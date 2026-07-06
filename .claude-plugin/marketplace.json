@@ -1,0 +1,25 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "bolivartech-ollama-orchestrator",
+  "description": "Claude-Ollama-Orchestrator plugin by BolivarTech",
+  "version": "0.0.1",
+  "owner": {
+    "name": "BolivarTech",
+    "url": "https://github.com/BolivarTech"
+  },
+  "plugins": [
+    {
+      "name": "claude-ollama-orchestrator",
+      "description": "Delegate coding, review, testing, explanation, vision, and transcription to Ollama models via streaming subagents",
+      "version": "0.0.1",
+      "author": {
+        "name": "Julian Bolivar",
+        "url": "https://github.com/BolivarTech"
+      },
+      "source": "./",
+      "category": "development",
+      "homepage": "https://github.com/BolivarTech/claude-ollama-orchestrator",
+      "tags": ["ollama", "delegation", "subagents", "local-llm", "orchestration"]
+    }
+  ]
+}

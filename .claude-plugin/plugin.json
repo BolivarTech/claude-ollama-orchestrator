@@ -1,0 +1,21 @@
+{
+  "name": "claude-ollama-orchestrator",
+  "version": "0.0.1",
+  "description": "Orchestration plugin that lets Claude Code delegate coding, review, testing, explanation, vision, and transcription tasks to local/LAN/cloud Ollama models via streaming subagents — cutting token cost while keeping generation on-device.",
+  "author": {
+    "name": "Julian Bolivar",
+    "url": "https://github.com/BolivarTech"
+  },
+  "repository": "https://github.com/BolivarTech/claude-ollama-orchestrator",
+  "license": "MIT OR Apache-2.0",
+  "keywords": [
+    "ollama",
+    "delegation",
+    "subagents",
+    "local-llm",
+    "orchestration",
+    "token-cost",
+    "code-generation"
+  ],
+  "skills": "./skills/"
+}

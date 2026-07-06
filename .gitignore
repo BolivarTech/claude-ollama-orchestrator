@@ -1,0 +1,35 @@
+__pycache__/
+*.pyc
+.*_cache/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+debug.log
+.env
+.venv/
+.claude/
+sbtdd/
+planning/
+CLAUDE.md
+CLAUDE.local.md
+CLAUDE.techdebt.md
+CLAUDE.changelog.md
+graphify-out
+
+# Usage-gate report output (local runtime artifact from claude_usage.py).
+claude-usage.txt
+
+# Per-session handoff buffer.
+.remember/
+
+# Fuzzing artifacts (atheris crash corpus / findings live locally).
+fuzz/corpus/
+fuzz/crash-*
+
+# Local developer tooling (SBTDD/graphify/usage-gate helpers from
+# BolivarTech/AI_Tools). Referenced by CLAUDE.local.md but not part of the
+# shipped plugin — each developer instantiates their own copy.
+/scripts/claude_usage.py
+/scripts/sleep_signal.py
+/scripts/graphify_ollama.py
