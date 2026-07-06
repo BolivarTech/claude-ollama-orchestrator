@@ -17,6 +17,15 @@ CLAUDE.techdebt.md
 CLAUDE.changelog.md
 graphify-out
 
+# Local graphify config (defines what the local graph indexes; not shipped).
+.graphifyignore
+
+# Local dev test harness. conftest.py holds the TDD-Guard pytest reporter (writes
+# .claude/tdd-guard/data/test.json — a local dev tool, like .claude/). Publishable
+# test imports live in pyproject.toml [tool.pytest.ini_options] pythonpath, so the
+# repo's tests run without it. Each developer instantiates their own conftest.py.
+conftest.py
+
 # Usage-gate report output (local runtime artifact from claude_usage.py).
 claude-usage.txt
 

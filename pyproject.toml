@@ -11,6 +11,7 @@ dev = ["pytest", "pytest-asyncio", "ruff", "mypy", "hypothesis"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["skills/ollama/scripts"]
 asyncio_mode = "auto"
 
 [tool.ruff]
