@@ -35,16 +35,37 @@ def normalize_base_url(raw: str) -> str:
             a misconfiguration, distinct from an *unset* base_url (which
             resolve_config's per-key precedence already falls back to
             ``DEFAULT_BASE_URL`` for, never reaching this function empty).
+        OllamaConfigError: if *raw* has a scheme but no authority/host (e.g.
+            ``"http://"``) — stripping trailing slashes from a bare scheme
+            would otherwise collapse it to ``"http:"``, which then looks
+            scheme-less and gets a bogus ``"http://"`` re-prepended
+            (``"http://http:"``). An empty authority is always invalid.
     """
-    value = raw.strip().rstrip("/")
+    stripped = raw.strip()
+    if not stripped:
+        raise OllamaConfigError(
+            "base_url must not be empty; leave it unset to use the default "
+            f"({DEFAULT_BASE_URL}) or provide a valid host/URL"
+        )
+    # Decide scheme-presence on the merely-stripped value, *before* trailing
+    # slashes are removed — for a bare scheme like "http://" every trailing
+    # char is "/", so rstrip below would erase the "://" marker itself and
+    # make the value look scheme-less to a check performed afterwards.
+    has_scheme = "://" in stripped
+    value = stripped.rstrip("/")
     if not value:
         raise OllamaConfigError(
             "base_url must not be empty; leave it unset to use the default "
             f"({DEFAULT_BASE_URL}) or provide a valid host/URL"
         )
-    if "://" not in value:
+    if not has_scheme:
         value = "http://" + value
     parts = urlsplit(value)
+    if not parts.netloc:
+        raise OllamaConfigError(
+            f"base_url {raw!r} has no host (empty authority after the "
+            "scheme); provide a value like 'http://localhost:11434'"
+        )
     if not parts.path:
         parts = parts._replace(path="/v1")
     return urlunsplit(parts)
