@@ -56,9 +56,14 @@ def test_preflight_401_aborts_and_redacts_api_key():
     assert "sk-secret" not in str(exc.value)
 
 
-def test_preflight_404_warns_and_proceeds():
+def test_preflight_404_warns_and_proceeds(capsys):
     err = urllib.error.HTTPError("u", 404, "Not Found", {}, io.BytesIO(b""))
-    preflight(_cfg(), urlopen=_fake_urlopen(error=err))  # no raise
+    preflight(_cfg(), urlopen=_fake_urlopen(error=err))  # no raise: proceeds normally
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    warnings = [line for line in captured.err.splitlines() if line.strip()]
+    assert len(warnings) == 1
+    assert "does not support listing models" in warnings[0]
 
 
 def test_preflight_aborts_on_non_json_response_with_actionable_message():
@@ -111,6 +116,27 @@ def test_preflight_checks_the_effective_model_override_not_the_config_default():
             effective_model="does-not-exist:cloud",
         )
     assert "does-not-exist:cloud" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        None,
+        "x",
+        {"data": None},
+    ],
+    ids=["bare-array", "bare-null", "bare-string", "data-null"],
+)
+def test_preflight_unexpected_models_shape_raises_domain_error_not_raw_exception(payload):
+    # Untrusted /models output that is valid JSON but the WRONG shape must map to the
+    # domain OllamaPreflightError this module exists to guarantee — never a raw
+    # AttributeError (payload not a dict) or TypeError (payload["data"] not iterable).
+    # {"data": None} is the key regression case: dict.get("data", []) only applies its
+    # default when the key is ABSENT, not when present with value null.
+    with pytest.raises(OllamaPreflightError) as exc:
+        preflight(_cfg(), urlopen=_fake_urlopen(payload))
+    assert "shape" in str(exc.value)
 
 
 def test_preflight_effective_model_present_passes_and_other_models_still_checked():

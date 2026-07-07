@@ -72,11 +72,12 @@ def preflight(
     Raises:
         OllamaPreflightError: on unreachable host, auth failure (401/403), a
             missing configured (or effective-override) model, an oversized
-            response body (``PREFLIGHT_MAX_RESPONSE_BYTES``), or a non-JSON
+            response body (``PREFLIGHT_MAX_RESPONSE_BYTES``), a non-JSON
             response body (e.g. an HTML error page from a misconfigured proxy,
-            or malformed UTF-8 bytes decoded via ``errors="replace"``) on an
-            otherwise-200 response. 404/501 warn-and-proceed instead of
-            raising.
+            or malformed UTF-8 bytes decoded via ``errors="replace"``), or a
+            valid-JSON body of the wrong shape (not an object, or its ``data``
+            key not a list) on an otherwise-200 response. 404/501 warn-and-proceed
+            instead of raising.
     """
     url = f"{config.base_url}/models"
     req = urllib.request.Request(url, method="GET")
@@ -90,9 +91,12 @@ def preflight(
         raw = resp.read(PREFLIGHT_MAX_RESPONSE_BYTES + 1)
         if len(raw) > PREFLIGHT_MAX_RESPONSE_BYTES:
             raise OllamaPreflightError(
-                f"/models response exceeded PREFLIGHT_MAX_RESPONSE_BYTES "
-                f"({PREFLIGHT_MAX_RESPONSE_BYTES} bytes) — endpoint sent an oversized "
-                "response"
+                _redact(
+                    f"/models response exceeded PREFLIGHT_MAX_RESPONSE_BYTES "
+                    f"({PREFLIGHT_MAX_RESPONSE_BYTES} bytes) — endpoint sent an oversized "
+                    "response",
+                    config.api_key,
+                )
             )
         # The /models response body is untrusted server output: decode with
         # errors="replace" (U+FFFD substitution) so malformed UTF-8 bytes never raise a
@@ -118,8 +122,11 @@ def preflight(
         ) from None
     except (socket.timeout, TimeoutError, urllib.error.URLError) as exc:
         raise OllamaPreflightError(
-            f"Cannot reach Ollama at {config.base_url}: {exc}. "
-            "Is it running? Try `ollama signin` for cloud."
+            _redact(
+                f"Cannot reach Ollama at {config.base_url}: {exc}. "
+                "Is it running? Try `ollama signin` for cloud.",
+                config.api_key,
+            )
         ) from None
     except json.JSONDecodeError as exc:
         # A reverse proxy / misconfigured endpoint can return HTTP 200 with a non-JSON
@@ -131,7 +138,22 @@ def preflight(
             )
         ) from None
 
-    available = {m["id"] for m in payload.get("data", []) if isinstance(m, dict) and "id" in m}
+    # The /models body is untrusted server output: it may be valid JSON of the WRONG
+    # shape (a bare array/string/number/null, or {"data": null}). Guard the shape BEFORE
+    # iterating so a malformed-but-valid-JSON body maps to the domain error this module
+    # exists to guarantee, instead of a raw AttributeError (payload not a dict) or
+    # TypeError (payload["data"] not a list — note `.get("data", [])`'s default only
+    # applies when the key is ABSENT, not when it is present with value `null`).
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        raise OllamaPreflightError(
+            _redact(
+                f"Preflight failed: {url} returned an unexpected /models response shape "
+                "(expected a JSON object with a `data` list).",
+                config.api_key,
+            )
+        )
+    available = {m["id"] for m in data if isinstance(m, dict) and "id" in m}
     # R28/R10: validate the EFFECTIVE model — a caller-supplied --model override for
     # *capability* takes the place of that capability's configured model in the check,
     # so an override to a non-existent model aborts HERE (actionable) instead of
@@ -143,7 +165,10 @@ def preflight(
     missing = sorted(set(check_models.values()) - available)
     if missing:
         raise OllamaPreflightError(
-            f"Missing models: {', '.join(missing)}. "
-            "Run `ollama pull <model>` / `ollama signin` (cloud) / edit the TOML / "
-            "`--ollama-init`."
+            _redact(
+                f"Missing models: {', '.join(missing)}. "
+                "Run `ollama pull <model>` / `ollama signin` (cloud) / edit the TOML / "
+                "`--ollama-init`.",
+                config.api_key,
+            )
         )
