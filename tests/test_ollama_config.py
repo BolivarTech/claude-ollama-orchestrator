@@ -4,13 +4,21 @@
 """Config resolver + base_url normalization (idempotent, per-key precedence)."""
 
 import string
+import textwrap
 
 import pytest
 from hypothesis import assume, given
 from hypothesis import strategies as st
 
 from errors import OllamaConfigError
-from ollama_config import DEFAULT_BASE_URL, normalize_base_url
+from ollama_config import (
+    CAPABILITIES,
+    DEFAULT_BASE_URL,
+    DEFAULT_MODELS,
+    OllamaAgentsConfig,
+    normalize_base_url,
+    resolve_config,
+)
 
 
 @pytest.mark.parametrize(
@@ -102,3 +110,128 @@ def test_normalize_base_url_never_doubles_v1_and_stays_idempotent(s):
     # The real invariant the test name claims: normalizing an already
     # normalized value must be a no-op.
     assert normalize_base_url(out) == out
+
+
+def _write(tmp_path, name, body):
+    p = tmp_path / name
+    p.write_text(textwrap.dedent(body), encoding="utf-8")
+    return str(p)
+
+
+def test_defaults_when_no_files_no_env():
+    cfg = resolve_config(global_path=None, repo_path=None, env={})
+    assert isinstance(cfg, OllamaAgentsConfig)
+    assert cfg.base_url == "http://localhost:11434/v1"
+    assert cfg.api_key is None
+    assert cfg.models["coder"] == "kimi-k2.7-code:cloud"
+    assert cfg.max_parallel_agents == 3
+    assert cfg.max_queued_agents == 32
+    assert cfg.structured["reviewer"] == "schema"
+    assert cfg.structured["coder"] == "off"
+    assert cfg.stream["coder"] is True
+    assert cfg.stream["reviewer"] is False
+    assert tuple(cfg.models) == CAPABILITIES
+
+
+def test_per_key_merge_repo_base_url_global_models(tmp_path):
+    g = _write(tmp_path, "global.toml", '[models]\ncoder = "global-coder:cloud"\n')
+    r = _write(tmp_path, "repo.toml", 'base_url = "http://repo:9999"\n')
+    cfg = resolve_config(global_path=g, repo_path=r, env={})
+    assert cfg.base_url == "http://repo:9999/v1"
+    assert cfg.models["coder"] == "global-coder:cloud"
+
+
+def test_env_overrides_files_for_model(tmp_path):
+    r = _write(tmp_path, "repo.toml", '[models]\ncoder = "repo-coder:cloud"\n')
+    cfg = resolve_config(
+        global_path=None, repo_path=r, env={"OLLAMA_AGENTS_MODEL_CODER": "env-coder:cloud"}
+    )
+    assert cfg.models["coder"] == "env-coder:cloud"
+
+
+def test_api_key_presence_semantics_empty_env_means_none(tmp_path):
+    r = _write(tmp_path, "repo.toml", 'api_key = "sk-from-file"\n')
+    cfg = resolve_config(global_path=None, repo_path=r, env={"OLLAMA_AGENTS_API_KEY": ""})
+    assert cfg.api_key is None
+
+
+def test_generic_ollama_host_env_is_base_url_fallback():
+    # R6: with no OLLAMA_AGENTS_HOST / repo / global base_url, the generic OLLAMA_HOST env
+    # is used and normalized idempotently (bare host:port → append /v1).
+    cfg = resolve_config(
+        global_path=None, repo_path=None, env={"OLLAMA_HOST": "http://192.168.0.30:11434"}
+    )
+    assert cfg.base_url == "http://192.168.0.30:11434/v1"
+
+
+def test_empty_string_model_override_is_not_an_override():
+    # Presence-semantics (R6): a present-but-empty override is DISTINCT from absent —
+    # it does not set an empty model tag; it falls through to the built-in default.
+    cfg = resolve_config(global_path=None, repo_path=None, env={"OLLAMA_AGENTS_MODEL_CODER": ""})
+    assert cfg.models["coder"] == "kimi-k2.7-code:cloud"
+
+
+def test_malformed_toml_raises_domain_error(tmp_path):
+    bad = _write(tmp_path, "bad.toml", "this is = = not toml")
+    with pytest.raises(OllamaConfigError):
+        resolve_config(global_path=None, repo_path=bad, env={})
+
+
+def test_invalid_max_parallel_raises():
+    with pytest.raises(OllamaConfigError):
+        resolve_config(global_path=None, repo_path=None, env={"OLLAMA_AGENTS_MAX_PARALLEL": "0"})
+
+
+def test_stream_string_false_coerces_to_false_not_true(tmp_path):
+    # The bool('false') is True trap: a STRING "false" in TOML must coerce to False.
+    r = _write(tmp_path, "repo.toml", '[stream]\ncoder = "false"\n')
+    cfg = resolve_config(global_path=None, repo_path=r, env={})
+    assert cfg.stream["coder"] is False
+
+
+def test_stream_env_and_native_bool_coerce_correctly(tmp_path):
+    r = _write(tmp_path, "repo.toml", "[stream]\ncoder = false\n")  # native TOML bool
+    cfg = resolve_config(
+        global_path=None, repo_path=r, env={"OLLAMA_AGENTS_STREAM_REVIEWER": "true"}
+    )
+    assert cfg.stream["coder"] is False and cfg.stream["reviewer"] is True
+
+
+def test_stream_invalid_value_raises(tmp_path):
+    r = _write(tmp_path, "repo.toml", '[stream]\ncoder = "maybe"\n')
+    with pytest.raises(OllamaConfigError):
+        resolve_config(global_path=None, repo_path=r, env={})
+
+
+def test_config_is_frozen():
+    cfg = resolve_config(global_path=None, repo_path=None, env={})
+    with pytest.raises(Exception):
+        cfg.base_url = "mutated"  # type: ignore[misc]
+
+
+def test_non_string_base_url_raises_config_error(tmp_path):
+    # A TOML `base_url = 123` (int) must never reach normalize_base_url()'s `raw.strip()`
+    # or a later f"{base_url}/chat/completions" as a non-string — caught here as an
+    # actionable OllamaConfigError, not a raw TypeError/AttributeError downstream.
+    r = _write(tmp_path, "repo.toml", "base_url = 123\n")
+    with pytest.raises(OllamaConfigError) as exc:
+        resolve_config(global_path=None, repo_path=r, env={})
+    assert "base_url" in str(exc.value)
+
+
+def test_non_string_api_key_raises_config_error(tmp_path):
+    # A TOML `api_key = true` (bool) must never reach header-building
+    # (`f"Bearer {api_key}"`) as a non-string.
+    r = _write(tmp_path, "repo.toml", "api_key = true\n")
+    with pytest.raises(OllamaConfigError) as exc:
+        resolve_config(global_path=None, repo_path=r, env={})
+    assert "api_key" in str(exc.value)
+
+
+def test_non_string_model_raises_config_error(tmp_path):
+    # A TOML `models.coder = 42` (int) must never reach the backend's `model=` payload
+    # field as a non-string.
+    r = _write(tmp_path, "repo.toml", "[models]\ncoder = 42\n")
+    with pytest.raises(OllamaConfigError) as exc:
+        resolve_config(global_path=None, repo_path=r, env={})
+    assert "models.coder" in str(exc.value)
