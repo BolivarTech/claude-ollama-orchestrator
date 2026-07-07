@@ -17,7 +17,13 @@ def test_rendered_template_parses_and_carries_all_defaults():
     assert data["max_parallel_agents"] == 3
     assert data["max_queued_agents"] == 32
     assert set(data["models"]) == {
-        "coder", "reviewer", "tester", "explainer", "vision", "transcribe", "thinking",
+        "coder",
+        "reviewer",
+        "tester",
+        "explainer",
+        "vision",
+        "transcribe",
+        "thinking",
     }
     assert data["models"]["thinking"] == "deepseek-v4-pro:cloud"
     assert data["structured"]["reviewer"] == "schema"
