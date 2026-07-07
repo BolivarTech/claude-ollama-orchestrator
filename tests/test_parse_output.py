@@ -6,6 +6,8 @@
 import json
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from parse_output import parse_agent_output
 
@@ -17,25 +19,24 @@ def test_clean_json_parses():
 
 
 def test_code_fence_is_stripped():
-    raw = "```json\n{\"agent\": \"reviewer\", \"verdict\": \"ok\"}\n```"
+    raw = '```json\n{"agent": "reviewer", "verdict": "ok"}\n```'
     assert parse_agent_output(raw, _KEYS)["agent"] == "reviewer"
 
 
 def test_code_fence_not_at_string_start_is_stripped():
     # A ```json fence that begins on a later LINE (not char 0) must still be recognized —
     # the fence regex is compiled with re.MULTILINE so ^```lang anchors to any line start.
-    raw = "Result below:\n```json\n{\"agent\": \"reviewer\", \"verdict\": \"ok\"}\n```"
+    raw = 'Result below:\n```json\n{"agent": "reviewer", "verdict": "ok"}\n```'
     assert parse_agent_output(raw, _KEYS)["verdict"] == "ok"
 
 
 def test_think_leak_is_recovered():
-    raw = "<think>let me reason...</think>\n{\"agent\": \"reviewer\", \"verdict\": \"ok\"}"
+    raw = '<think>let me reason...</think>\n{"agent": "reviewer", "verdict": "ok"}'
     assert parse_agent_output(raw, _KEYS)["verdict"] == "ok"
 
 
 def test_ambiguous_two_objects_is_fail_closed():
-    raw = ('{"agent": "a", "verdict": "x"} and also '
-           '{"agent": "b", "verdict": "y"}')
+    raw = '{"agent": "a", "verdict": "x"} and also {"agent": "b", "verdict": "y"}'
     with pytest.raises(json.JSONDecodeError):
         parse_agent_output(raw, _KEYS)  # ≥2 discriminator-matching objects → not parseable
 
@@ -81,9 +82,6 @@ def test_non_dict_top_level_is_ignored_not_crashed():
     raw = "[1, 2, 3]"
     with pytest.raises(json.JSONDecodeError):
         parse_agent_output(raw, _KEYS)
-
-
-from hypothesis import given, strategies as st
 
 
 @given(st.text(max_size=500))
