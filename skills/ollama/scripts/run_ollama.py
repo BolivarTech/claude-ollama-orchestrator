@@ -90,6 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _validate_args(parser: argparse.ArgumentParser, ns: argparse.Namespace) -> None:
+    """Reject cross-flag-invalid parsed args via ``parser.error`` (R28 CLI surface)."""
     if ns.keep_runs == 0:
         parser.error("--keep-runs 0 is ambiguous; use -1 to disable cleanup or >= 1")
     if ns.warn_input_tokens <= 0:
@@ -334,10 +335,12 @@ def _make_backend(cfg: OllamaAgentsConfig) -> OllamaBackend:
 
 
 def _global_toml() -> str:
+    """Return the path to the global config (``~/.claude/ollama-agents.toml``)."""
     return os.path.join(os.path.expanduser("~"), ".claude", "ollama-agents.toml")
 
 
 def _repo_toml() -> str:
+    """Return the path to the repo config (``./.claude/ollama-agents.toml``)."""
     return os.path.join(os.getcwd(), ".claude", "ollama-agents.toml")
 
 

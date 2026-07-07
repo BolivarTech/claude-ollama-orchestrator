@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import socket
 import sys
@@ -74,7 +75,9 @@ def preflight(
             missing configured (or effective-override) model, an oversized
             response body (``PREFLIGHT_MAX_RESPONSE_BYTES``), a non-JSON
             response body (e.g. an HTML error page from a misconfigured proxy,
-            or malformed UTF-8 bytes decoded via ``errors="replace"``), or a
+            or malformed UTF-8 bytes decoded via ``errors="replace"``), a
+            mid-read connection drop (``http.client.IncompleteRead`` or any
+            other ``OSError`` such as ``ConnectionResetError``), or a
             valid-JSON body of the wrong shape (not an object, or its ``data``
             key not a list) on an otherwise-200 response. 404/501 warn-and-proceed
             instead of raising.
@@ -120,7 +123,7 @@ def preflight(
         raise OllamaPreflightError(
             _redact(f"Preflight HTTP {exc.code} at {url}.", config.api_key)
         ) from None
-    except (socket.timeout, TimeoutError, urllib.error.URLError) as exc:
+    except (socket.timeout, TimeoutError, urllib.error.URLError, http.client.IncompleteRead) as exc:
         raise OllamaPreflightError(
             _redact(
                 f"Cannot reach Ollama at {config.base_url}: {exc}. "
@@ -136,6 +139,15 @@ def preflight(
             _redact(
                 f"Preflight failed: {url} returned a non-JSON response ({exc}).", config.api_key
             )
+        ) from None
+    except OSError as exc:
+        # Any other connect/read failure not already covered above (e.g. a
+        # ConnectionResetError on a mid-read connection drop) must map to a domain
+        # error, never propagate as a raw non-domain exception. NOTE: urllib.error.URLError
+        # (and its HTTPError subclass) are themselves OSError subclasses, so both are
+        # caught above with their more actionable messages BEFORE this catch-all.
+        raise OllamaPreflightError(
+            _redact(f"Preflight connection error: {exc}", config.api_key)
         ) from None
 
     # The /models body is untrusted server output: it may be valid JSON of the WRONG

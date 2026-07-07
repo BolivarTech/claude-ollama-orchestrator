@@ -15,6 +15,14 @@ from urllib.parse import urlsplit, urlunsplit
 from errors import OllamaConfigError
 
 DEFAULT_BASE_URL = "http://localhost:11434/v1"
+# Default semaphore size for concurrent delegations (R21) -- default plan tier is Ollama
+# Pro (3 concurrent). Shared with ollama_init.render_template so the scaffolded TOML and
+# the resolver default never drift apart.
+DEFAULT_MAX_PARALLEL_AGENTS = 3
+# Default bound on the queue of delegations waiting for a semaphore slot (R21b) -- an
+# anti-DoS backstop, not a resource limit; see spec-behavior.md for the rationale. Shared
+# with ollama_init.render_template (see DEFAULT_MAX_PARALLEL_AGENTS above).
+DEFAULT_MAX_QUEUED_AGENTS = 32
 
 
 def normalize_base_url(raw: str) -> str:
@@ -394,9 +402,21 @@ def resolve_config(
         structured=MappingProxyType(structured),
         stream=MappingProxyType(stream),
         max_parallel_agents=_resolve_int(
-            env, "OLLAMA_AGENTS_MAX_PARALLEL", repo, glob, "max_parallel_agents", 3, 1
+            env,
+            "OLLAMA_AGENTS_MAX_PARALLEL",
+            repo,
+            glob,
+            "max_parallel_agents",
+            DEFAULT_MAX_PARALLEL_AGENTS,
+            1,
         ),
         max_queued_agents=_resolve_int(
-            env, "OLLAMA_AGENTS_MAX_QUEUED", repo, glob, "max_queued_agents", 32, 0
+            env,
+            "OLLAMA_AGENTS_MAX_QUEUED",
+            repo,
+            glob,
+            "max_queued_agents",
+            DEFAULT_MAX_QUEUED_AGENTS,
+            0,
         ),
     )

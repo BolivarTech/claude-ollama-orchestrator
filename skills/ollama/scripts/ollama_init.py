@@ -10,6 +10,8 @@ import os
 from ollama_config import (
     CAPABILITIES,
     DEFAULT_BASE_URL,
+    DEFAULT_MAX_PARALLEL_AGENTS,
+    DEFAULT_MAX_QUEUED_AGENTS,
     DEFAULT_MODELS,
     DEFAULT_STREAM,
     DEFAULT_STRUCTURED,
@@ -33,8 +35,10 @@ def render_template() -> str:
         "",
         f'base_url = "{DEFAULT_BASE_URL}"   # path verbatim e idempotente; host:port pelado -> /v1',
         '# api_key = "sk-..."                 # solo nube/auth; local no necesita (chmod 600)',
-        "max_parallel_agents = 3             # delegaciones corriendo a la vez (semaforo)",
-        "max_queued_agents   = 32            # tope de la cola de espera (backstop anti-DoS)",
+        f"max_parallel_agents = {DEFAULT_MAX_PARALLEL_AGENTS}"
+        "             # delegaciones corriendo a la vez (semaforo)",
+        f"max_queued_agents   = {DEFAULT_MAX_QUEUED_AGENTS}"
+        "            # tope de la cola de espera (backstop anti-DoS)",
         "",
         "[models]",
     ]

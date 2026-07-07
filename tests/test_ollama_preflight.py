@@ -3,6 +3,7 @@
 # Date: 2026-07-05
 """Fail-fast preflight: reachability, model existence, auth, warn-and-proceed."""
 
+import http.client
 import io
 import json
 import urllib.error
@@ -137,6 +138,41 @@ def test_preflight_unexpected_models_shape_raises_domain_error_not_raw_exception
     with pytest.raises(OllamaPreflightError) as exc:
         preflight(_cfg(), urlopen=_fake_urlopen(payload))
     assert "shape" in str(exc.value)
+
+
+class _RaisingReadResponse:
+    """Fake response whose ``.read()`` raises *exc* (simulates a mid-read connection drop)."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def read(self, *args, **kwargs):
+        raise self._exc
+
+
+def test_preflight_incomplete_read_maps_to_domain_error_not_raw_traceback():
+    # A truncated /models response (connection dropped mid-body) raises
+    # http.client.IncompleteRead from resp.read() -- an HTTPException, NOT an
+    # OSError/URLError subclass, so it must be explicitly guarded (mirrors
+    # backend.OllamaBackend's own (OSError, http.client.IncompleteRead) catch-all) rather
+    # than escape preflight() as a raw, uncaught exception.
+    def _open(req, timeout=None):
+        return _RaisingReadResponse(http.client.IncompleteRead(b"partial"))
+
+    with pytest.raises(OllamaPreflightError):
+        preflight(_cfg(), urlopen=_open)
+
+
+def test_preflight_connection_reset_during_read_maps_to_domain_error():
+    # Any other read-time OSError not already covered by the more specific
+    # (socket.timeout, TimeoutError, URLError, IncompleteRead) arm -- e.g. a
+    # ConnectionResetError -- must also map to the domain OllamaPreflightError via the
+    # residual `except OSError` catch-all, never propagate as a raw exception.
+    def _open(req, timeout=None):
+        return _RaisingReadResponse(ConnectionResetError("connection reset by peer"))
+
+    with pytest.raises(OllamaPreflightError):
+        preflight(_cfg(), urlopen=_open)
 
 
 def test_preflight_effective_model_present_passes_and_other_models_still_checked():
