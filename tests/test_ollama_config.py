@@ -123,7 +123,7 @@ def test_defaults_when_no_files_no_env():
     assert isinstance(cfg, OllamaAgentsConfig)
     assert cfg.base_url == "http://localhost:11434/v1"
     assert cfg.api_key is None
-    assert cfg.models["coder"] == "kimi-k2.7-code:cloud"
+    assert cfg.models["coder"] == DEFAULT_MODELS["coder"]
     assert cfg.max_parallel_agents == 3
     assert cfg.max_queued_agents == 32
     assert cfg.structured["reviewer"] == "schema"
@@ -168,7 +168,7 @@ def test_empty_string_model_override_is_not_an_override():
     # Presence-semantics (R6): a present-but-empty override is DISTINCT from absent —
     # it does not set an empty model tag; it falls through to the built-in default.
     cfg = resolve_config(global_path=None, repo_path=None, env={"OLLAMA_AGENTS_MODEL_CODER": ""})
-    assert cfg.models["coder"] == "kimi-k2.7-code:cloud"
+    assert cfg.models["coder"] == DEFAULT_MODELS["coder"]
 
 
 def test_malformed_toml_raises_domain_error(tmp_path):

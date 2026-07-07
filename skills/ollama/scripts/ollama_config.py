@@ -5,6 +5,11 @@
 
 from __future__ import annotations
 
+import os
+import tomllib
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
 from errors import OllamaConfigError
@@ -69,3 +74,300 @@ def normalize_base_url(raw: str) -> str:
     if not parts.path:
         parts = parts._replace(path="/v1")
     return urlunsplit(parts)
+
+
+CAPABILITIES: tuple[str, ...] = (
+    "coder",
+    "reviewer",
+    "tester",
+    "explainer",
+    "vision",
+    "transcribe",
+    "thinking",
+)
+DEFAULT_MODELS: Mapping[str, str] = MappingProxyType(
+    {
+        "coder": "kimi-k2.7-code:cloud",
+        "reviewer": "glm-5.2:cloud",
+        "tester": "deepseek-v4-flash:cloud",
+        "explainer": "gpt-oss:120b-cloud",
+        "vision": "minimax-m3:cloud",
+        "transcribe": "gemma4:cloud",
+        "thinking": "deepseek-v4-pro:cloud",
+    }
+)
+DEFAULT_STRUCTURED: Mapping[str, str] = MappingProxyType(
+    {c: ("schema" if c in ("reviewer", "tester") else "off") for c in CAPABILITIES}
+)
+DEFAULT_STREAM: Mapping[str, bool] = MappingProxyType(
+    {c: (c not in ("reviewer", "tester")) for c in CAPABILITIES}
+)
+_STRUCTURED_VALUES = frozenset({"schema", "object", "off"})
+
+
+@dataclass(frozen=True)
+class OllamaAgentsConfig:
+    """Resolved, immutable configuration for the delegation runtime."""
+
+    base_url: str
+    api_key: str | None
+    models: Mapping[str, str]
+    structured: Mapping[str, str]
+    stream: Mapping[str, bool]
+    max_parallel_agents: int
+    max_queued_agents: int
+
+
+def _load_toml(path: str | None) -> dict[str, Any]:
+    """Return parsed TOML, or ``{}`` if the path is absent/empty.
+
+    Args:
+        path: Path to a TOML file, or ``None``.
+
+    Returns:
+        The parsed TOML as a dict, or ``{}`` if *path* is falsy or missing.
+
+    Raises:
+        OllamaConfigError: if the file exists but is malformed TOML.
+    """
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "rb") as fh:
+            return tomllib.load(fh)
+    except tomllib.TOMLDecodeError as exc:
+        raise OllamaConfigError(f"Malformed TOML in {path}: {exc}") from exc
+
+
+def _require_str(value: Any, key: str) -> None:
+    """Guard a config value that MUST be a string once present.
+
+    Applied uniformly to every string-typed config key resolved from TOML/env
+    (``base_url``, ``api_key``, every ``models.<capability>``, every
+    ``structured.<capability>``) so a non-string value (e.g. ``base_url = 123``,
+    ``api_key = true``, ``models.coder = 42``) is rejected here, at resolution
+    time, with an actionable domain error — instead of silently flowing through
+    the ``or``-chain / ``_first_present`` and later blowing up with an uncaught
+    ``TypeError``/``AttributeError`` (e.g. inside ``normalize_base_url``'s
+    ``raw.strip()`` or an f-string like ``f"{base_url}/chat/completions"``).
+
+    Args:
+        value: The candidate value pulled from TOML/env for *key* (``None`` if
+            absent at that layer — absence is not an error here, only a wrong
+            *type* is; presence-semantics for absence are handled by the
+            ``or``-chain / ``_first_present`` callers).
+        key: Config key name for the error message (e.g. ``"base_url"``,
+            ``"models.coder"``).
+
+    Raises:
+        OllamaConfigError: if *value* is present (not ``None``) and not a
+            ``str``.
+    """
+    if value is not None and not isinstance(value, str):
+        raise OllamaConfigError(f"{key} must be a string, got {type(value).__name__}: {value!r}")
+
+
+def _resolve_int(
+    env: Mapping[str, str],
+    env_key: str,
+    repo: dict[str, Any],
+    glob: dict[str, Any],
+    toml_key: str,
+    default: int,
+    minimum: int,
+) -> int:
+    """Resolve an integer config value with env > repo > global > default precedence.
+
+    Args:
+        env: Environment mapping.
+        env_key: Environment variable name (e.g. ``"OLLAMA_AGENTS_MAX_PARALLEL"``).
+        repo: Parsed repo TOML.
+        glob: Parsed global TOML.
+        toml_key: Key name within the TOML tables (e.g. ``"max_parallel_agents"``).
+        default: Built-in default if absent everywhere.
+        minimum: Minimum accepted value (inclusive).
+
+    Returns:
+        The resolved integer.
+
+    Raises:
+        OllamaConfigError: if a present value is not coercible to ``int`` or is
+            below *minimum*. A native ``bool`` is rejected (``bool`` is a
+            subclass of ``int`` in Python, but ``true``/``false`` is never a
+            valid integer config value here).
+    """
+    for src in (env.get(env_key), repo.get(toml_key), glob.get(toml_key)):
+        if src is None or src == "":
+            continue
+        if isinstance(src, bool):
+            raise OllamaConfigError(f"{toml_key} must be an integer, got {src!r}")
+        try:
+            value = int(src)
+        except (TypeError, ValueError) as exc:
+            raise OllamaConfigError(f"{toml_key} must be an integer, got {src!r}") from exc
+        if value < minimum:
+            raise OllamaConfigError(f"{toml_key} must be >= {minimum}, got {value}")
+        return value
+    return default
+
+
+def _first_present(*candidates: Any, default: Any) -> Any:
+    """Return the first candidate that is present (not None) and non-empty.
+
+    Presence-semantics for string overrides: a present-but-empty value (``""``) is
+    treated as *no override at that layer* (an empty model tag / structured value is
+    never a valid override), so resolution falls through to the next layer and finally
+    *default*. This is deliberate and distinct from ``api_key`` (where present-but-empty
+    means ``None``); see ``test_empty_string_model_override_is_not_an_override``.
+
+    Args:
+        *candidates: Values to try, in precedence order (highest first).
+        default: Value to use if every candidate is absent or empty.
+
+    Returns:
+        The first present-and-non-empty candidate, or *default*.
+    """
+    for value in candidates:
+        if value is not None and value != "":
+            return value
+    return default
+
+
+def _coerce_bool(value: Any, ctx: str) -> bool:
+    """Coerce a config value to bool WITHOUT the ``bool('false') is True`` trap.
+
+    A native TOML bool passes through; a string is parsed case-insensitively
+    (``true``/``1`` -> True, ``false``/``0`` -> False), consistent with the env path;
+    anything else is a config error. Never use bare ``bool(str)`` -- ``bool("false")``
+    is ``True``, which would silently invert a ``stream.<cap> = "false"`` setting.
+
+    Args:
+        value: The resolved config value (native bool or string).
+        ctx: Key name for the error message (e.g. ``"stream.reviewer"``).
+
+    Returns:
+        The coerced boolean.
+
+    Raises:
+        OllamaConfigError: if *value* is a non-boolean string / unsupported type.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in ("true", "1"):
+            return True
+        if low in ("false", "0"):
+            return False
+    raise OllamaConfigError(f"{ctx} must be a boolean (true/false), got {value!r}")
+
+
+def resolve_config(
+    *, global_path: str | None, repo_path: str | None, env: Mapping[str, str]
+) -> OllamaAgentsConfig:
+    """Resolve the layered config with per-key precedence.
+
+    Precedence (per key, highest first): env ``OLLAMA_AGENTS_*`` > repo TOML >
+    global TOML > a generic fallback env var (``OLLAMA_HOST``/``OLLAMA_API_KEY``,
+    ``base_url``/``api_key`` only) > built-in default.
+
+    Args:
+        global_path: Path to ``~/.claude/ollama-agents.toml`` (or ``None``).
+        repo_path: Path to ``./.claude/ollama-agents.toml`` (or ``None``).
+        env: Environment mapping (injected for tests).
+
+    Returns:
+        An immutable :class:`OllamaAgentsConfig`.
+
+    Raises:
+        OllamaConfigError: on malformed TOML, on an invalid value (bad int/bool/
+            enum), or on a **non-string value for a string-typed key**
+            (``base_url``, ``api_key``, any ``models.<cap>``, any
+            ``structured.<cap>``) -- every such key is guarded uniformly via
+            ``_require_str`` so a stray ``base_url = 123`` / ``api_key = true`` /
+            ``models.coder = 42`` in TOML never reaches later string operations
+            (``normalize_base_url``, header building, the backend payload)
+            un-typed.
+    """
+    glob = _load_toml(global_path)
+    repo = _load_toml(repo_path)
+
+    env_host = env.get("OLLAMA_AGENTS_HOST")
+    repo_base = repo.get("base_url")
+    glob_base = glob.get("base_url")
+    generic_host = env.get("OLLAMA_HOST")
+    _require_str(env_host, "OLLAMA_AGENTS_HOST")
+    _require_str(repo_base, "base_url (repo)")
+    _require_str(glob_base, "base_url (global)")
+    _require_str(generic_host, "OLLAMA_HOST")
+    raw_base = env_host or repo_base or glob_base or generic_host or DEFAULT_BASE_URL
+    base_url = normalize_base_url(raw_base)
+
+    if "OLLAMA_AGENTS_API_KEY" in env:
+        _require_str(env["OLLAMA_AGENTS_API_KEY"], "OLLAMA_AGENTS_API_KEY")
+        api_key = env["OLLAMA_AGENTS_API_KEY"] or None
+    elif "api_key" in repo:
+        _require_str(repo["api_key"], "api_key (repo)")
+        api_key = repo["api_key"] or None
+    elif "api_key" in glob:
+        _require_str(glob["api_key"], "api_key (global)")
+        api_key = glob["api_key"] or None
+    elif "OLLAMA_API_KEY" in env:
+        _require_str(env["OLLAMA_API_KEY"], "OLLAMA_API_KEY")
+        api_key = env["OLLAMA_API_KEY"] or None
+    else:
+        api_key = None
+
+    repo_models, glob_models = repo.get("models", {}), glob.get("models", {})
+    repo_struct, glob_struct = repo.get("structured", {}), glob.get("structured", {})
+    repo_stream, glob_stream = repo.get("stream", {}), glob.get("stream", {})
+    models: dict[str, str] = {}
+    structured: dict[str, str] = {}
+    stream: dict[str, bool] = {}
+    for cap in CAPABILITIES:
+        up = cap.upper()
+        # Presence-aware resolution (see _first_present): a present-but-empty override
+        # falls through -- it never sets an empty model tag / structured value.
+        models[cap] = _first_present(
+            env.get(f"OLLAMA_AGENTS_MODEL_{up}"),
+            repo_models.get(cap),
+            glob_models.get(cap),
+            default=DEFAULT_MODELS[cap],
+        )
+        _require_str(models[cap], f"models.{cap}")
+        s = _first_present(
+            env.get(f"OLLAMA_AGENTS_STRUCTURED_{up}"),
+            repo_struct.get(cap),
+            glob_struct.get(cap),
+            default=DEFAULT_STRUCTURED[cap],
+        )
+        _require_str(s, f"structured.{cap}")
+        if s not in _STRUCTURED_VALUES:
+            raise OllamaConfigError(f"structured.{cap} must be schema|object|off, got {s!r}")
+        structured[cap] = s
+        # Boolean coercion via _coerce_bool at every layer (env AND TOML): a native
+        # bool passes through, a string is parsed true/false, invalid -> ValidationError.
+        # NEVER bare bool(str) -- bool("false") is True (the flagged coercion bug).
+        env_stream = env.get(f"OLLAMA_AGENTS_STREAM_{up}")
+        if env_stream is not None and env_stream != "":
+            stream[cap] = _coerce_bool(env_stream, f"stream.{cap}")
+        elif cap in repo_stream:
+            stream[cap] = _coerce_bool(repo_stream[cap], f"stream.{cap}")
+        elif cap in glob_stream:
+            stream[cap] = _coerce_bool(glob_stream[cap], f"stream.{cap}")
+        else:
+            stream[cap] = DEFAULT_STREAM[cap]
+
+    return OllamaAgentsConfig(
+        base_url=base_url,
+        api_key=api_key,
+        models=MappingProxyType(models),
+        structured=MappingProxyType(structured),
+        stream=MappingProxyType(stream),
+        max_parallel_agents=_resolve_int(
+            env, "OLLAMA_AGENTS_MAX_PARALLEL", repo, glob, "max_parallel_agents", 3, 1
+        ),
+        max_queued_agents=_resolve_int(
+            env, "OLLAMA_AGENTS_MAX_QUEUED", repo, glob, "max_queued_agents", 32, 0
+        ),
+    )
