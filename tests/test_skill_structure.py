@@ -28,5 +28,5 @@ def test_skill_documents_hybrid_delegation_and_positional_capability():
     with open(_SKILL, encoding="utf-8") as fh:
         body = fh.read()
     assert "/ollama" in body
-    assert "capacidad" in body or "capability" in body   # positional routing (R1b)
-    assert "delega" in body.lower()                        # hybrid heuristic (R1c)
+    assert "capacidad" in body or "capability" in body  # positional routing (R1b)
+    assert "delega" in body.lower()  # hybrid heuristic (R1c)
