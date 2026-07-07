@@ -359,6 +359,22 @@ def test_connection_reset_during_read_maps_to_backend_error_not_raw_oserror():
     assert "connection" in str(exc.value).lower()
 
 
+def test_deeply_nested_json_body_maps_to_backend_error_not_raw_recursion_error():
+    # A malicious/hostile server can return a deeply-nested JSON body that trips
+    # Python's recursion limit inside json.loads. RecursionError is a RuntimeError, NOT
+    # a json.JSONDecodeError, so it is NOT caught by `except json.JSONDecodeError`
+    # alone — it must still map to the domain OllamaBackendError, never escape as a raw
+    # RecursionError past this module's boundary.
+    nested = ("[" * 20000) + ("]" * 20000)
+
+    def _deep(req, timeout=None):
+        return io.BytesIO(nested.encode("utf-8"))
+
+    with pytest.raises(OllamaBackendError) as exc:
+        OllamaBackend(_cfg(), urlopen=_deep).run("coder", "s", "p", "m", 60)
+    assert "not valid JSON" in str(exc.value)
+
+
 def test_incomplete_read_during_read_maps_to_backend_error_not_raw_exception():
     # http.client.IncompleteRead (a truncated read on a mid-response drop) is NOT an
     # OSError subclass — it must be mapped explicitly, not silently propagate raw.

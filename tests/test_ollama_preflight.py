@@ -175,6 +175,63 @@ def test_preflight_connection_reset_during_read_maps_to_domain_error():
         preflight(_cfg(), urlopen=_open)
 
 
+def test_preflight_deeply_nested_json_maps_to_domain_error_not_raw_recursion_error():
+    # A malicious/hostile endpoint can return a deeply-nested JSON /models body that
+    # trips Python's recursion limit inside json.loads. RecursionError is a
+    # RuntimeError, NOT a json.JSONDecodeError, so it is NOT caught by
+    # `except json.JSONDecodeError` alone — it must still map to the domain
+    # OllamaPreflightError, never escape as a raw RecursionError past this boundary.
+    nested = ("[" * 20000) + ("]" * 20000)
+
+    def _deep(req, timeout=None):
+        return io.BytesIO(nested.encode("utf-8"))
+
+    with pytest.raises(OllamaPreflightError):
+        preflight(_cfg(), urlopen=_deep)
+
+
+def test_preflight_success_response_body_is_closed_after_reading():
+    # No leaked descriptors on the success path: the HTTPResponse-like object must be
+    # closed once its body has been read, not left open for the lifetime of the process
+    # (mirrors backend.OllamaBackend's own success-path close).
+    payload = {"data": [{"id": "m-a"}, {"id": "m-b"}]}
+    resp = io.BytesIO(json.dumps(payload).encode("utf-8"))
+
+    def _open(req, timeout=None):
+        return resp
+
+    preflight(_cfg(), urlopen=_open)
+    assert resp.closed
+
+
+def test_preflight_http_error_response_body_is_closed_after_reading():
+    # No leaked descriptors on the error-abort path either: the HTTPError's body (itself
+    # a response-like object) must be closed (mirrors backend.OllamaBackend's own
+    # HTTPError-body cleanup).
+    fp = io.BytesIO(b"error detail")
+    err = urllib.error.HTTPError("u", 500, "Server Error", {}, fp)
+
+    def _open(req, timeout=None):
+        raise err
+
+    with pytest.raises(OllamaPreflightError):
+        preflight(_cfg(), urlopen=_open)
+    assert fp.closed
+
+
+def test_preflight_404_warn_and_proceed_still_closes_the_response_body(capsys):
+    # The warn-and-proceed early return (404/501) must not skip cleanup: the HTTPError
+    # body is still closed even though this path returns instead of raising.
+    fp = io.BytesIO(b"")
+    err = urllib.error.HTTPError("u", 404, "Not Found", {}, fp)
+
+    def _open(req, timeout=None):
+        raise err
+
+    preflight(_cfg(), urlopen=_open)  # no raise: proceeds normally
+    assert fp.closed
+
+
 def test_preflight_effective_model_present_passes_and_other_models_still_checked():
     # The override substitutes ONLY the given capability's slot; every other configured
     # capability's model is still validated against /models unchanged.

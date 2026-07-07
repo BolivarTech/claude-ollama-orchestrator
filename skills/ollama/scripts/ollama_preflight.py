@@ -39,6 +39,27 @@ def _redact(message: str, api_key: str | None) -> str:
     return message.replace(api_key, _REDACTED) if api_key else message
 
 
+def _safe_close(closable: Any) -> None:
+    """Best-effort ``close()`` on a response/error body (mirrors ``backend._safe_close``).
+
+    Args:
+        closable: Any object that may expose a ``close`` method (an
+            ``http.client.HTTPResponse``, ``urllib.error.HTTPError``, ``None``, or a
+            test double).
+
+    A missing ``close`` attribute (some test doubles are plain objects) or a failure
+    while closing must never mask the real result/exception already in flight — this is
+    resource cleanup, not a correctness path.
+    """
+    close = getattr(closable, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except OSError:
+        pass
+
+
 def preflight(
     config: OllamaAgentsConfig,
     *,
@@ -86,6 +107,7 @@ def preflight(
     req = urllib.request.Request(url, method="GET")
     if config.api_key:
         req.add_header("Authorization", f"Bearer {config.api_key}")
+    resp: Any = None
     try:
         resp = urlopen(req, timeout=PREFLIGHT_TIMEOUT)
         # Bounded read (mirrors backend.MAX_RESPONSE_BYTES): read at most ONE byte past
@@ -107,22 +129,28 @@ def preflight(
         # after substitution surfaces as the existing OllamaPreflightError below.
         payload = json.loads(raw.decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as exc:
-        if exc.code in (401, 403):
-            raise OllamaPreflightError(
-                _redact(
-                    f"Preflight auth failed ({exc.code}): check api_key / `ollama signin`.",
-                    config.api_key,
+        try:
+            if exc.code in (401, 403):
+                raise OllamaPreflightError(
+                    _redact(
+                        f"Preflight auth failed ({exc.code}): check api_key / `ollama signin`.",
+                        config.api_key,
+                    )
+                ) from None
+            if exc.code in (404, 501):
+                print(
+                    "WARNING: endpoint does not support listing models; skipping model check.",
+                    file=sys.stderr,
                 )
+                return
+            raise OllamaPreflightError(
+                _redact(f"Preflight HTTP {exc.code} at {url}.", config.api_key)
             ) from None
-        if exc.code in (404, 501):
-            print(
-                "WARNING: endpoint does not support listing models; skipping model check.",
-                file=sys.stderr,
-            )
-            return
-        raise OllamaPreflightError(
-            _redact(f"Preflight HTTP {exc.code} at {url}.", config.api_key)
-        ) from None
+        finally:
+            # The HTTPError itself carries the (unread here) error body; close it on
+            # every path — auth-abort, warn-and-proceed, or generic-abort — mirroring
+            # backend.OllamaBackend's own cleanup of the HTTPError body (no fd leak).
+            _safe_close(exc)
     except (socket.timeout, TimeoutError, urllib.error.URLError, http.client.IncompleteRead) as exc:
         raise OllamaPreflightError(
             _redact(
@@ -131,10 +159,13 @@ def preflight(
                 config.api_key,
             )
         ) from None
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, RecursionError) as exc:
         # A reverse proxy / misconfigured endpoint can return HTTP 200 with a non-JSON
-        # body (e.g. an HTML error page). Map it to a domain error instead of letting an
-        # uncaught json.JSONDecodeError crash the process with a raw traceback.
+        # body (e.g. an HTML error page), OR a malicious/hostile endpoint can return a
+        # deeply nested JSON body that trips Python's recursion limit inside json.loads
+        # (RecursionError is a RuntimeError, NOT a JSONDecodeError, so it is NOT caught
+        # by `except json.JSONDecodeError` alone). Map BOTH to a domain error instead of
+        # letting either crash the process with a raw traceback.
         raise OllamaPreflightError(
             _redact(
                 f"Preflight failed: {url} returned a non-JSON response ({exc}).", config.api_key
@@ -149,6 +180,13 @@ def preflight(
         raise OllamaPreflightError(
             _redact(f"Preflight connection error: {exc}", config.api_key)
         ) from None
+    finally:
+        # Close the /models response on EVERY path — success, oversized-body abort, or a
+        # shape/JSON error raised further below — never leave the socket/fd open
+        # (mirrors backend.OllamaBackend's `finally: _safe_close(resp)`). `resp` is
+        # `None` here whenever `urlopen` itself raised (e.g. the HTTPError/URLError
+        # arms above), and `_safe_close(None)` is a no-op.
+        _safe_close(resp)
 
     # The /models body is untrusted server output: it may be valid JSON of the WRONG
     # shape (a bare array/string/number/null, or {"data": null}). Guard the shape BEFORE

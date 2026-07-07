@@ -331,9 +331,13 @@ class OllamaBackend(AgentBackend):
             # its HTTPError subclass) are themselves OSError subclasses, so both are
             # caught above with their more actionable messages BEFORE this catch-all.
             raise OllamaBackendError(self._redact(f"Ollama connection error: {exc}")) from None
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, RecursionError) as exc:
             # A proxy/gateway can return 200 with a non-JSON body (e.g. b'<html>502
-            # Bad Gateway</html>'); map it to a domain error instead of crashing.
+            # Bad Gateway</html>'), OR a malicious/hostile server can return a deeply
+            # nested JSON body that trips Python's recursion limit inside json.loads
+            # (RecursionError is a RuntimeError, NOT a JSONDecodeError, so it is NOT
+            # caught by `except json.JSONDecodeError` alone) — map BOTH to a domain
+            # error instead of letting either crash the process with a raw exception.
             raise OllamaBackendError(self._redact("Unexpected response: not valid JSON")) from exc
         finally:
             _safe_close(resp)
