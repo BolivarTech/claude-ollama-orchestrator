@@ -139,7 +139,7 @@ def _load_toml(path: str | None) -> dict[str, Any]:
         raise OllamaConfigError(f"Malformed TOML in {path}: {exc}") from exc
 
 
-def _require_str(value: Any, key: str) -> None:
+def _require_str(value: Any, key: str, *, redact_value: bool = False) -> None:
     """Guard a config value that MUST be a string once present.
 
     Applied uniformly to every string-typed config key resolved from TOML/env
@@ -158,12 +158,22 @@ def _require_str(value: Any, key: str) -> None:
             ``or``-chain / ``_first_present`` callers).
         key: Config key name for the error message (e.g. ``"base_url"``,
             ``"models.coder"``).
+        redact_value: When ``True``, the error message omits the offending
+            value entirely (only the key name and the wrong type are
+            reported). **Must** be ``True`` at every ``api_key`` call site
+            (NR3: the key must never be logged/written to artifacts, including
+            error messages) — a malformed TOML such as ``api_key =
+            ["sk-real-secret"]`` must never embed the secret in the exception
+            text via ``{value!r}``. Non-secret keys (``base_url``, ``models``,
+            ``structured``) keep the default ``False`` for helpful diagnostics.
 
     Raises:
         OllamaConfigError: if *value* is present (not ``None``) and not a
             ``str``.
     """
     if value is not None and not isinstance(value, str):
+        if redact_value:
+            raise OllamaConfigError(f"{key} must be a string, got {type(value).__name__}")
         raise OllamaConfigError(f"{key} must be a string, got {type(value).__name__}: {value!r}")
 
 
@@ -283,11 +293,15 @@ def resolve_config(
         OllamaConfigError: on malformed TOML, on an invalid value (bad int/bool/
             enum), or on a **non-string value for a string-typed key**
             (``base_url``, ``api_key``, any ``models.<cap>``, any
-            ``structured.<cap>``) -- every such key is guarded uniformly via
+            ``structured.<cap>``) -- every such key is guarded via
             ``_require_str`` so a stray ``base_url = 123`` / ``api_key = true`` /
             ``models.coder = 42`` in TOML never reaches later string operations
             (``normalize_base_url``, header building, the backend payload)
-            un-typed.
+            un-typed. For ``base_url`` only the *winning* layer (per the
+            precedence above) is type-checked -- a malformed value in a
+            shadowed/losing layer never breaks resolution. ``api_key`` errors
+            never embed the offending value (NR3: redacted in every error
+            message, not just non-error paths).
     """
     glob = _load_toml(global_path)
     repo = _load_toml(repo_path)
@@ -296,24 +310,39 @@ def resolve_config(
     repo_base = repo.get("base_url")
     glob_base = glob.get("base_url")
     generic_host = env.get("OLLAMA_HOST")
-    _require_str(env_host, "OLLAMA_AGENTS_HOST")
-    _require_str(repo_base, "base_url (repo)")
-    _require_str(glob_base, "base_url (global)")
-    _require_str(generic_host, "OLLAMA_HOST")
-    raw_base = env_host or repo_base or glob_base or generic_host or DEFAULT_BASE_URL
+    # Select the WINNING layer first (same truthiness-based precedence as the
+    # `or`-chain this replaces: env host > repo > global > generic host >
+    # default; a falsy/absent candidate at any layer is skipped, matching
+    # presence-semantics for base_url), THEN validate + normalize only that
+    # winner. A malformed value in a losing/shadowed layer (e.g. a stray
+    # `base_url = 123` in the global TOML that a valid repo `base_url` should
+    # shadow) is never inspected and never breaks resolution.
+    raw_base = None
+    for candidate, label in (
+        (env_host, "OLLAMA_AGENTS_HOST"),
+        (repo_base, "base_url (repo)"),
+        (glob_base, "base_url (global)"),
+        (generic_host, "OLLAMA_HOST"),
+    ):
+        if candidate:
+            _require_str(candidate, label)
+            raw_base = candidate
+            break
+    if raw_base is None:
+        raw_base = DEFAULT_BASE_URL
     base_url = normalize_base_url(raw_base)
 
     if "OLLAMA_AGENTS_API_KEY" in env:
-        _require_str(env["OLLAMA_AGENTS_API_KEY"], "OLLAMA_AGENTS_API_KEY")
+        _require_str(env["OLLAMA_AGENTS_API_KEY"], "OLLAMA_AGENTS_API_KEY", redact_value=True)
         api_key = env["OLLAMA_AGENTS_API_KEY"] or None
     elif "api_key" in repo:
-        _require_str(repo["api_key"], "api_key (repo)")
+        _require_str(repo["api_key"], "api_key (repo)", redact_value=True)
         api_key = repo["api_key"] or None
     elif "api_key" in glob:
-        _require_str(glob["api_key"], "api_key (global)")
+        _require_str(glob["api_key"], "api_key (global)", redact_value=True)
         api_key = glob["api_key"] or None
     elif "OLLAMA_API_KEY" in env:
-        _require_str(env["OLLAMA_API_KEY"], "OLLAMA_API_KEY")
+        _require_str(env["OLLAMA_API_KEY"], "OLLAMA_API_KEY", redact_value=True)
         api_key = env["OLLAMA_API_KEY"] or None
     else:
         api_key = None

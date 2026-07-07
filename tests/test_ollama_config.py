@@ -235,3 +235,48 @@ def test_non_string_model_raises_config_error(tmp_path):
     with pytest.raises(OllamaConfigError) as exc:
         resolve_config(global_path=None, repo_path=r, env={})
     assert "models.coder" in str(exc.value)
+
+
+def test_non_string_api_key_does_not_leak_secret_value(tmp_path):
+    # Finding 1 (SECURITY): a malformed api_key (array instead of scalar) must raise
+    # a REDACTED error -- the real secret must never appear in the exception message
+    # (NR3: api_key redacted in every error, not just the happy path).
+    r = _write(tmp_path, "repo.toml", 'api_key = ["sk-secret-xyz"]\n')
+    with pytest.raises(OllamaConfigError) as exc:
+        resolve_config(global_path=None, repo_path=r, env={})
+    assert "sk-secret-xyz" not in str(exc.value)
+    assert "api_key" in str(exc.value)
+
+
+def test_shadowed_invalid_base_url_in_losing_layer_is_ignored(tmp_path):
+    # Finding 2 (LOGIC): a malformed base_url in a SHADOWED layer (global, here) must
+    # never break resolution when a valid higher-precedence layer (repo) wins -- only
+    # the winning layer is type-checked.
+    g = _write(tmp_path, "global.toml", "base_url = 123\n")
+    r = _write(tmp_path, "repo.toml", 'base_url = "http://repo-valid:9999"\n')
+    cfg = resolve_config(global_path=g, repo_path=r, env={})
+    assert cfg.base_url == "http://repo-valid:9999/v1"
+
+
+def test_structured_invalid_value_raises(tmp_path):
+    r = _write(tmp_path, "repo.toml", '[structured]\ncoder = "maybe"\n')
+    with pytest.raises(OllamaConfigError):
+        resolve_config(global_path=None, repo_path=r, env={})
+
+
+def test_generic_ollama_api_key_env_is_fallback():
+    # R6: with no OLLAMA_AGENTS_API_KEY / repo / global api_key, the generic
+    # OLLAMA_API_KEY env var wins as the last-resort fallback.
+    cfg = resolve_config(global_path=None, repo_path=None, env={"OLLAMA_API_KEY": "sk-generic"})
+    assert cfg.api_key == "sk-generic"
+
+
+def test_invalid_max_queued_raises():
+    with pytest.raises(OllamaConfigError):
+        resolve_config(global_path=None, repo_path=None, env={"OLLAMA_AGENTS_MAX_QUEUED": "-1"})
+
+
+def test_max_queued_bool_raises(tmp_path):
+    r = _write(tmp_path, "repo.toml", "max_queued_agents = true\n")
+    with pytest.raises(OllamaConfigError):
+        resolve_config(global_path=None, repo_path=r, env={})
