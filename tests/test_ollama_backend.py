@@ -73,12 +73,14 @@ def test_unexpected_shape_raises_backend_error():
     class _Bad:
         def __call__(self, req, timeout=None):
             return io.BytesIO(b'{"unexpected": true}')
+
     with pytest.raises(OllamaBackendError):
         OllamaBackend(_cfg(), urlopen=_Bad()).run("coder", "s", "p", "m", 60)
 
 
 def test_timeout_maps_to_timeout_error():
     import socket
+
     rec = _Recorder(error=socket.timeout("slow"))
     with pytest.raises(TimeoutError):
         OllamaBackend(_cfg(), urlopen=rec).run("coder", "s", "p", "m", 1)
@@ -94,7 +96,7 @@ def test_http_error_redacts_api_key():
 
 def test_downgrade_on_400_response_format_retries_without_it():
     err = urllib.error.HTTPError(
-        "u", 400, "Bad Request", {}, io.BytesIO(b'response_format not supported')
+        "u", 400, "Bad Request", {}, io.BytesIO(b"response_format not supported")
     )
     rec = _Recorder(content="ok", error_once=err)  # first call 400, second succeeds
     out = OllamaBackend(_cfg(), urlopen=rec).run(
@@ -116,8 +118,13 @@ def test_429_backs_off_respecting_retry_after_then_succeeds():
 def test_429_exhausted_raises_backend_error_with_redaction():
     err = urllib.error.HTTPError("u", 429, "Too Many", {}, io.BytesIO(b""))
     rec = _Recorder(error=err)  # always 429
-    be = OllamaBackend(_cfg(api_key="sk-secret"), urlopen=rec,
-                       sleep=lambda _s: None, rng=lambda: 0.0, max_backoffs=2)
+    be = OllamaBackend(
+        _cfg(api_key="sk-secret"),
+        urlopen=rec,
+        sleep=lambda _s: None,
+        rng=lambda: 0.0,
+        max_backoffs=2,
+    )
     with pytest.raises(OllamaBackendError) as exc:
         be.run("coder", "s", "p", "m", 60)
     assert "sk-secret" not in str(exc.value)
@@ -128,6 +135,7 @@ def test_non_json_server_response_maps_to_backend_error():
     # resulting JSONDecodeError to a domain error, not crash the process.
     def _html(req, timeout=None):
         return io.BytesIO(b"<html>502 Bad Gateway</html>")
+
     with pytest.raises(OllamaBackendError):
         OllamaBackend(_cfg(), urlopen=_html).run("coder", "s", "p", "m", 60)
 
@@ -140,6 +148,7 @@ def test_invalid_utf8_response_bytes_do_not_crash():
     # other non-JSON body — not a crash.
     def _bad_utf8(req, timeout=None):
         return io.BytesIO(b"\xff\xfe garbage \x80\x81")
+
     with pytest.raises(OllamaBackendError):
         OllamaBackend(_cfg(), urlopen=_bad_utf8).run("coder", "s", "p", "m", 60)
 
@@ -152,8 +161,8 @@ def test_429_backoff_is_bounded_by_the_per_delegation_deadline():
     rec = _Recorder(error=err)
     be = OllamaBackend(_cfg(), urlopen=rec, sleep=slept.append)
     with pytest.raises(OllamaBackendError):
-        be.run("coder", "s", "p", "m", 1)   # 1s budget « 999999s Retry-After → deadline
-    assert slept == []                        # never slept past the deadline
+        be.run("coder", "s", "p", "m", 1)  # 1s budget « 999999s Retry-After → deadline
+    assert slept == []  # never slept past the deadline
 
 
 def test_run_honors_a_caller_supplied_deadline_over_timeout():
@@ -161,20 +170,22 @@ def test_run_honors_a_caller_supplied_deadline_over_timeout():
     # run must NOT derive a fresh timeout budget — the first 429 backoff is refused
     # immediately, so a large per-call `timeout` cannot re-expand the shared budget.
     import time as _t
+
     err = urllib.error.HTTPError("u", 429, "Too Many", {"Retry-After": "5"}, io.BytesIO(b""))
     slept: list[float] = []
     rec = _Recorder(error=err)
     be = OllamaBackend(_cfg(), urlopen=rec, sleep=slept.append)
-    past = _t.monotonic() - 1.0                # deadline already in the past
+    past = _t.monotonic() - 1.0  # deadline already in the past
     with pytest.raises(OllamaBackendError):
         be.run("coder", "s", "p", "m", 9999, deadline=past)  # huge timeout ignored
-    assert slept == []                          # deadline (not timeout) governed → no sleep
+    assert slept == []  # deadline (not timeout) governed → no sleep
 
 
 def test_per_call_socket_timeout_clamped_to_remaining_deadline():
     # R25: each urlopen's socket timeout is the REMAINING budget, never the nominal
     # `timeout`, so one call plus a retry can never together exceed the deadline (no 2×).
     import time as _t
+
     seen: list[float] = []
 
     def _urlopen(req, timeout=None):
@@ -183,20 +194,21 @@ def test_per_call_socket_timeout_clamped_to_remaining_deadline():
 
     be = OllamaBackend(_cfg(), urlopen=_urlopen)
     be.run("coder", "s", "p", "m", 9999, deadline=_t.monotonic() + 5)  # 5s left « 9999
-    assert seen and 1.0 <= seen[0] <= 5.0        # clamped to remaining budget, not 9999
+    assert seen and 1.0 <= seen[0] <= 5.0  # clamped to remaining budget, not 9999
 
 
 def test_429_retry_after_http_date_is_parsed():
     # Retry-After may be an HTTP-date (RFC 7231), not only integer seconds.
     from datetime import datetime, timedelta, timezone
     from email.utils import format_datetime
+
     when = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=2))
     err = urllib.error.HTTPError("u", 429, "Too Many", {"Retry-After": when}, io.BytesIO(b""))
     slept: list[float] = []
-    rec = _Recorder(content="ok", error_once=err)   # 429 (date) once, then success
+    rec = _Recorder(content="ok", error_once=err)  # 429 (date) once, then success
     be = OllamaBackend(_cfg(), urlopen=rec, sleep=slept.append)
     be.run("coder", "s", "p", "m", 60)
-    assert slept and 0.0 <= slept[0] <= 3.0          # ~2s derived from the date, not jitter
+    assert slept and 0.0 <= slept[0] <= 3.0  # ~2s derived from the date, not jitter
 
 
 def test_oversized_response_body_raises_backend_error():
@@ -205,6 +217,7 @@ def test_oversized_response_body_raises_backend_error():
     class _Oversized:
         def __call__(self, req, timeout=None):
             return io.BytesIO(b"x" * (MAX_RESPONSE_BYTES + 1))
+
     with pytest.raises(OllamaBackendError) as exc:
         OllamaBackend(_cfg(), urlopen=_Oversized()).run("coder", "s", "p", "m", 60)
     assert "MAX_RESPONSE_BYTES" in str(exc.value)
@@ -223,5 +236,6 @@ def test_response_read_is_called_with_a_bound_never_unbounded():
     class _Rec:
         def __call__(self, req, timeout=None):
             return _Resp()
+
     OllamaBackend(_cfg(), urlopen=_Rec()).run("coder", "s", "p", "m", 60)
     assert seen["n"] == MAX_RESPONSE_BYTES + 1
