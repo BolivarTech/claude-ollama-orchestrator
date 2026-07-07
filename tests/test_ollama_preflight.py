@@ -18,8 +18,9 @@ from ollama_preflight import PREFLIGHT_MAX_RESPONSE_BYTES, preflight
 
 def _cfg(models=None, api_key=None):
     cfg = resolve_config(global_path=None, repo_path=None, env={})
-    return replace(cfg, api_key=api_key,
-                   models=MappingProxyType(models or {"coder": "m-a", "reviewer": "m-b"}))
+    return replace(
+        cfg, api_key=api_key, models=MappingProxyType(models or {"coder": "m-a", "reviewer": "m-b"})
+    )
 
 
 def _fake_urlopen(payload=None, error=None):
@@ -27,6 +28,7 @@ def _fake_urlopen(payload=None, error=None):
         if error is not None:
             raise error
         return io.BytesIO(json.dumps(payload).encode("utf-8"))
+
     return _open
 
 
@@ -65,6 +67,7 @@ def test_preflight_aborts_on_non_json_response_with_actionable_message():
     # OllamaPreflightError, never an uncaught json.JSONDecodeError/raw traceback.
     def _html(req, timeout=None):
         return io.BytesIO(b"<html>502 Bad Gateway</html>")
+
     with pytest.raises(OllamaPreflightError) as exc:
         preflight(_cfg(), urlopen=_html)
     assert "non-JSON" in str(exc.value)
@@ -78,6 +81,7 @@ def test_preflight_invalid_utf8_response_bytes_do_not_crash():
     # any other non-JSON body — not a crash.
     def _bad_utf8(req, timeout=None):
         return io.BytesIO(b"\xff\xfe not valid utf-8 \x80\x81")
+
     with pytest.raises(OllamaPreflightError):
         preflight(_cfg(), urlopen=_bad_utf8)
 
@@ -87,6 +91,7 @@ def test_preflight_oversized_models_response_raises_actionable_error():
     # bare resp.read() — a runaway/hostile response is rejected before any decode.
     def _oversized(req, timeout=None):
         return io.BytesIO(b"x" * (PREFLIGHT_MAX_RESPONSE_BYTES + 1))
+
     with pytest.raises(OllamaPreflightError) as exc:
         preflight(_cfg(), urlopen=_oversized)
     assert "PREFLIGHT_MAX_RESPONSE_BYTES" in str(exc.value)
@@ -99,8 +104,12 @@ def test_preflight_checks_the_effective_model_override_not_the_config_default():
     # IS present), but the effective override "does-not-exist:cloud" is NOT present.
     payload = {"data": [{"id": "m-a"}, {"id": "m-b"}]}
     with pytest.raises(OllamaPreflightError) as exc:
-        preflight(_cfg(), urlopen=_fake_urlopen(payload),
-                  capability="coder", effective_model="does-not-exist:cloud")
+        preflight(
+            _cfg(),
+            urlopen=_fake_urlopen(payload),
+            capability="coder",
+            effective_model="does-not-exist:cloud",
+        )
     assert "does-not-exist:cloud" in str(exc.value)
 
 
@@ -108,9 +117,17 @@ def test_preflight_effective_model_present_passes_and_other_models_still_checked
     # The override substitutes ONLY the given capability's slot; every other configured
     # capability's model is still validated against /models unchanged.
     payload = {"data": [{"id": "override-model:cloud"}, {"id": "m-b"}]}
-    preflight(_cfg(), urlopen=_fake_urlopen(payload),
-              capability="coder", effective_model="override-model:cloud")  # no raise
+    preflight(
+        _cfg(),
+        urlopen=_fake_urlopen(payload),
+        capability="coder",
+        effective_model="override-model:cloud",
+    )  # no raise
     with pytest.raises(OllamaPreflightError) as exc:
-        preflight(_cfg(), urlopen=_fake_urlopen({"data": [{"id": "override-model:cloud"}]}),
-                  capability="coder", effective_model="override-model:cloud")
+        preflight(
+            _cfg(),
+            urlopen=_fake_urlopen({"data": [{"id": "override-model:cloud"}]}),
+            capability="coder",
+            effective_model="override-model:cloud",
+        )
     assert "m-b" in str(exc.value)  # reviewer's configured model is still enforced
