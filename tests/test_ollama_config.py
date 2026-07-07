@@ -4,6 +4,8 @@
 """Config resolver + base_url normalization (idempotent, per-key precedence)."""
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from errors import OllamaConfigError
 from ollama_config import DEFAULT_BASE_URL, normalize_base_url
@@ -43,3 +45,9 @@ def test_empty_or_whitespace_base_url_raises_config_error():
         normalize_base_url("   ")
     with pytest.raises(OllamaConfigError):
         normalize_base_url("///")  # all-slashes collapses to empty after stripping
+
+
+@given(st.text(alphabet="abcdefghijklmnop.:/-", min_size=1, max_size=40))
+def test_normalize_base_url_never_produces_double_v1(s):
+    out = normalize_base_url(s if "://" in s else "http://" + s)
+    assert "/v1/v1" not in out
