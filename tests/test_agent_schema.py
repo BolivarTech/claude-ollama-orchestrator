@@ -128,6 +128,21 @@ def test_non_structured_capability_has_no_validator_branch():
         validate_output("coder", {"anything": 1})  # coder is free-text, not structured
 
 
+@pytest.mark.parametrize("non_dict", [["not", "a", "dict"], None, "a string", 42])
+def test_reviewer_non_dict_top_level_raises_validation_error(non_dict):
+    # R23 fail-closed branch: a non-dict top-level must raise ValidationError (the
+    # domain exception), never an unhandled AttributeError/TypeError from downstream
+    # dict-only operations like `.keys()` or `in obj`.
+    with pytest.raises(ValidationError):
+        validate_output("reviewer", non_dict)
+
+
+@pytest.mark.parametrize("non_dict", [["not", "a", "dict"], None, "a string", 42])
+def test_tester_non_dict_top_level_raises_validation_error(non_dict):
+    with pytest.raises(ValidationError):
+        validate_output("tester", non_dict)
+
+
 def test_invisibles_stripped_from_all_structured_string_fields():
     # R23: EVERY structured string field is sanitized, not just reviewer.title.
     zwsp, rlo, bom = chr(0x200B), chr(0x202E), chr(0xFEFF)

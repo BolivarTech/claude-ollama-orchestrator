@@ -57,4 +57,8 @@ DISCRIMINATOR_KEYS: dict[str, tuple[str, ...]] = {
     "reviewer": ("capability", "findings"),
     "tester": ("capability", "tests"),
 }
-_SEVERITIES = frozenset(_SEVERITY)
+# Public contract (R29): the shared lockstep source-of-truth for the set of valid
+# ``severity`` values, consumed by validate.py. Deliberately public (no leading
+# underscore) since it is imported cross-module, unlike the module-local `_SEVERITY`
+# list used only to build the schema's enum above.
+SEVERITIES = frozenset(_SEVERITY)

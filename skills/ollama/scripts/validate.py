@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from agent_schema import SCHEMAS, _SEVERITIES
+from agent_schema import SCHEMAS, SEVERITIES
 from errors import ValidationError
 
 # Anti-DoS bound (R23) shared with the input-reading path; enforced in run_ollama's
@@ -130,10 +130,15 @@ def validate_output(capability: str, obj: dict[str, Any]) -> dict[str, Any]:
             raise ValidationError("reviewer: findings must be a list")
         new_findings = []
         for f in findings:
+            # NOTE: this allowed/required key set MUST be kept in lockstep with
+            # SCHEMAS["reviewer"]["properties"]["findings"]["items"]["properties"] in
+            # agent_schema.py (no jsonschema engine here, R29 is stdlib-only) — the
+            # bidirectional corpus test (test_agent_schema.py) is the safety net that
+            # catches drift if one side is edited without the other.
             if not isinstance(f, dict) or {"severity", "title", "detail"} - f.keys():
                 raise ValidationError("reviewer: malformed finding")
             _reject_extra_keys(f, {"severity", "title", "detail"}, "reviewer finding")
-            if f["severity"] not in _SEVERITIES:
+            if f["severity"] not in SEVERITIES:
                 raise ValidationError(f"reviewer: bad severity {f['severity']!r}")
             # Lockstep with the schema's ``type: "string"`` (R29): reject a non-string
             # instead of ``str()``-coercing it (which would accept ints/None the schema rejects).
@@ -153,6 +158,11 @@ def validate_output(capability: str, obj: dict[str, Any]) -> dict[str, Any]:
             raise ValidationError("tester: tests must be a list")
         new_tests = []
         for t in tests:
+            # NOTE: this allowed/required key set MUST be kept in lockstep with
+            # SCHEMAS["tester"]["properties"]["tests"]["items"]["properties"] in
+            # agent_schema.py (no jsonschema engine here, R29 is stdlib-only) — the
+            # bidirectional corpus test (test_agent_schema.py) is the safety net that
+            # catches drift if one side is edited without the other.
             if not isinstance(t, dict) or {"name", "code"} - t.keys():
                 raise ValidationError("tester: malformed test")
             _reject_extra_keys(t, {"name", "code"}, "tester test")
