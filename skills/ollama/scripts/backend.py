@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import random
 import socket
@@ -12,6 +13,8 @@ import time
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable
 
 from errors import OllamaBackendError
@@ -27,6 +30,30 @@ _BACKOFF_CAP_SECONDS = 30
 # TOP of this bound — the two are complementary (MS6's can only tighten, never loosen,
 # this floor), never conflicting.
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+# Error bodies (4xx/5xx diagnostic text/JSON) are typically small; cap the read
+# independently and much tighter than MAX_RESPONSE_BYTES so a malicious/broken endpoint
+# cannot force a large in-memory read via its *error* path either.
+MAX_ERROR_BODY_BYTES = 64 * 1024
+
+
+def _safe_close(closable: Any) -> None:
+    """Best-effort ``close()`` on a response/error body.
+
+    Args:
+        closable: Any object that may expose a ``close`` method (an
+            ``http.client.HTTPResponse``, ``urllib.error.HTTPError``, or a test double).
+
+    A missing ``close`` attribute (some test doubles are plain objects) or a failure
+    while closing must never mask the real result/exception already in flight — this is
+    resource cleanup, not a correctness path.
+    """
+    close = getattr(closable, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except OSError:
+        pass
 
 
 class _ResponseFormatRejected(Exception):
@@ -228,6 +255,7 @@ class OllamaBackend(AgentBackend):
                 (all messages redacted).
             TimeoutError: on socket timeout.
         """
+        resp: Any = None
         try:
             resp = self._urlopen(req, timeout=timeout)
             # Absolute DoS backstop (MAX_RESPONSE_BYTES, always-on): read at most ONE
@@ -238,8 +266,10 @@ class OllamaBackend(AgentBackend):
             raw = resp.read(MAX_RESPONSE_BYTES + 1)
             if len(raw) > MAX_RESPONSE_BYTES:
                 raise OllamaBackendError(
-                    f"response body exceeded MAX_RESPONSE_BYTES ({MAX_RESPONSE_BYTES} "
-                    "bytes) — server sent an oversized response"
+                    self._redact(
+                        f"response body exceeded MAX_RESPONSE_BYTES ({MAX_RESPONSE_BYTES} "
+                        "bytes) — server sent an oversized response"
+                    )
                 )
             # The chat-completions response body is untrusted server output: decode
             # with errors="replace" (U+FFFD substitution) so malformed UTF-8 bytes
@@ -248,50 +278,71 @@ class OllamaBackend(AgentBackend):
             # OllamaBackendError below.
             payload = json.loads(raw.decode("utf-8", errors="replace"))
         except urllib.error.HTTPError as exc:
-            detail = ""
-            if exc.fp is not None:
-                detail = exc.read().decode("utf-8", errors="replace").lower()
-            if exc.code == 400 and ("response_format" in detail or "json_schema" in detail):
-                raise _ResponseFormatRejected() from None
-            if exc.code == 429:
-                header = exc.headers.get("Retry-After") if exc.headers else None
-                retry_after: float | None = None
-                if header:
-                    header = header.strip()
-                    if header.isdigit():
-                        retry_after = float(header)
-                    else:  # best-effort HTTP-date form (RFC 7231); else fall back to jitter.
-                        try:
-                            from datetime import datetime, timezone
-                            from email.utils import parsedate_to_datetime
-
-                            when = parsedate_to_datetime(header)
-                            if when is not None:
-                                if when.tzinfo is None:
-                                    when = when.replace(tzinfo=timezone.utc)
-                                retry_after = max(
-                                    (when - datetime.now(timezone.utc)).total_seconds(), 0.0
-                                )
-                        except (TypeError, ValueError, OverflowError):
-                            retry_after = None
-                raise _RateLimited(retry_after) from None
-            raise OllamaBackendError(
-                self._redact(f"Ollama HTTP {exc.code}: {exc.reason} {detail}".strip())
-            ) from None
+            try:
+                detail = ""
+                if exc.fp is not None:
+                    # Bounded read, mirroring the success-path backstop above: a
+                    # malicious/broken endpoint must not be able to force an unbounded
+                    # in-memory read via its *error* body either. Best-effort: a read
+                    # failure degrades to an empty detail rather than masking exc.
+                    try:
+                        raw_detail = exc.read(MAX_ERROR_BODY_BYTES + 1)
+                    except OSError:
+                        raw_detail = b""
+                    detail = raw_detail.decode("utf-8", errors="replace").lower()
+                if exc.code == 400 and ("response_format" in detail or "json_schema" in detail):
+                    raise _ResponseFormatRejected() from None
+                if exc.code == 429:
+                    header = exc.headers.get("Retry-After") if exc.headers else None
+                    retry_after: float | None = None
+                    if header:
+                        header = header.strip()
+                        if header.isdigit():
+                            retry_after = float(header)
+                        else:  # best-effort HTTP-date (RFC 7231); else fall back to jitter.
+                            try:
+                                when = parsedate_to_datetime(header)
+                                if when is not None:
+                                    if when.tzinfo is None:
+                                        when = when.replace(tzinfo=timezone.utc)
+                                    retry_after = max(
+                                        (when - datetime.now(timezone.utc)).total_seconds(),
+                                        0.0,
+                                    )
+                            except (TypeError, ValueError, OverflowError):
+                                retry_after = None
+                    raise _RateLimited(retry_after) from None
+                raise OllamaBackendError(
+                    self._redact(f"Ollama HTTP {exc.code}: {exc.reason} {detail}".strip())
+                ) from None
+            finally:
+                _safe_close(exc)
         except (socket.timeout, TimeoutError) as exc:
             raise TimeoutError(self._redact(f"Delegation timed out: {exc}")) from None
         except urllib.error.URLError as exc:
             raise OllamaBackendError(
                 self._redact(f"Cannot reach Ollama at {self._config.base_url}: {exc.reason}")
             ) from None
+        except (OSError, http.client.IncompleteRead) as exc:
+            # Any other connect/read failure not already covered above (e.g. a
+            # ConnectionResetError or a truncated read on a mid-response connection
+            # drop, realistic for `:cloud` endpoints) must map to a domain error, never
+            # propagate as a raw non-domain exception. NOTE: urllib.error.URLError (and
+            # its HTTPError subclass) are themselves OSError subclasses, so both are
+            # caught above with their more actionable messages BEFORE this catch-all.
+            raise OllamaBackendError(self._redact(f"Ollama connection error: {exc}")) from None
         except json.JSONDecodeError as exc:
             # A proxy/gateway can return 200 with a non-JSON body (e.g. b'<html>502
             # Bad Gateway</html>'); map it to a domain error instead of crashing.
             raise OllamaBackendError(self._redact("Unexpected response: not valid JSON")) from exc
+        finally:
+            _safe_close(resp)
         try:
             content = payload["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise OllamaBackendError("Unexpected OpenAI-compatible response shape") from exc
+            raise OllamaBackendError(
+                self._redact("Unexpected OpenAI-compatible response shape")
+            ) from exc
         if content is None:
             # A model that returns a null `content` (e.g. an empty/failed completion) must
             # surface as a domain error, not str(None) == "None" — a literal "None" string
@@ -339,9 +390,26 @@ class OllamaBackend(AgentBackend):
         # single R25 budget; only derive one when called directly (deadline is None).
         if deadline is None:
             deadline = time.monotonic() + timeout
+        # `capability` is intentionally unused in this transactional core; it is threaded
+        # through the ``AgentBackend`` contract for MS2 telemetry (token accounting by
+        # capability/model), not dead code.
         req = self._build_request(system_prompt, prompt, model, response_format)
         try:
             return self._call(req, deadline)
         except _ResponseFormatRejected:
             downgraded = self._build_request(system_prompt, prompt, model, None)
-            return self._call(downgraded, deadline)
+            try:
+                return self._call(downgraded, deadline)
+            except _ResponseFormatRejected:
+                # The DOWNGRADED (no response_format) request was STILL rejected as a
+                # response_format/json_schema 400 — e.g. a proxy whose error body
+                # generically mentions those terms regardless of what was actually sent.
+                # No further downgrade is possible; surface a domain error instead of
+                # letting this internal signal escape the module boundary.
+                raise OllamaBackendError(
+                    self._redact(
+                        "Ollama rejected response_format on both the original and the "
+                        "downgraded (no response_format) request; no further downgrade "
+                        "is possible."
+                    )
+                ) from None

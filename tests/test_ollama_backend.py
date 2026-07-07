@@ -10,7 +10,7 @@ from dataclasses import replace
 
 import pytest
 
-from backend import MAX_RESPONSE_BYTES, OllamaBackend
+from backend import MAX_ERROR_BODY_BYTES, MAX_RESPONSE_BYTES, OllamaBackend
 from errors import OllamaBackendError
 from ollama_config import resolve_config
 
@@ -26,6 +26,17 @@ class _Recorder:
         self.content, self.error, self.error_once = content, error, error_once
         self.requests: list = []
         self._raised_once = False
+        # A persistent `error` (raised on EVERY call — e.g. 429-exhaustion / multi-attempt
+        # tests) must behave like a real server: every attempt gets its OWN response
+        # object. Production code now closes an HTTPError's body after reading it, so
+        # replaying the exact same object/fp on a second call would hit "I/O operation on
+        # closed file" — snapshot the body ONCE here and rebuild a fresh, independently
+        # readable+closable HTTPError on every raise instead of reusing the same instance.
+        self._error_snapshot: tuple[str, int, str, object, bytes] | None = None
+        if isinstance(error, urllib.error.HTTPError) and error.fp is not None:
+            body = error.fp.read()
+            error.fp.seek(0)
+            self._error_snapshot = (error.filename, error.code, error.msg, error.hdrs, body)
 
     def __call__(self, req, timeout=None):
         self.requests.append(req)
@@ -33,6 +44,9 @@ class _Recorder:
             self._raised_once = True
             raise self.error_once
         if self.error is not None:
+            if self._error_snapshot is not None:
+                url, code, msg, hdrs, body = self._error_snapshot
+                raise urllib.error.HTTPError(url, code, msg, hdrs, io.BytesIO(body))
             raise self.error
         body = {"choices": [{"message": {"content": self.content}}]}
         return io.BytesIO(json.dumps(body).encode("utf-8"))
@@ -69,13 +83,26 @@ def test_auth_header_only_when_api_key_present():
     assert rec2.requests[-1].get_header("Authorization") is None
 
 
-def test_unexpected_shape_raises_backend_error():
+@pytest.mark.parametrize(
+    "raw_body",
+    [
+        pytest.param(b'{"unexpected": true}', id="missing-choices-key"),
+        pytest.param(b"[]", id="top-level-list"),
+        pytest.param(b"null", id="top-level-null"),
+        pytest.param(b'{"choices": []}', id="empty-choices"),
+        pytest.param(b'{"choices": [{"message": null}]}', id="null-message"),
+    ],
+)
+def test_unexpected_shape_raises_backend_error(raw_body):
     class _Bad:
+        def __init__(self, body):
+            self._body = body
+
         def __call__(self, req, timeout=None):
-            return io.BytesIO(b'{"unexpected": true}')
+            return io.BytesIO(self._body)
 
     with pytest.raises(OllamaBackendError):
-        OllamaBackend(_cfg(), urlopen=_Bad()).run("coder", "s", "p", "m", 60)
+        OllamaBackend(_cfg(), urlopen=_Bad(raw_body)).run("coder", "s", "p", "m", 60)
 
 
 def test_timeout_maps_to_timeout_error():
@@ -239,3 +266,113 @@ def test_response_read_is_called_with_a_bound_never_unbounded():
 
     OllamaBackend(_cfg(), urlopen=_Rec()).run("coder", "s", "p", "m", 60)
     assert seen["n"] == MAX_RESPONSE_BYTES + 1
+
+
+def test_double_400_response_format_rejection_raises_backend_error_not_internal_signal():
+    # If even the DOWNGRADED (no response_format) retry is STILL rejected as a
+    # response_format/json_schema 400 (e.g. a proxy whose error body generically mentions
+    # those terms regardless of what was actually sent), the internal _ResponseFormatRejected
+    # signal must never escape run() — it must surface as a domain OllamaBackendError.
+    # Each attempt gets its OWN fresh HTTPError (a real server would never hand back an
+    # already-closed response on a second attempt).
+    calls: list = []
+
+    def _urlopen(req, timeout=None):
+        calls.append(req)
+        raise urllib.error.HTTPError(
+            "u", 400, "Bad Request", {}, io.BytesIO(b"response_format not supported")
+        )
+
+    with pytest.raises(OllamaBackendError):
+        OllamaBackend(_cfg(), urlopen=_urlopen).run(
+            "reviewer", "s", "p", "m", 60, response_format={"type": "json_object"}
+        )
+    assert len(calls) == 2  # original + downgraded, then gave up (no 3rd attempt)
+
+
+def test_http_error_body_read_is_called_with_a_bound_never_unbounded():
+    # The error-body backstop only holds if the read itself is bounded (`exc.read(N)`),
+    # never a bare `exc.read()`/`exc.read(-1)` that would defeat the whole point of the cap.
+    seen: dict[str, int] = {}
+
+    class _ErrFP:
+        def read(self, n=-1):
+            seen["n"] = n
+            return b"Internal Server booboo"
+
+        def close(self):
+            pass
+
+    def _urlopen(req, timeout=None):
+        raise urllib.error.HTTPError("u", 500, "Server Error", {}, _ErrFP())
+
+    with pytest.raises(OllamaBackendError):
+        OllamaBackend(_cfg(), urlopen=_urlopen).run("coder", "s", "p", "m", 60)
+    assert seen["n"] == MAX_ERROR_BODY_BYTES + 1
+
+
+def test_success_response_body_is_closed_after_reading():
+    # No leaked descriptors on the success path: the HTTPResponse-like object must be
+    # closed once its body has been read, not left open for the lifetime of the process.
+    body = json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+    resp = io.BytesIO(body)
+
+    def _urlopen(req, timeout=None):
+        return resp
+
+    OllamaBackend(_cfg(), urlopen=_urlopen).run("coder", "s", "p", "m", 60)
+    assert resp.closed
+
+
+def test_http_error_response_body_is_closed_after_reading():
+    # No leaked descriptors on the error path either: the HTTPError's body (itself a
+    # response-like object) must be closed once its detail has been read. Raised directly
+    # (not via `_Recorder`, which snapshots+rebuilds HTTPErrors for repeat-attempt
+    # realism) so we can assert on the SAME fp instance that was closed.
+    fp = io.BytesIO(b"error detail")
+    err = urllib.error.HTTPError("u", 500, "Server Error", {}, fp)
+
+    def _urlopen(req, timeout=None):
+        raise err
+
+    with pytest.raises(OllamaBackendError):
+        OllamaBackend(_cfg(), urlopen=_urlopen).run("coder", "s", "p", "m", 60)
+    assert fp.closed
+
+
+def test_connection_reset_during_read_maps_to_backend_error_not_raw_oserror():
+    # A mid-response connection drop (ConnectionResetError is an OSError subclass, common
+    # on a `:cloud` endpoint) must map to a domain error, never propagate as a raw
+    # non-domain exception across the module boundary.
+    class _Resp:
+        def read(self, n=-1):
+            raise ConnectionResetError("connection reset by peer")
+
+        def close(self):
+            pass
+
+    def _urlopen(req, timeout=None):
+        return _Resp()
+
+    with pytest.raises(OllamaBackendError) as exc:
+        OllamaBackend(_cfg(), urlopen=_urlopen).run("coder", "s", "p", "m", 60)
+    assert "connection" in str(exc.value).lower()
+
+
+def test_incomplete_read_during_read_maps_to_backend_error_not_raw_exception():
+    # http.client.IncompleteRead (a truncated read on a mid-response drop) is NOT an
+    # OSError subclass — it must be mapped explicitly, not silently propagate raw.
+    import http.client
+
+    class _Resp:
+        def read(self, n=-1):
+            raise http.client.IncompleteRead(b"partial")
+
+        def close(self):
+            pass
+
+    def _urlopen(req, timeout=None):
+        return _Resp()
+
+    with pytest.raises(OllamaBackendError):
+        OllamaBackend(_cfg(), urlopen=_urlopen).run("coder", "s", "p", "m", 60)
