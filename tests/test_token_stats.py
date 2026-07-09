@@ -319,3 +319,13 @@ def test_write_returns_none_after_exhausting_os_replace_permission_error_retries
     assert ts.write(str(tmp_path)) is None  # exhausted → best-effort None
     assert attempts["n"] == _REPLACE_MAX_RETRIES  # bounded: exactly N attempts, no infinite loop
     assert not os.path.exists(os.path.join(str(tmp_path), "token_stats.json"))  # no partial file
+
+
+def test_write_returns_none_on_valueerror_from_bad_output_dir(tmp_path):
+    # write() promises best-effort (never raise; return None on failure). A path containing
+    # a NUL byte makes tempfile.mkstemp raise ValueError, NOT OSError — an OSError-only guard
+    # would let it escape and break the never-raise contract. write() must also catch
+    # ValueError and degrade to None.
+    ts = TokenStats()
+    ts.record("coder", "m", _res())
+    assert ts.write(str(tmp_path) + "\x00bogus") is None  # NUL byte → ValueError, not OSError
