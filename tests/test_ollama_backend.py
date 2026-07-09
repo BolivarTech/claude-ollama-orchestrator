@@ -471,3 +471,17 @@ def test_incomplete_read_during_read_maps_to_backend_error_not_raw_exception():
 
     with pytest.raises(OllamaBackendError):
         OllamaBackend(_cfg(), urlopen=_urlopen).run("coder", "s", "p", "m", 60)
+
+
+def test_safe_close_ignores_non_callable_close_attribute():
+    # _safe_close's contract is that resource cleanup must NEVER mask the real result.
+    # An object whose `close` is a NON-callable data attribute would make `close()` raise
+    # TypeError (not OSError), escaping the OSError-only guard — so _safe_close checks
+    # `callable(close)` and no-ops when there's nothing callable to close.
+    from backend import _safe_close
+
+    class _Weird:
+        close = "not a method"  # a data attribute named close, not a callable
+
+    _safe_close(_Weird())  # must not raise TypeError
+    _safe_close(object())  # no close attribute at all → also a no-op
