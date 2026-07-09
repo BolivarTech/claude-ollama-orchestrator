@@ -685,3 +685,416 @@ def test_main_handles_unreadable_input_file_as_actionable_nonzero_not_a_tracebac
     rc = run_ollama.main(["coder", ghost_path, "--no-status"])
     assert rc != 0
     assert "delegation failed" in capsys.readouterr().err.lower()
+
+
+# --- Task 5: managed run-dir lifecycle + artifacts + interrupt cleanup ---
+
+import tempfile  # noqa: E402 — grouped with the Task-5 test block it belongs to.
+
+import json  # noqa: E402
+
+
+def _wire(monkeypatch, tmp_path, result, *, container=None):
+    """Point the run-dir namespace at an isolated container and stub the pipeline."""
+    container = container or str(tmp_path / "runs")
+    os.makedirs(container, exist_ok=True)
+    # run_ollama does `from temp_dirs import resolve_project_root, project_run_root`, so those
+    # names live in run_ollama's namespace — patch THERE (where they're looked up), not temp_dirs.
+    monkeypatch.setattr(run_ollama, "resolve_project_root", lambda start=None: str(tmp_path))
+    monkeypatch.setattr(run_ollama, "project_run_root", lambda root: container)
+
+    class _FakeBackend:
+        def run(
+            self,
+            capability,
+            system_prompt,
+            prompt,
+            model,
+            timeout,
+            *,
+            response_format=None,
+            deadline=None,
+        ):
+            return result
+
+    monkeypatch.setattr(run_ollama, "_make_backend", lambda cfg: _FakeBackend())
+    # **kw absorbs preflight's capability=/effective_model= kwargs (R10/R28 fix, already
+    # exercised elsewhere in this file) — the stub only needs to no-op regardless of what
+    # run_delegation threads through.
+    monkeypatch.setattr(run_ollama, "preflight", lambda cfg, **kw: None)
+    monkeypatch.setattr(run_ollama, "load_system_prompt", lambda cap: "sys")
+    return container
+
+
+def _run_dir(container):
+    dirs = [
+        os.path.join(container, x) for x in os.listdir(container) if x.startswith("ollama-run-")
+    ]
+    assert dirs, "no run dir created"
+    return dirs[0]
+
+
+def test_managed_run_writes_full_artifacts_and_removes_lock(tmp_path, monkeypatch):
+    container = _wire(monkeypatch, tmp_path, DelegationResult("hi", 3, 2, False, 0.1))
+    assert run_ollama.main(["coder", "write hi", "--no-status"]) == 0
+    d = _run_dir(container)
+    for name in ("coder.prompt.txt", "coder.raw.json", "token_stats.json", "ollama-report.json"):
+        assert os.path.exists(os.path.join(d, name)), name
+    assert not os.path.exists(os.path.join(d, ".ollama-lock"))  # removed on success
+
+
+def test_ollama_report_has_r18_telemetry_fields(tmp_path, monkeypatch):
+    container = _wire(monkeypatch, tmp_path, DelegationResult("hi", 3, 2, False, 0.1))
+    assert run_ollama.main(["coder", "write hi", "--no-status"]) == 0
+    report = json.loads(
+        open(os.path.join(_run_dir(container), "ollama-report.json"), encoding="utf-8").read()
+    )
+    for field in ("tokens_by_model", "input_size", "timings", "retried", "guard"):
+        assert field in report, field
+
+
+def test_stderr_log_written_even_with_no_status(tmp_path, monkeypatch):
+    # R18: {cap}.stderr.log is persisted regardless of the live display (--no-status).
+    container = _wire(monkeypatch, tmp_path, DelegationResult("hi", 3, 2, False, 0.1))
+    assert run_ollama.main(["coder", "write hi", "--no-status"]) == 0
+    assert os.path.exists(os.path.join(_run_dir(container), "coder.stderr.log"))
+
+
+def test_structured_delegation_writes_parsed_json(tmp_path, monkeypatch):
+    res = DelegationResult(
+        '{"capability":"reviewer","findings":[]}',
+        3,
+        2,
+        False,
+        0.1,
+        parsed={"capability": "reviewer", "findings": []},
+    )
+    container = _wire(monkeypatch, tmp_path, res)
+    assert run_ollama.main(["reviewer", "review x", "--no-status"]) == 0
+    assert os.path.exists(os.path.join(_run_dir(container), "reviewer.parsed.json"))
+
+
+def test_write_artifacts_survives_one_file_oserror(tmp_path, monkeypatch):
+    # A disk error on one artifact must not crash the run nor block the rest (R18).
+    # The patched `open` intercepts ONLY the one target filename; every other call
+    # (including any the test harness/pytest itself makes during `main()`) is passed
+    # straight through to the real `open` — narrower than a blanket global patch.
+    container = _wire(monkeypatch, tmp_path, DelegationResult("hi", 3, 2, False, 0.1))
+    real_open = open
+
+    def _flaky_open(path, *a, **k):
+        try:
+            is_target = os.path.basename(os.fspath(path)) == "coder.raw.json"
+        except TypeError:
+            is_target = False  # non-path argument (e.g. an fd) — never our target
+        if is_target:
+            raise OSError("disk full (simulated)")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr("builtins.open", _flaky_open)
+    assert run_ollama.main(["coder", "write hi", "--no-status"]) == 0  # no exception propagates
+    d = _run_dir(container)
+    assert not os.path.exists(os.path.join(d, "coder.raw.json"))  # the flaky one is skipped
+    assert os.path.exists(os.path.join(d, "coder.prompt.txt"))  # others still written
+    assert os.path.exists(os.path.join(d, "ollama-report.json"))
+
+
+def test_write_artifacts_survives_token_stats_write_oserror(tmp_path, monkeypatch):
+    # `stats.write(output_dir)` (token_stats.json) must not break `_write_artifacts`'s
+    # never-raise contract either — a local try/except guards it as defense-in-depth,
+    # independent of MS2's `TokenStats.write` already returning `str | None` internally.
+    from token_stats import TokenStats
+
+    container = _wire(monkeypatch, tmp_path, DelegationResult("hi", 3, 2, False, 0.1))
+
+    def _raising_write(self, output_dir):
+        raise OSError("disk full (simulated)")
+
+    monkeypatch.setattr(TokenStats, "write", _raising_write)
+    assert run_ollama.main(["coder", "write hi", "--no-status"]) == 0  # no exception propagates
+    d = _run_dir(container)
+    assert not os.path.exists(os.path.join(d, "token_stats.json"))  # the flaky one is skipped
+    assert os.path.exists(os.path.join(d, "coder.prompt.txt"))  # others still written
+    assert os.path.exists(os.path.join(d, "ollama-report.json"))
+
+
+def test_write_artifacts_survives_non_serializable_stats_dict(tmp_path, monkeypatch):
+    # The DEFINITIVE belt (finding 1, round 3; narrowed in round 4): a value inside
+    # stats.to_dict() that json.dumps rejects (e.g. a bare object()) raises a TypeError
+    # from the report serialization step, and must not propagate out of
+    # _write_artifacts at all. The outer `except (OSError, TypeError, ValueError,
+    # RecursionError)` around the whole function body catches that TypeError
+    # specifically, warns, and returns; artifacts already written before the crash
+    # point (prompt/raw/token_stats) stay on disk, but ollama-report.json itself
+    # never lands.
+    from token_stats import TokenStats
+
+    container = _wire(monkeypatch, tmp_path, DelegationResult("hi", 3, 2, False, 0.1))
+    monkeypatch.setattr(
+        TokenStats,
+        "to_dict",
+        lambda self: {"coder": {"some-model": object()}},  # object() is not JSON-serializable
+    )
+    assert run_ollama.main(["coder", "write hi", "--no-status"]) == 0  # no exception propagates
+    d = _run_dir(container)
+    assert os.path.exists(os.path.join(d, "coder.prompt.txt"))  # written before the crash
+    assert os.path.exists(os.path.join(d, "coder.raw.json"))  # written before the crash
+    assert not os.path.exists(os.path.join(d, "ollama-report.json"))  # report never landed
+
+
+def test_retried_derivation_degrades_gracefully_on_malformed_stats_dict(tmp_path, monkeypatch):
+    # `retried` must not be derived by blindly trusting TokenStats.to_dict()'s exact shape
+    # (MS3-local structural guard — MS2's plan/contract is untouched). A malformed/empty
+    # result degrades to `retried == []` instead of raising KeyError/TypeError.
+    from token_stats import TokenStats
+
+    container = _wire(monkeypatch, tmp_path, DelegationResult("hi", 3, 2, False, 0.1))
+    monkeypatch.setattr(TokenStats, "to_dict", lambda self: {"coder": "not-a-dict"})
+    assert run_ollama.main(["coder", "write hi", "--no-status"]) == 0
+    report = json.loads(
+        open(os.path.join(_run_dir(container), "ollama-report.json"), encoding="utf-8").read()
+    )
+    assert report["retried"] == []
+
+
+def test_retried_derivation_flags_capability_with_more_http_calls_than_delegations(
+    tmp_path, monkeypatch
+):
+    # Normal, well-shaped to_dict() result: a capability whose http_calls exceed its
+    # delegations (a parse/schema retry, R25) appears in `retried`.
+    from token_stats import TokenStats
+
+    container = _wire(monkeypatch, tmp_path, DelegationResult("hi", 3, 2, False, 0.1))
+    monkeypatch.setattr(
+        TokenStats,
+        "to_dict",
+        lambda self: {"coder": {"kimi-k2.7-code:cloud": {"http_calls": 2, "delegations": 1}}},
+    )
+    assert run_ollama.main(["coder", "write hi", "--no-status"]) == 0
+    report = json.loads(
+        open(os.path.join(_run_dir(container), "ollama-report.json"), encoding="utf-8").read()
+    )
+    assert report["retried"] == ["coder"]
+
+
+def test_interrupt_rmtrees_dir_but_plain_exception_keeps_it(tmp_path, monkeypatch):
+    from errors import OllamaBackendError
+
+    container = _wire(monkeypatch, tmp_path, DelegationResult("x", 1, 1, False, 0.1))
+
+    monkeypatch.setattr(
+        run_ollama, "dispatch", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt())
+    )
+    with pytest.raises(KeyboardInterrupt):
+        run_ollama.main(["coder", "x", "--no-status"])
+    assert not [x for x in os.listdir(container) if x.startswith("ollama-run-")]  # R27: cleaned
+
+    monkeypatch.setattr(
+        run_ollama, "dispatch", lambda *a, **k: (_ for _ in ()).throw(OllamaBackendError("boom"))
+    )
+    with pytest.raises(OllamaBackendError):
+        run_ollama.main(["coder", "x", "--no-status"])
+    assert [x for x in os.listdir(container) if x.startswith("ollama-run-")]  # kept for debug
+
+
+def test_status_display_stop_called_even_on_interrupt(tmp_path, monkeypatch):
+    # R20: the live display is restored (stop()) even when the run is interrupted.
+    _wire(monkeypatch, tmp_path, DelegationResult("x", 1, 1, False, 0.1))
+    stopped = {"n": 0}
+
+    class _SpyDisplay:
+        def __init__(self, agents, **kw):
+            pass
+
+        def update(self, *a, **k):
+            pass
+
+        def stop(self):
+            stopped["n"] += 1
+
+    monkeypatch.setattr(run_ollama, "StatusDisplay", _SpyDisplay)
+    monkeypatch.setattr(
+        run_ollama, "dispatch", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt())
+    )
+    with pytest.raises(KeyboardInterrupt):
+        run_ollama.main(["coder", "x"])  # display active (no --no-status)
+    assert stopped["n"] == 1  # stop() ran in the finally despite the interrupt
+
+
+def test_failed_delegation_marks_display_failed(tmp_path, monkeypatch):
+    # R20: a delegation that raises must mark its row "failed" in the live status
+    # tree before the exception propagates — never left frozen on "running".
+    from errors import OllamaBackendError
+
+    _wire(monkeypatch, tmp_path, DelegationResult("x", 1, 1, False, 0.1))
+    updates: list[tuple[str, str]] = []
+
+    class _SpyDisplay:
+        def __init__(self, agents, **kw):
+            pass
+
+        def update(self, agent, state, tok_per_s=None):
+            updates.append((agent, state))
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(run_ollama, "StatusDisplay", _SpyDisplay)
+    monkeypatch.setattr(
+        run_ollama, "dispatch", lambda *a, **k: (_ for _ in ()).throw(OllamaBackendError("boom"))
+    )
+    with pytest.raises(OllamaBackendError):
+        run_ollama.main(["coder", "x"])  # display active (no --no-status)
+    assert ("coder", "failed") in updates
+
+
+def test_timeout_delegation_marks_display_timeout(tmp_path, monkeypatch):
+    # TimeoutError is cleanly distinguishable from a generic failure — it gets its
+    # own "timeout" state (R20's state set) instead of the generic "failed".
+    _wire(monkeypatch, tmp_path, DelegationResult("x", 1, 1, False, 0.1))
+    updates: list[tuple[str, str]] = []
+
+    class _SpyDisplay:
+        def __init__(self, agents, **kw):
+            pass
+
+        def update(self, agent, state, tok_per_s=None):
+            updates.append((agent, state))
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(run_ollama, "StatusDisplay", _SpyDisplay)
+    monkeypatch.setattr(
+        run_ollama, "dispatch", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("timed out"))
+    )
+    with pytest.raises(TimeoutError):
+        run_ollama.main(["coder", "x"])
+    assert ("coder", "timeout") in updates
+    assert ("coder", "failed") not in updates
+
+
+def test_preflight_warning_captured_in_stderr_log(tmp_path, monkeypatch):
+    # R18: preflight runs INSIDE the shim, so its warn-and-proceed output lands in stderr.log.
+    import sys as _sys
+
+    container = _wire(monkeypatch, tmp_path, DelegationResult("x", 1, 1, False, 0.1))
+    monkeypatch.setattr(
+        run_ollama,
+        "preflight",
+        lambda cfg, **kw: print("WARNING: /models returned 404; skipping check", file=_sys.stderr),
+    )
+    assert run_ollama.main(["coder", "x", "--no-status"]) == 0
+    log = open(os.path.join(_run_dir(container), "coder.stderr.log"), encoding="utf-8").read()
+    assert "404" in log
+
+
+def test_keep_runs_zero_is_rejected_via_main_with_message(capsys):
+    # Distinct from the earlier `test_keep_runs_zero_is_rejected` (which exercises
+    # `_validate_args` directly): this drives the rejection through the full `main()`
+    # entry point and asserts the actionable message reaches stderr.
+    with pytest.raises(SystemExit):
+        run_ollama.main(["coder", "x", "--keep-runs", "0"])
+    assert "keep-runs" in capsys.readouterr().err.lower()
+
+
+def test_gettempdir_fallback_skips_cross_project_cleanup(tmp_path, monkeypatch):
+    # When the per-project container can't be made, project_run_root degrades to the
+    # SHARED gettempdir → cleanup must be skipped (never prune other projects' runs).
+    monkeypatch.setattr(run_ollama, "resolve_project_root", lambda start=None: str(tmp_path))
+    monkeypatch.setattr(run_ollama, "project_run_root", lambda root: tempfile.gettempdir())
+    calls = {"cleanup": 0}
+    monkeypatch.setattr(
+        run_ollama,
+        "cleanup_old_runs",
+        lambda *a, **k: calls.__setitem__("cleanup", calls["cleanup"] + 1),
+    )
+    monkeypatch.setattr(
+        run_ollama,
+        "_make_backend",
+        lambda cfg: type(
+            "B",
+            (),
+            {"run": staticmethod(lambda *a, **k: DelegationResult("x", 1, 1, False, 0.1))},
+        )(),
+    )
+    monkeypatch.setattr(run_ollama, "preflight", lambda cfg, **kw: None)
+    monkeypatch.setattr(run_ollama, "load_system_prompt", lambda cap: "sys")
+    run_ollama.main(["coder", "x", "--no-status"])
+    assert calls["cleanup"] == 0  # no cross-project prune in the gettempdir fallback
+
+
+# --- managed_run_dir (extracted lifecycle context manager) — unit-level, direct ---
+# These exercise `managed_run_dir` on its own, one level below the `main()`-driven
+# integration tests above (which still cover the same three outcomes end-to-end via
+# `test_managed_run_writes_full_artifacts_and_removes_lock` and
+# `test_interrupt_rmtrees_dir_but_plain_exception_keeps_it`). The assertions here are
+# the same ones those tests already make (lock present/absent, dir present/absent) —
+# just targeted at the context manager directly instead of through the whole CLI.
+
+
+def _wire_namespace(monkeypatch, tmp_path):
+    """Point the run-dir namespace at an isolated, per-test container."""
+    container = str(tmp_path / "runs")
+    os.makedirs(container, exist_ok=True)
+    monkeypatch.setattr(run_ollama, "resolve_project_root", lambda start=None: str(tmp_path))
+    monkeypatch.setattr(run_ollama, "project_run_root", lambda root: container)
+    return container
+
+
+def test_managed_run_dir_removes_lock_on_success(tmp_path, monkeypatch):
+    _wire_namespace(monkeypatch, tmp_path)
+    with run_ollama.managed_run_dir(keep_runs=5, timeout=30) as output_dir:
+        assert os.path.exists(os.path.join(output_dir, ".ollama-lock"))
+    assert os.path.exists(output_dir)  # dir itself stays
+    assert not os.path.exists(os.path.join(output_dir, ".ollama-lock"))  # lock removed on success
+
+
+def test_managed_run_dir_rmtrees_on_interrupt(tmp_path, monkeypatch):
+    _wire_namespace(monkeypatch, tmp_path)
+    captured: dict[str, str] = {}
+    with pytest.raises(KeyboardInterrupt):
+        with run_ollama.managed_run_dir(keep_runs=5, timeout=30) as output_dir:
+            captured["dir"] = output_dir
+            raise KeyboardInterrupt()
+    assert not os.path.exists(captured["dir"])  # R27: rmtree'd, no orphaned ollama-run-*
+
+
+def test_managed_run_dir_rmtrees_on_generator_exit(tmp_path, monkeypatch):
+    # GeneratorExit is a BaseException, same family as KeyboardInterrupt/SystemExit
+    # (R27): an abandoned/GC'd generator means the run is being discarded, so it must
+    # get the same rmtree cleanup, not the retain-for-debug path. `cm.gen.close()`
+    # (contextlib's underlying generator) is exactly how a real abandonment throws
+    # GeneratorExit at the suspended `yield`.
+    _wire_namespace(monkeypatch, tmp_path)
+    cm = run_ollama.managed_run_dir(keep_runs=5, timeout=30)
+    output_dir = cm.__enter__()
+    cm.gen.close()  # simulates generator abandonment -> GeneratorExit at the yield
+    assert not os.path.exists(output_dir)  # R27: rmtree'd, same as an interrupt
+
+
+def test_managed_run_dir_retains_dir_and_lock_on_plain_exception(tmp_path, monkeypatch):
+    _wire_namespace(monkeypatch, tmp_path)
+    captured: dict[str, str] = {}
+    with pytest.raises(ValueError):
+        with run_ollama.managed_run_dir(keep_runs=5, timeout=30) as output_dir:
+            captured["dir"] = output_dir
+            raise ValueError("boom")
+    assert os.path.exists(captured["dir"])  # retained for debug
+    assert os.path.exists(os.path.join(captured["dir"], ".ollama-lock"))  # lock retained too
+
+
+def test_managed_run_dir_with_explicit_output_dir_skips_lock_and_prune(tmp_path, monkeypatch):
+    # --output-dir is caller-managed: no lock, no pruning, nothing removed on any exit path.
+    calls = {"cleanup": 0}
+    monkeypatch.setattr(
+        run_ollama,
+        "cleanup_old_runs",
+        lambda *a, **k: calls.__setitem__("cleanup", calls["cleanup"] + 1),
+    )
+    caller_dir = str(tmp_path / "caller-owned")
+    with run_ollama.managed_run_dir(keep_runs=5, timeout=30, output_dir=caller_dir) as output_dir:
+        assert output_dir == caller_dir
+        assert not os.path.exists(os.path.join(output_dir, ".ollama-lock"))
+    assert os.path.exists(output_dir)  # never removed by managed_run_dir
+    assert calls["cleanup"] == 0  # a caller-managed dir is never pruned
