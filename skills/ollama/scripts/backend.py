@@ -45,12 +45,15 @@ def _safe_close(closable: Any) -> None:
         closable: Any object that may expose a ``close`` method (an
             ``http.client.HTTPResponse``, ``urllib.error.HTTPError``, or a test double).
 
-    A missing ``close`` attribute (some test doubles are plain objects) or a failure
-    while closing must never mask the real result/exception already in flight — this is
-    resource cleanup, not a correctness path.
+    A missing OR non-callable ``close`` attribute (some test doubles are plain objects,
+    and a data attribute happening to be named ``close`` is not something to invoke) or a
+    failure while closing must never mask the real result/exception already in flight —
+    this is resource cleanup, not a correctness path. ``callable(close)`` covers both the
+    missing (``None``) and non-callable cases, so a non-callable ``close`` never raises a
+    ``TypeError`` out of this cleanup helper.
     """
     close = getattr(closable, "close", None)
-    if close is None:
+    if not callable(close):
         return
     try:
         close()
