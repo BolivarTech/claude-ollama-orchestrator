@@ -10,6 +10,7 @@ from types import MappingProxyType
 import pytest
 
 import run_ollama
+from backend import DelegationResult
 from errors import OllamaBackendError, OllamaPreflightError, ValidationError
 from run_ollama import _validate_args, build_parser
 
@@ -138,7 +139,10 @@ class _FakeBackend:
         item = self.scripted.pop(0)
         if isinstance(item, Exception):
             raise item
-        return item
+        # MS2: backend.run now returns a DelegationResult (content + token metrics),
+        # not a bare str. Scripted items are the `content`; wrap them (estimated
+        # metrics, unused by these MS1-era dispatch tests) so `.content` reads back.
+        return DelegationResult(item, 0, 0, True, 0.0)
 
 
 _GOOD_REVIEW = (
@@ -388,7 +392,7 @@ def test_main_model_override_reaches_backend(monkeypatch):
             deadline=None,
         ):
             seen["model"] = model
-            return "ok"
+            return DelegationResult("ok", 0, 0, True, 0.0)
 
     cfg = _cfg_with_structured()
     monkeypatch.setattr(run_ollama, "resolve_config", lambda **kw: cfg)

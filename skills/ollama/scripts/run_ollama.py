@@ -290,6 +290,9 @@ def dispatch(
     # Parse+validate only when we asked for the strict schema AND the capability has one;
     # "object"/"off" (and any free-text capability) return the content verbatim.
     if mode != "schema" or keys is None:
+        # MS2: backend.run now returns a DelegationResult; free-text/object modes return
+        # its `.content` verbatim for Claude to review. Task 3 threads token accounting
+        # and switches this to return the DelegationResult itself.
         return backend.run(
             capability,
             system_prompt,
@@ -298,7 +301,7 @@ def dispatch(
             timeout,
             response_format=response_format,
             deadline=deadline,
-        )
+        ).content
 
     attempt_prompt = prompt
     last_error = ""
@@ -315,7 +318,7 @@ def dispatch(
             timeout,
             response_format=response_format,
             deadline=deadline,
-        )
+        ).content
         try:
             return validate_output(capability, parse_agent_output(content, keys))
         except (ValidationError, json.JSONDecodeError) as exc:
