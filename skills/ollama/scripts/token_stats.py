@@ -264,7 +264,10 @@ class TokenStats:
                     if attempt == _REPLACE_MAX_RETRIES - 1:
                         raise
                     time.sleep(_REPLACE_BACKOFF_SECONDS * (attempt + 1))
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            # ValueError (not an OSError subclass) is raised by tempfile.mkstemp/os.open when
+            # the path contains an embedded NUL byte; catch it too so write() honors its
+            # never-raise, best-effort contract instead of letting it escape.
             print(f"WARNING: could not write {path}: {exc}", file=sys.stderr)
             if tmp_path is not None:
                 try:
