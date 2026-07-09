@@ -599,6 +599,32 @@ def test_main_aborts_when_preflight_fails(monkeypatch):
     assert rc != 0  # abort, non-zero, no delegation
 
 
+def test_main_preflight_failure_gives_actionable_r14_message_and_exit_2(
+    monkeypatch, capsys, tmp_path
+):
+    # R14: an unreachable host / missing model / bad config aborts with an ACTIONABLE
+    # "Ollama unavailable ... Not delegating; resolve and retry (or generate with Claude
+    # explicitly)" message and a DISTINCT exit code 2 — never a generic "Delegation
+    # failed", never a silent fall-back to Claude. Pins the R14 messaging so the run-dir
+    # lifecycle wiring cannot silently regress it.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(run_ollama, "resolve_config", lambda **kw: _cfg_with_structured())
+
+    def _boom(cfg, **kw):
+        raise OllamaPreflightError("host unreachable at http://x:11434/v1")
+
+    monkeypatch.setattr(run_ollama, "preflight", _boom)
+    monkeypatch.setattr(
+        run_ollama,
+        "_make_backend",
+        lambda cfg: (_ for _ in ()).throw(AssertionError("must not delegate")),
+    )
+    rc = run_ollama.main(["coder", "write hi", "--no-status"])
+    assert rc == 2  # R14 distinct exit code, not the generic 1
+    err = capsys.readouterr().err
+    assert "Ollama unavailable" in err and "Not delegating" in err
+
+
 def test_output_dir_writes_raw_artifact(tmp_path, monkeypatch):
     # R28: --output-dir persists the raw output to a caller-owned dir. Since MS3 (Task 5),
     # {cap}.raw.json follows the canonical R18 artifact format (`_write_artifacts`, a JSON
