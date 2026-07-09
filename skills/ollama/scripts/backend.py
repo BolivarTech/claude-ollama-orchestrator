@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import random
 import socket
 import time
@@ -161,11 +162,14 @@ class DelegationResult:
     def tok_per_s(self) -> float:
         """End-to-end delivered tokens/sec = completion_tokens / elapsed_s.
 
-        Guarded: if ``elapsed_s`` is zero OR (defensively) negative, returns
-        ``0.0`` instead of dividing — never raises ``ZeroDivisionError`` and never
-        returns a negative/absurd rate. NOT raw model generation speed.
+        Guarded: if ``elapsed_s`` is zero, (defensively) negative, or non-finite
+        (``NaN``/``inf``), returns ``0.0`` instead of dividing — never raises
+        ``ZeroDivisionError``, never returns a negative/absurd rate, and never
+        propagates ``NaN``/``inf`` out of this public property (``NaN <= 0`` is
+        ``False``, so an explicit ``isfinite`` check is required). NOT raw model
+        generation speed.
         """
-        if self.elapsed_s <= 0:
+        if not math.isfinite(self.elapsed_s) or self.elapsed_s <= 0:
             return 0.0
         return round(self.completion_tokens / self.elapsed_s, 4)
 
