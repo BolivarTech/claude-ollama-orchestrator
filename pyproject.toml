@@ -12,6 +12,9 @@ dev = ["pytest", "pytest-asyncio", "ruff", "mypy", "hypothesis"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["skills/ollama/scripts"]
+markers = [
+    "integration: slower integration tests exercising real byte-boundary behavior (run by make verify)",
+]
 asyncio_mode = "auto"
 
 [tool.ruff]
