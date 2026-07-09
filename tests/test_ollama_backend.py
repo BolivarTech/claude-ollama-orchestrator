@@ -10,7 +10,7 @@ from dataclasses import replace
 
 import pytest
 
-from backend import MAX_ERROR_BODY_BYTES, MAX_RESPONSE_BYTES, OllamaBackend
+from backend import DelegationResult, MAX_ERROR_BODY_BYTES, MAX_RESPONSE_BYTES, OllamaBackend
 from errors import OllamaBackendError
 from ollama_config import resolve_config
 
@@ -22,8 +22,8 @@ def _cfg(api_key=None):
 class _Recorder:
     """Callable urlopen replacement recording the last Request + returning a body."""
 
-    def __init__(self, content=None, error=None, error_once=None):
-        self.content, self.error, self.error_once = content, error, error_once
+    def __init__(self, content=None, error=None, error_once=None, usage=None):
+        self.content, self.error, self.error_once, self.usage = content, error, error_once, usage
         self.requests: list = []
         self._raised_once = False
         # A persistent `error` (raised on EVERY call — e.g. 429-exhaustion / multi-attempt
@@ -49,19 +49,89 @@ class _Recorder:
                 raise urllib.error.HTTPError(url, code, msg, hdrs, io.BytesIO(body))
             raise self.error
         body = {"choices": [{"message": {"content": self.content}}]}
+        if self.usage is not None:
+            body["usage"] = self.usage
         return io.BytesIO(json.dumps(body).encode("utf-8"))
 
 
 def test_run_extracts_content():
     rec = _Recorder(content="def f(): pass")
-    out = OllamaBackend(_cfg(), urlopen=rec).run("coder", "sys", "write f", "m", 60)
-    assert out == "def f(): pass"
+    res = OllamaBackend(_cfg(), urlopen=rec).run("coder", "sys", "write f", "m", 60)
+    assert res.content == "def f(): pass"
+
+
+def test_run_reads_usage_when_present():
+    rec = _Recorder(content="x", usage={"prompt_tokens": 12, "completion_tokens": 7})
+    res = OllamaBackend(_cfg(), urlopen=rec).run("coder", "s", "p", "m", 60)
+    assert (res.prompt_tokens, res.completion_tokens) == (12, 7)
+    assert res.estimated is False
+
+
+def test_run_estimates_prompt_tokens_from_length_without_string_alloc():
+    rec = _Recorder(content="abcdefgh")  # no usage → completion 8//4 = 2
+    res = OllamaBackend(_cfg(), urlopen=rec).run("coder", "systempr", "user", "m", 60)
+    assert res.estimated is True
+    assert res.completion_tokens == 2
+    assert res.prompt_tokens == 3  # (len("systempr")+len("user"))=12 → 12//4, no "x"*n alloc
+
+
+def test_delegation_result_reports_per_delegation_tok_per_s():
+    assert DelegationResult("x", 10, 30, False, 1.5).tok_per_s == 20.0  # 30/1.5
+    assert DelegationResult("x", 0, 0, True, 0.0).tok_per_s == 0.0  # elapsed==0 guard
+
+
+def test_delegation_result_tok_per_s_never_negative_on_defensive_negative_elapsed():
+    # elapsed_s should never legitimately be negative, but tok_per_s must be a
+    # defensive guard (`<= 0`, not just `== 0`) rather than trust the caller —
+    # it must never divide by a negative elapsed_s or return a negative rate.
+    assert DelegationResult("x", 0, 30, False, -1.5).tok_per_s == 0.0
+
+
+def test_delegation_result_parsed_defaults_none():
+    assert DelegationResult("x", 1, 1, False, 0.1).parsed is None
+
+
+def test_run_falls_back_to_estimate_when_usage_has_non_numeric_token_count():
+    rec = _Recorder(content="abcdefgh", usage={"prompt_tokens": "twelve", "completion_tokens": 7})
+    res = OllamaBackend(_cfg(), urlopen=rec).run("coder", "systempr", "user", "m", 60)
+    assert res.estimated is True
+    assert res.prompt_tokens == 3  # falls back to length-based estimate for BOTH counts
+    assert res.completion_tokens == 2  # never a partial mix of real + estimated counts
+
+
+def test_run_accepts_integral_float_usage_values():
+    rec = _Recorder(content="x", usage={"prompt_tokens": 12.0, "completion_tokens": 7.0})
+    res = OllamaBackend(_cfg(), urlopen=rec).run("coder", "s", "p", "m", 60)
+    assert (res.prompt_tokens, res.completion_tokens) == (12, 7)
+    assert res.estimated is False
+
+
+def test_run_rejects_nan_float_usage_value_and_estimates_instead():
+    rec = _Recorder(
+        content="abcdefgh", usage={"prompt_tokens": float("nan"), "completion_tokens": 7}
+    )
+    res = OllamaBackend(_cfg(), urlopen=rec).run("coder", "systempr", "user", "m", 60)
+    assert res.estimated is True  # NaN fails `.is_integer()` → fail-soft to estimate, no crash
+
+
+def test_run_treats_null_usage_token_count_as_missing():
+    rec = _Recorder(content="abcdefgh", usage={"prompt_tokens": None, "completion_tokens": 7})
+    res = OllamaBackend(_cfg(), urlopen=rec).run("coder", "systempr", "user", "m", 60)
+    assert res.estimated is True
+
+
+def test_coerce_token_count_rejects_bool_and_negative_accepts_nonneg_int():
+    from backend import _coerce_token_count
+
+    assert _coerce_token_count(True) is None  # bool is an int subclass; not a token count
+    assert _coerce_token_count(-1) is None
+    assert _coerce_token_count(3) == 3
 
 
 def test_dict_content_is_serialized_as_json_not_str():
     rec = _Recorder(content={"agent": "reviewer", "findings": []})
-    out = OllamaBackend(_cfg(), urlopen=rec).run("reviewer", "sys", "p", "m", 60)
-    assert json.loads(out) == {"agent": "reviewer", "findings": []}  # valid JSON, not str(dict)
+    res = OllamaBackend(_cfg(), urlopen=rec).run("reviewer", "sys", "p", "m", 60)
+    assert json.loads(res.content) == {"agent": "reviewer", "findings": []}  # JSON, not str(dict)
 
 
 def test_null_content_raises_backend_error_not_string_none():
@@ -126,10 +196,10 @@ def test_downgrade_on_400_response_format_retries_without_it():
         "u", 400, "Bad Request", {}, io.BytesIO(b"response_format not supported")
     )
     rec = _Recorder(content="ok", error_once=err)  # first call 400, second succeeds
-    out = OllamaBackend(_cfg(), urlopen=rec).run(
+    res = OllamaBackend(_cfg(), urlopen=rec).run(
         "reviewer", "s", "p", "m", 60, response_format={"type": "json_object"}
     )
-    assert out == "ok"
+    assert res.content == "ok"
     assert len(rec.requests) == 2  # downgrade retry happened
 
 
@@ -137,8 +207,8 @@ def test_429_backs_off_respecting_retry_after_then_succeeds():
     err = urllib.error.HTTPError("u", 429, "Too Many", {"Retry-After": "0"}, io.BytesIO(b""))
     slept: list[float] = []
     rec = _Recorder(content="ok", error_once=err)  # first call 429, second succeeds
-    out = OllamaBackend(_cfg(), urlopen=rec, sleep=slept.append).run("coder", "s", "p", "m", 60)
-    assert out == "ok"
+    res = OllamaBackend(_cfg(), urlopen=rec, sleep=slept.append).run("coder", "s", "p", "m", 60)
+    assert res.content == "ok"
     assert slept == [0.0]  # honored Retry-After: 0 (distinct from the parse retry)
 
 
