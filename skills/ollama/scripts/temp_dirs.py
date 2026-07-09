@@ -96,7 +96,10 @@ def cleanup_old_runs(keep: int, run_root: str | None = None) -> None:
         entries = [
             (e.stat().st_mtime, e.path)
             for e in os.scandir(run_root)
-            if e.is_dir() and e.name.startswith(OLLAMA_DIR_PREFIX)
+            # follow_symlinks=False: a symlink named `ollama-run-*` is anomalous (real run
+            # dirs come from mkdtemp, never symlinks) and must never even be a deletion
+            # candidate — it is NOT a directory for our purposes, so it is excluded here.
+            if e.is_dir(follow_symlinks=False) and e.name.startswith(OLLAMA_DIR_PREFIX)
         ]
     except OSError:
         return
@@ -106,6 +109,13 @@ def cleanup_old_runs(keep: int, run_root: str | None = None) -> None:
     candidates.sort(key=lambda x: (-x[0], x[1]))
     safe = _safe_prefix(run_root)
     for _mtime, path in candidates[keep:]:
+        # Never rmtree a symlink: a run dir is a real mkdtemp directory, never a symlink,
+        # so skip one entirely rather than following it. Belt-and-suspenders with the
+        # realpath-containment check below and scandir's follow_symlinks=False above — and
+        # it closes a TOCTOU where a real dir is swapped to a symlink between scandir and
+        # here (shutil.rmtree also refuses a top-level symlink, but skipping is cleaner).
+        if os.path.islink(path):
+            continue
         if os.path.normcase(os.path.realpath(path)).startswith(safe):
             try:
                 shutil.rmtree(path)

@@ -6,6 +6,8 @@
 import os
 import tempfile
 
+import pytest
+
 import temp_dirs
 from run_lock import write_lock
 from temp_dirs import OLLAMA_DIR_PREFIX, cleanup_old_runs, create_output_dir, project_run_root
@@ -66,3 +68,26 @@ def test_cleanup_old_runs_refuses_shared_gettempdir_at_runtime(capsys):
     # must no-op + warn rather than scanning/pruning OTHER projects' ollama-run-* dirs.
     cleanup_old_runs(5, tempfile.gettempdir())
     assert "WARNING" in capsys.readouterr().err
+
+
+def test_cleanup_never_follows_or_removes_a_symlink_run_dir(tmp_path, monkeypatch):
+    # R17 / security: a symlink named `ollama-run-*` (anomalous — real run dirs come from
+    # mkdtemp, never symlinks) must NEVER be followed or rmtree'd, so its TARGET (outside
+    # run_root) stays intact and the symlink itself is skipped, not removed. Real non-live
+    # dirs are still pruned.
+    monkeypatch.setattr(temp_dirs, "is_dir_live", lambda d: False)
+    outside = tmp_path / "precious"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("do not delete", encoding="utf-8")
+    run_root = tmp_path / "runs"
+    run_root.mkdir()
+    link = os.path.join(str(run_root), OLLAMA_DIR_PREFIX + "evil")
+    try:
+        os.symlink(str(outside), link, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation not permitted on this host")
+    reals = [create_output_dir(None, str(run_root)) for _ in range(3)]
+    cleanup_old_runs(0, str(run_root))  # remove all non-live
+    assert outside.exists() and (outside / "keep.txt").exists()  # target untouched
+    assert os.path.islink(link)  # the symlink itself was skipped, not removed
+    assert not any(os.path.exists(d) for d in reals)  # real non-live dirs still pruned
