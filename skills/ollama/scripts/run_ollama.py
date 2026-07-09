@@ -25,6 +25,7 @@ from errors import (
     InvalidInputError,
     OllamaBackendError,
     OllamaConfigError,
+    OllamaPreflightError,
     ValidationError,
 )
 from ollama_config import CAPABILITIES, OllamaAgentsConfig
@@ -843,6 +844,22 @@ def main(argv: list[str] | None = None) -> int:
     # interrupt-cleanup path (MS3) needs it to propagate.
     try:
         return run_delegation(ns)
+    except OllamaPreflightError as exc:
+        # R14: a preflight failure (unreachable host / missing model) is genuinely "Ollama
+        # unavailable" → abort with an ACTIONABLE message and a DISTINCT exit code 2, never
+        # a generic "Delegation failed", never a silent fall-back to Claude generation. The
+        # domain exc already carries the specific remedy (ollama pull / signin / edit TOML);
+        # this frames it and offers the explicit-Claude alternative. MUST precede the
+        # ValidationError arm below (OllamaPreflightError is a ValidationError subclass;
+        # Python tries except clauses in order). A plain OllamaConfigError (bad TOML, or a
+        # missing agent prompt from load_system_prompt) is NOT "Ollama unavailable" — it
+        # falls through to the generic actionable handler below.
+        print(
+            f"Ollama unavailable: {exc}\nNot delegating; resolve the issue and retry "
+            "(or generate with Claude explicitly).",
+            file=sys.stderr,
+        )
+        return 2
     except (
         ValidationError,
         OllamaBackendError,
