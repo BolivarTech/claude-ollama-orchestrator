@@ -322,7 +322,7 @@ def dispatch(
 
     attempt_prompt = prompt
     last_error = ""
-    for _attempt in range(2):  # one retry (R25), sharing the single deadline above.
+    for attempt in range(2):  # one retry (R25), sharing the single deadline above.
         if time.monotonic() >= deadline:
             raise OllamaBackendError(
                 f"{capability} delegation exceeded its retry deadline ({last_error})"
@@ -339,7 +339,7 @@ def dispatch(
         # Bill EVERY completed backend call (http_calls); the retry does not count as a
         # second logical delegation (counts_as_delegation False on attempt 1).
         if stats is not None:
-            stats.record(capability, model, result, counts_as_delegation=(_attempt == 0))
+            stats.record(capability, model, result, counts_as_delegation=(attempt == 0))
         try:
             parsed = validate_output(capability, parse_agent_output(result.content, keys))
             return replace(result, parsed=parsed)
