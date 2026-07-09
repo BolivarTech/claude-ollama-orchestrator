@@ -504,7 +504,10 @@ def test_looks_like_path_detects_separator_extension_and_absolute():
     assert run_ollama._looks_like_path("just-a-word") is False  # no sep/ext
 
 
-def test_main_runs_full_pipeline_and_prints_output(capsys, monkeypatch):
+def test_main_runs_full_pipeline_and_prints_output(capsys, monkeypatch, tmp_path):
+    # Isolate cwd: run_delegation writes token_stats.json to os.getcwd() (MS2 interim, no
+    # --output-dir here) — chdir to tmp_path so the suite never touches the real repo root.
+    monkeypatch.chdir(tmp_path)
     # Use the REAL OllamaAgentsConfig (via _cfg_with_structured) — a hand-rolled stub with
     # only `models` would AttributeError once dispatch reads `config.structured` (coder→"off").
     cfg = _cfg_with_structured()
@@ -519,8 +522,9 @@ def test_main_runs_full_pipeline_and_prints_output(capsys, monkeypatch):
     assert "hello world" in capsys.readouterr().out
 
 
-def test_main_model_override_reaches_backend(monkeypatch):
+def test_main_model_override_reaches_backend(monkeypatch, tmp_path):
     # R28: --model overrides the config default and reaches backend.run as `model`.
+    monkeypatch.chdir(tmp_path)  # isolate cwd: run_delegation writes token_stats.json there
     seen: dict[str, str] = {}
 
     class _CapBackend:
@@ -549,12 +553,13 @@ def test_main_model_override_reaches_backend(monkeypatch):
     assert seen["model"] == "custom-model:cloud"  # override wins over cfg.models["coder"]
 
 
-def test_main_threads_the_model_override_into_preflight_not_just_the_backend(monkeypatch):
+def test_main_threads_the_model_override_into_preflight_not_just_the_backend(monkeypatch, tmp_path):
     # R10/R28 fix: a --model override must reach preflight's model-existence check, not
     # only backend.run — otherwise an override to a nonexistent model would silently
     # bypass preflight and only surface as a chat-time 404. This asserts preflight is
     # called with the OVERRIDE (as effective_model, for capability="coder"), never the
     # stale config default.
+    monkeypatch.chdir(tmp_path)  # isolate cwd: run_delegation writes token_stats.json there
     seen_preflight: dict[str, object] = {}
 
     def _preflight(cfg, **kw):
