@@ -29,6 +29,12 @@ conftest.py
 # Usage-gate report output (local runtime artifact from claude_usage.py).
 claude-usage.txt
 
+# Local token-accounting artifacts (R12) written to cwd when no --output-dir is given
+# (MS2 interim; MS3 moves the default into the managed temp run dir). Never tracked.
+token_stats.json
+ollama-report.json
+.token_stats.json.*.tmp
+
 # Per-session handoff buffer.
 .remember/
 

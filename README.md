@@ -19,10 +19,19 @@ Edit/Write tools. The goal: **cut Anthropic token cost** and keep bulk generatio
 
 > [!IMPORTANT]
 > ### Project Status
-> **Spec phase.** This repository is being built under the SBTDD workflow (Spec +
-> Behavior + Test-Driven Development). The authoritative description of *what* to build
-> lives in `sbtdd/`. The tree, tables, and commands below describe the **intended
-> design**; production code lands as the spec is implemented test-first.
+> **Early development (v0.0.2).** Built under the SBTDD workflow (Spec + Behavior +
+> Test-Driven Development). The authoritative description of *what* to build lives in
+> `sbtdd/`; the tree, tables, and commands below describe the **intended design**, and
+> production code lands milestone-by-milestone, test-first.
+>
+> **Implemented so far:** the **transactional delegation core** — layered config, fail-fast
+> preflight, an OpenAI-compatible backend with structured output + downgrade-on-400, a
+> tolerant JSON parser, and the `/ollama` orchestrator (+ `--ollama-init`) — and **local
+> token accounting**: each delegation reports tok/s + token counts from the response
+> `usage` (with a `chars/4` estimated fallback when the server omits it), aggregated into a
+> per-capability/model `token_stats.json` artifact kept **separate** from Claude usage.
+> Visible streaming, output/concurrency management, untrusted-I/O hardening, and the
+> vision / transcribe / thinking capabilities are the remaining milestones.
 
 ---
 

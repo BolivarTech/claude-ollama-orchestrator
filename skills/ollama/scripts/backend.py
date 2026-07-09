@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import random
 import socket
 import time
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable
@@ -43,17 +45,136 @@ def _safe_close(closable: Any) -> None:
         closable: Any object that may expose a ``close`` method (an
             ``http.client.HTTPResponse``, ``urllib.error.HTTPError``, or a test double).
 
-    A missing ``close`` attribute (some test doubles are plain objects) or a failure
-    while closing must never mask the real result/exception already in flight — this is
-    resource cleanup, not a correctness path.
+    A missing OR non-callable ``close`` attribute (some test doubles are plain objects,
+    and a data attribute happening to be named ``close`` is not something to invoke) or a
+    failure while closing must never mask the real result/exception already in flight —
+    this is resource cleanup, not a correctness path. ``callable(close)`` covers both the
+    missing (``None``) and non-callable cases, so a non-callable ``close`` never raises a
+    ``TypeError`` out of this cleanup helper.
     """
     close = getattr(closable, "close", None)
-    if close is None:
+    if not callable(close):
         return
     try:
         close()
     except OSError:
         pass
+
+
+def _estimate_tokens(text: str) -> int:
+    """Estimate token count as ``len(text) // 4`` (stdlib heuristic; never raises)."""
+    return len(text) // 4
+
+
+def _estimate_tokens_from_len(n: int) -> int:
+    """Estimate tokens from a character count as ``n // 4`` — no string allocation.
+
+    Args:
+        n: A non-negative character length.
+
+    Returns:
+        The estimated token count.
+    """
+    return n // 4
+
+
+def _coerce_token_count(value: Any) -> int | None:
+    """Safely coerce an untrusted ``usage`` token count to a non-negative int.
+
+    The ``usage`` object comes from an untrusted remote server and may be missing,
+    a bool, a float, a string, or null — a bare ``int(...)`` on it can crash (on a
+    string/None) or silently produce a wrong value. This coercion is fail-soft: it
+    returns ``None`` (never raises) for anything it cannot safely represent,
+    signaling the caller to fall back to the local estimate.
+
+    Args:
+        value: The raw value at ``usage["prompt_tokens"]``/``["completion_tokens"]``.
+
+    Returns:
+        A non-negative ``int`` if *value* is an ``int`` (excluding ``bool``, an
+        ``int`` subclass that is never a valid token count here) or a ``float``
+        that is both non-negative and ``is_integer()`` (this rejects ``inf``/``nan``,
+        neither of which is ever integral). ``None`` for anything else.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float) and value.is_integer():
+        return int(value) if value >= 0 else None
+    return None
+
+
+def _resolve_usage(
+    usage: dict[str, Any] | None, prompt_len: int, content: str
+) -> tuple[int, int, bool]:
+    """Resolve ``(prompt_tokens, completion_tokens, estimated)`` fail-soft.
+
+    Trusts the server's ``usage`` object only if BOTH ``prompt_tokens`` and
+    ``completion_tokens`` coerce safely (see ``_coerce_token_count``); otherwise
+    falls back to the local ``chars/4`` estimate for BOTH counts together — never
+    a partial mix of one real + one estimated count, and never a crash on
+    malformed/missing ``usage``.
+
+    Args:
+        usage: The parsed ``usage`` object from the response envelope, or ``None``.
+        prompt_len: ``len(system_prompt) + len(prompt)``, pre-computed by the caller
+            so no throwaway concatenated/padded string is allocated here.
+        content: The extracted model content, for the completion-token estimate.
+
+    Returns:
+        A ``(prompt_tokens, completion_tokens, estimated)`` tuple.
+    """
+    if isinstance(usage, dict):
+        prompt_tokens = _coerce_token_count(usage.get("prompt_tokens"))
+        completion_tokens = _coerce_token_count(usage.get("completion_tokens"))
+        if prompt_tokens is not None and completion_tokens is not None:
+            return prompt_tokens, completion_tokens, False
+    return _estimate_tokens_from_len(prompt_len), _estimate_tokens(content), True
+
+
+@dataclass(frozen=True)
+class DelegationResult:
+    """The outcome of one delegation: content plus token metrics.
+
+    ``tok_per_s`` is an END-TO-END **delivered-tokens-per-second** metric
+    (``completion_tokens / elapsed_s``), where ``elapsed_s`` is the call's full
+    wall-clock duration — network latency, any 429 backoff/retry waiting, and
+    (transactional) the entire round-trip until the response is fully received are
+    ALL included. It is NOT the model's raw generation/decode speed.
+
+    Attributes:
+        content: The extracted model content.
+        prompt_tokens: Prompt tokens (from ``usage`` or estimated).
+        completion_tokens: Completion tokens (from ``usage`` or estimated).
+        estimated: True if the metrics were estimated (server omitted ``usage``).
+        elapsed_s: End-to-end wall-clock seconds for the call.
+        parsed: For a structured capability, the validated output dict; ``None`` for
+            free-text. Lets ``dispatch`` return a single type carrying both the
+            content and the parsed object.
+    """
+
+    content: str
+    prompt_tokens: int
+    completion_tokens: int
+    estimated: bool
+    elapsed_s: float
+    parsed: dict[str, Any] | None = None
+
+    @property
+    def tok_per_s(self) -> float:
+        """End-to-end delivered tokens/sec = completion_tokens / elapsed_s.
+
+        Guarded: if ``elapsed_s`` is zero, (defensively) negative, or non-finite
+        (``NaN``/``inf``), returns ``0.0`` instead of dividing — never raises
+        ``ZeroDivisionError``, never returns a negative/absurd rate, and never
+        propagates ``NaN``/``inf`` out of this public property (``NaN <= 0`` is
+        ``False``, so an explicit ``isfinite`` check is required). NOT raw model
+        generation speed.
+        """
+        if not math.isfinite(self.elapsed_s) or self.elapsed_s <= 0:
+            return 0.0
+        return round(self.completion_tokens / self.elapsed_s, 4)
 
 
 class _ResponseFormatRejected(Exception):
@@ -82,8 +203,8 @@ class AgentBackend(ABC):
         *,
         response_format: dict[str, Any] | None = None,
         deadline: float | None = None,
-    ) -> str:
-        """Run one delegation and return the extracted ``content`` string.
+    ) -> DelegationResult:
+        """Run one delegation and return its result plus token metrics.
 
         Args:
             capability: The capability name (for logging/telemetry).
@@ -99,7 +220,7 @@ class AgentBackend(ABC):
                 ``None``, the backend derives ``time.monotonic() + timeout``.
 
         Returns:
-            The extracted ``content`` string.
+            The ``DelegationResult`` (content plus token metrics).
         """
         raise NotImplementedError
 
@@ -174,7 +295,9 @@ class OllamaBackend(AgentBackend):
             req.add_header("Authorization", f"Bearer {self._config.api_key}")
         return req
 
-    def _call(self, req: urllib.request.Request, deadline: float) -> str:
+    def _call(
+        self, req: urllib.request.Request, deadline: float
+    ) -> tuple[str, dict[str, Any] | None]:
         """Execute *req*, backing off on HTTP 429 up to ``max_backoffs`` (R8), bounded by
         the per-delegation monotonic *deadline* (R25).
 
@@ -192,7 +315,8 @@ class OllamaBackend(AgentBackend):
                 source of truth for the time budget).
 
         Returns:
-            The extracted ``content`` string.
+            A ``(content, usage)`` tuple: the extracted ``content`` string and the raw
+            ``usage`` dict from the response envelope (``None`` if the server omitted it).
 
         Raises:
             OllamaBackendError: on HTTP/connection/shape failure, or on 429 exhaustion
@@ -235,8 +359,10 @@ class OllamaBackend(AgentBackend):
                 self._sleep(delay)
                 attempt += 1
 
-    def _call_once(self, req: urllib.request.Request, timeout: float) -> str:
-        """Execute *req* once and extract the ``content`` string, or raise.
+    def _call_once(
+        self, req: urllib.request.Request, timeout: float
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Execute *req* once and extract ``(content, usage)``, or raise.
 
         Args:
             req: The prepared request.
@@ -244,7 +370,9 @@ class OllamaBackend(AgentBackend):
                 remaining deadline budget by the caller).
 
         Returns:
-            The extracted ``content`` string.
+            A ``(content, usage)`` tuple: the extracted ``content`` string and the raw
+            ``usage`` dict from the SAME already bounded-read/decoded/parsed ``payload``
+            (``None`` if the server omitted it) — no additional I/O or decoding.
 
         Raises:
             _ResponseFormatRejected: on a 400 that mentions ``response_format``/
@@ -354,7 +482,11 @@ class OllamaBackend(AgentBackend):
             raise OllamaBackendError(
                 self._redact("Ollama returned null content (model produced no output)")
             )
-        return json.dumps(content) if isinstance(content, dict) else str(content)
+        content_str = json.dumps(content) if isinstance(content, dict) else str(content)
+        # NEW in MS2: read `usage` from the SAME already bounded-read/decoded/parsed
+        # `payload` — zero additional I/O, zero additional decoding.
+        usage = payload.get("usage")
+        return content_str, usage if isinstance(usage, dict) else None
 
     def run(
         self,
@@ -366,7 +498,7 @@ class OllamaBackend(AgentBackend):
         *,
         response_format: dict[str, Any] | None = None,
         deadline: float | None = None,
-    ) -> str:
+    ) -> DelegationResult:
         """Run one delegation transactionally; downgrade once on a 400 that rejects
         ``response_format``.
 
@@ -384,7 +516,10 @@ class OllamaBackend(AgentBackend):
                 ``time.monotonic() + timeout``.
 
         Returns:
-            The extracted ``content`` string.
+            A ``DelegationResult`` with real ``usage`` counts when the server provides
+            them safely (both coerce; see ``_coerce_token_count``), else a fail-soft
+            local estimate for BOTH counts (``estimated=True``). Never raises on
+            malformed/missing ``usage``.
 
         Raises:
             OllamaBackendError: on HTTP/connection/shape failure (key redacted).
@@ -398,12 +533,14 @@ class OllamaBackend(AgentBackend):
         # through the ``AgentBackend`` contract for MS2 telemetry (token accounting by
         # capability/model), not dead code.
         req = self._build_request(system_prompt, prompt, model, response_format)
+        prompt_len = len(system_prompt) + len(prompt)
+        start = time.monotonic()
         try:
-            return self._call(req, deadline)
+            content, usage = self._call(req, deadline)
         except _ResponseFormatRejected:
             downgraded = self._build_request(system_prompt, prompt, model, None)
             try:
-                return self._call(downgraded, deadline)
+                content, usage = self._call(downgraded, deadline)
             except _ResponseFormatRejected:
                 # The DOWNGRADED (no response_format) request was STILL rejected as a
                 # response_format/json_schema 400 — e.g. a proxy whose error body
@@ -417,3 +554,6 @@ class OllamaBackend(AgentBackend):
                         "is possible."
                     )
                 ) from None
+        elapsed = time.monotonic() - start
+        prompt_tokens, completion_tokens, estimated = _resolve_usage(usage, prompt_len, content)
+        return DelegationResult(content, prompt_tokens, completion_tokens, estimated, elapsed)

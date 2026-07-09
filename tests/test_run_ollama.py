@@ -10,6 +10,7 @@ from types import MappingProxyType
 import pytest
 
 import run_ollama
+from backend import DelegationResult
 from errors import OllamaBackendError, OllamaPreflightError, ValidationError
 from run_ollama import _validate_args, build_parser
 
@@ -138,7 +139,10 @@ class _FakeBackend:
         item = self.scripted.pop(0)
         if isinstance(item, Exception):
             raise item
-        return item
+        # MS2: backend.run now returns a DelegationResult (content + token metrics),
+        # not a bare str. Scripted items are the `content`; wrap them (estimated
+        # metrics, unused by these MS1-era dispatch tests) so `.content` reads back.
+        return DelegationResult(item, 0, 0, True, 0.0)
 
 
 _GOOD_REVIEW = (
@@ -159,7 +163,8 @@ def test_dispatch_free_text_returns_content_and_sends_no_schema():
     out = run_ollama.dispatch(
         "coder", "write f", backend=be, model="m", timeout=10, system_prompt="sys", config=_CFG
     )  # coder default "off"
-    assert out == "def f(): pass"
+    assert out.content == "def f(): pass"
+    assert out.parsed is None  # free-text: no structured payload
     assert be.calls[0]["response_format"] is None  # off: no schema
 
 
@@ -185,7 +190,7 @@ def test_dispatch_structured_off_returns_content_verbatim_without_schema():
         system_prompt="sys",
         config=_cfg_with_structured(reviewer="off"),
     )
-    assert out == "free-form review text"  # off: content verbatim
+    assert out.content == "free-form review text"  # off: content verbatim
     assert be.calls[0]["response_format"] is None  # off: no response_format
 
 
@@ -201,7 +206,8 @@ def test_dispatch_object_mode_sends_generic_json_envelope():
         system_prompt="sys",
         config=_cfg_with_structured(coder="object"),
     )
-    assert out == '{"any": "json"}'  # object: content verbatim (no validate)
+    assert out.content == '{"any": "json"}'  # object: content verbatim (no validate)
+    assert out.parsed is None  # object mode: no schema validation → nothing parsed
     assert be.calls[0]["response_format"] == {"type": "json_object"}
 
 
@@ -246,7 +252,7 @@ def test_dispatch_retries_once_with_feedback_on_schema_failure():
     out = run_ollama.dispatch(
         "reviewer", "review", backend=be, model="m", timeout=10, system_prompt="sys", config=_CFG
     )
-    assert out["findings"][0]["severity"] == "info"
+    assert out.parsed["findings"][0]["severity"] == "info"
     assert "---RETRY-FEEDBACK---" in be.calls[1]["prompt"]  # feedback reinjected
     assert '"const": "reviewer"' in be.calls[1]["prompt"]  # ACTUAL JSON-Schema, not just keys
 
@@ -265,6 +271,148 @@ def test_dispatch_deadline_exceeded_raises_backend_error(monkeypatch):
             "reviewer", "review", backend=be, model="m", timeout=1, system_prompt="sys", config=_CFG
         )
     assert len(be.calls) == 1  # attempt-1 ran; the retry never did
+
+
+def test_dispatch_free_text_records_one_delegation_and_returns_result():
+    from token_stats import TokenStats
+
+    class _RecordingBackend:
+        def run(
+            self,
+            capability,
+            system_prompt,
+            prompt,
+            model,
+            timeout,
+            *,
+            response_format=None,
+            deadline=None,
+        ):
+            return DelegationResult("hello", 10, 5, False, 0.5)
+
+    stats = TokenStats()
+    out = run_ollama.dispatch(
+        "coder",
+        "write",
+        backend=_RecordingBackend(),
+        model="kimi-k2.7-code:cloud",
+        timeout=10,
+        system_prompt="sys",
+        config=_CFG,
+        stats=stats,
+    )
+    assert out.content == "hello" and out.parsed is None
+    d = stats.to_dict()["coder"]["kimi-k2.7-code:cloud"]
+    assert d["http_calls"] == 1 and d["delegations"] == 1
+    assert d["prompt_tokens"] == 10 and d["completion_tokens"] == 5
+
+
+def test_dispatch_structured_returns_delegation_result_with_parsed():
+    from token_stats import TokenStats
+
+    class _StructuredBackend:
+        def run(
+            self,
+            capability,
+            system_prompt,
+            prompt,
+            model,
+            timeout,
+            *,
+            response_format=None,
+            deadline=None,
+        ):
+            return DelegationResult(_GOOD_REVIEW, 10, 5, False, 0.5)
+
+    stats = TokenStats()
+    out = run_ollama.dispatch(
+        "reviewer",
+        "review",
+        backend=_StructuredBackend(),
+        model="glm-5.2:cloud",
+        timeout=10,
+        system_prompt="sys",
+        config=_CFG,
+        stats=stats,
+    )
+    assert isinstance(out, DelegationResult)
+    assert out.parsed is not None and out.parsed["capability"] == "reviewer"
+    d = stats.to_dict()["reviewer"]["glm-5.2:cloud"]
+    assert d["http_calls"] == 1 and d["delegations"] == 1
+
+
+def test_dispatch_structured_retry_counts_two_http_calls_one_delegation():
+    from token_stats import TokenStats
+
+    class _FlakyBackend:
+        def __init__(self):
+            self.calls = 0
+
+        def run(
+            self,
+            capability,
+            system_prompt,
+            prompt,
+            model,
+            timeout,
+            *,
+            response_format=None,
+            deadline=None,
+        ):
+            self.calls += 1
+            content = "not json" if self.calls == 1 else _GOOD_REVIEW
+            return DelegationResult(content, 10, 5, False, 0.5)
+
+    stats = TokenStats()
+    out = run_ollama.dispatch(
+        "reviewer",
+        "review",
+        backend=_FlakyBackend(),
+        model="glm-5.2:cloud",
+        timeout=10,
+        system_prompt="sys",
+        config=_CFG,
+        stats=stats,
+    )
+    assert out.parsed is not None
+    d = stats.to_dict()["reviewer"]["glm-5.2:cloud"]
+    assert d["http_calls"] == 2 and d["delegations"] == 1  # retry billed, one delegation
+    assert d["prompt_tokens"] == 20 and d["completion_tokens"] == 10  # BOTH attempts' tokens
+
+
+def test_dispatch_does_not_record_stats_for_a_call_that_raises_before_returning():
+    # http_calls counts backend calls that COMPLETE and produce a DelegationResult.
+    # A call that raises (connection/timeout/5xx) before returning is never recorded —
+    # tracking failed attempts is the per-model circuit breaker's job (R14b/MS5).
+    from token_stats import TokenStats
+
+    class _FailingBackend:
+        def run(
+            self,
+            capability,
+            system_prompt,
+            prompt,
+            model,
+            timeout,
+            *,
+            response_format=None,
+            deadline=None,
+        ):
+            raise OllamaBackendError("connection refused")
+
+    stats = TokenStats()
+    with pytest.raises(OllamaBackendError):
+        run_ollama.dispatch(
+            "coder",
+            "write",
+            backend=_FailingBackend(),
+            model="kimi-k2.7-code:cloud",
+            timeout=10,
+            system_prompt="sys",
+            config=_CFG,
+            stats=stats,
+        )
+    assert stats.to_dict() == {}
 
 
 def test_load_system_prompt_reads_agent_file(tmp_path, monkeypatch):
@@ -356,7 +504,10 @@ def test_looks_like_path_detects_separator_extension_and_absolute():
     assert run_ollama._looks_like_path("just-a-word") is False  # no sep/ext
 
 
-def test_main_runs_full_pipeline_and_prints_output(capsys, monkeypatch):
+def test_main_runs_full_pipeline_and_prints_output(capsys, monkeypatch, tmp_path):
+    # Isolate cwd: run_delegation writes token_stats.json to os.getcwd() (MS2 interim, no
+    # --output-dir here) — chdir to tmp_path so the suite never touches the real repo root.
+    monkeypatch.chdir(tmp_path)
     # Use the REAL OllamaAgentsConfig (via _cfg_with_structured) — a hand-rolled stub with
     # only `models` would AttributeError once dispatch reads `config.structured` (coder→"off").
     cfg = _cfg_with_structured()
@@ -371,8 +522,9 @@ def test_main_runs_full_pipeline_and_prints_output(capsys, monkeypatch):
     assert "hello world" in capsys.readouterr().out
 
 
-def test_main_model_override_reaches_backend(monkeypatch):
+def test_main_model_override_reaches_backend(monkeypatch, tmp_path):
     # R28: --model overrides the config default and reaches backend.run as `model`.
+    monkeypatch.chdir(tmp_path)  # isolate cwd: run_delegation writes token_stats.json there
     seen: dict[str, str] = {}
 
     class _CapBackend:
@@ -388,7 +540,7 @@ def test_main_model_override_reaches_backend(monkeypatch):
             deadline=None,
         ):
             seen["model"] = model
-            return "ok"
+            return DelegationResult("ok", 0, 0, True, 0.0)
 
     cfg = _cfg_with_structured()
     monkeypatch.setattr(run_ollama, "resolve_config", lambda **kw: cfg)
@@ -401,12 +553,13 @@ def test_main_model_override_reaches_backend(monkeypatch):
     assert seen["model"] == "custom-model:cloud"  # override wins over cfg.models["coder"]
 
 
-def test_main_threads_the_model_override_into_preflight_not_just_the_backend(monkeypatch):
+def test_main_threads_the_model_override_into_preflight_not_just_the_backend(monkeypatch, tmp_path):
     # R10/R28 fix: a --model override must reach preflight's model-existence check, not
     # only backend.run — otherwise an override to a nonexistent model would silently
     # bypass preflight and only surface as a chat-time 404. This asserts preflight is
     # called with the OVERRIDE (as effective_model, for capability="coder"), never the
     # stale config default.
+    monkeypatch.chdir(tmp_path)  # isolate cwd: run_delegation writes token_stats.json there
     seen_preflight: dict[str, object] = {}
 
     def _preflight(cfg, **kw):

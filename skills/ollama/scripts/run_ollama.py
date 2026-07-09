@@ -10,10 +10,11 @@ import json
 import os
 import sys
 import time
+from dataclasses import replace
 from typing import Any
 
 from agent_schema import DISCRIMINATOR_KEYS, SCHEMAS
-from backend import AgentBackend, OllamaBackend
+from backend import AgentBackend, DelegationResult, OllamaBackend
 from errors import (
     DelegationError,
     InvalidInputError,
@@ -29,11 +30,17 @@ from ollama_config import CAPABILITIES, OllamaAgentsConfig
 from ollama_config import resolve_config as resolve_config
 from ollama_preflight import preflight
 from parse_output import parse_agent_output
+from token_stats import TokenStats
 from validate import MAX_INPUT_FILE_SIZE, validate_output
 
 MAX_HISTORY_RUNS = 5
 
-_RETRY_FEEDBACK = "\n\n---RETRY-FEEDBACK---\nYour previous output failed: {error}\n{schema}\n"
+# Retry feedback (R25) is built by explicit concatenation, NOT str.format — the parser/
+# validator error text and the JSON-Schema both contain literal braces. Concatenation is
+# crash-proof by construction (no format-field parsing of dynamic content) and future-proof
+# against a stray brace ever being introduced into a template.
+_RETRY_FEEDBACK_PREFIX = "\n\n---RETRY-FEEDBACK---\nYour previous output failed: "
+_RETRY_FEEDBACK_SCHEMA_INTRO = "Return JSON conforming to this schema:\n"
 # agents/ live one level up from scripts/ (skills/ollama/agents/).
 _AGENTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "agents")
 
@@ -241,14 +248,24 @@ def dispatch(
     timeout: int,
     system_prompt: str,
     config: OllamaAgentsConfig,
-) -> dict[str, Any] | str:
+    stats: TokenStats | None = None,
+) -> DelegationResult:
     """Run one delegation; for the ``schema`` mode parse+validate with one retry.
 
     The per-capability ``[structured]`` mode from *config* drives the request (R29):
     ``"schema"`` sends the strict JSON-Schema ``response_format`` and parses+validates the
     output (retrying ONCE with a corrective feedback block while a monotonic wall-clock
-    deadline (R25) has not elapsed); ``"object"``/``"off"`` send a generic/absent
-    ``response_format`` and return the content verbatim for Claude to review.
+    deadline (R25) has not elapsed), returning the ``DelegationResult`` with the validated
+    dict in ``.parsed``; ``"object"``/``"off"`` send a generic/absent ``response_format``
+    and return the ``DelegationResult`` verbatim (``.parsed`` is ``None``, ``.content`` is
+    the raw text for Claude to review).
+
+    When *stats* is given, every backend call that COMPLETES (returns a
+    ``DelegationResult``) is recorded (``http_calls``) and the logical delegation is
+    counted once (``delegations`` via ``counts_as_delegation`` False on the retry). A call
+    that raises (connection error/timeout/5xx) propagates the exception unchanged and is
+    never recorded — ``http_calls`` reflects completed attempts, not raw connection
+    attempts (see ``token_stats.TokenStats``).
 
     Args:
         capability: The capability name.
@@ -259,9 +276,12 @@ def dispatch(
         timeout: Per-delegation timeout.
         system_prompt: The capability's system prompt.
         config: The resolved config (its ``structured`` mapping drives the mode).
+        stats: Optional local token accumulator (R12); every completed backend call is
+            recorded into it.
 
     Returns:
-        The validated dict (schema mode) or the raw content str (object/off mode).
+        The ``DelegationResult`` — with the validated dict in ``.parsed`` for schema mode,
+        or ``.parsed is None`` and the raw text in ``.content`` for object/off mode.
 
     Raises:
         OllamaBackendError: if the composite retry deadline is exceeded.
@@ -290,7 +310,9 @@ def dispatch(
     # Parse+validate only when we asked for the strict schema AND the capability has one;
     # "object"/"off" (and any free-text capability) return the content verbatim.
     if mode != "schema" or keys is None:
-        return backend.run(
+        # Free-text/object (and schema-without-keys) return the DelegationResult verbatim:
+        # `.content` is what Claude reviews, `.parsed` stays None. Record the completed call.
+        result = backend.run(
             capability,
             system_prompt,
             prompt,
@@ -299,15 +321,18 @@ def dispatch(
             response_format=response_format,
             deadline=deadline,
         )
+        if stats is not None:
+            stats.record(capability, model, result)
+        return result
 
     attempt_prompt = prompt
     last_error = ""
-    for _attempt in range(2):  # one retry (R25), sharing the single deadline above.
+    for attempt in range(2):  # one retry (R25), sharing the single deadline above.
         if time.monotonic() >= deadline:
             raise OllamaBackendError(
                 f"{capability} delegation exceeded its retry deadline ({last_error})"
             )
-        content = backend.run(
+        result = backend.run(
             capability,
             system_prompt,
             attempt_prompt,
@@ -316,15 +341,27 @@ def dispatch(
             response_format=response_format,
             deadline=deadline,
         )
+        # Bill EVERY completed backend call (http_calls); the retry does not count as a
+        # second logical delegation (counts_as_delegation False on attempt 1).
+        if stats is not None:
+            stats.record(capability, model, result, counts_as_delegation=(attempt == 0))
         try:
-            return validate_output(capability, parse_agent_output(content, keys))
+            parsed = validate_output(capability, parse_agent_output(result.content, keys))
+            return replace(result, parsed=parsed)
         except (ValidationError, json.JSONDecodeError) as exc:
             last_error = str(exc)
             # Reinject the ACTUAL per-capability JSON-Schema (not just the key list) so the
             # model gets the precise contract on retry — maximizes corrective effectiveness.
-            attempt_prompt = prompt + _RETRY_FEEDBACK.format(
-                error=last_error,
-                schema="Return JSON conforming to this schema:\n" + json.dumps(SCHEMAS[capability]),
+            # Built by concatenation (not str.format) so braces in last_error / the schema
+            # JSON can never be misparsed as format fields.
+            attempt_prompt = (
+                prompt
+                + _RETRY_FEEDBACK_PREFIX
+                + last_error
+                + "\n"
+                + _RETRY_FEEDBACK_SCHEMA_INTRO
+                + json.dumps(SCHEMAS[capability])
+                + "\n"
             )
     raise ValidationError(f"{capability} output invalid after retry: {last_error}")
 
@@ -367,6 +404,7 @@ def run_delegation(ns: argparse.Namespace) -> int:
         return 2
     system_prompt = load_system_prompt(ns.capability)
     prompt = _load_input(ns.input)
+    stats = TokenStats()
     result = dispatch(
         ns.capability,
         prompt,
@@ -375,8 +413,12 @@ def run_delegation(ns: argparse.Namespace) -> int:
         timeout=ns.timeout,
         system_prompt=system_prompt,
         config=cfg,
+        stats=stats,
     )
-    rendered = result if isinstance(result, str) else json.dumps(result, indent=2)
+    # The reviewable output is the validated structured dict (`.parsed`) when present, else
+    # the raw text content — both untrusted data for Claude to review, never auto-applied.
+    review = result.parsed if result.parsed is not None else result.content
+    rendered = review if isinstance(review, str) else json.dumps(review, indent=2)
     # --output-dir (R28): when given, persist the raw output to a caller-owned dir. No
     # lock/prune here — the temp-managed run-dir lifecycle and the --keep-runs cleanup it
     # controls land in MS3 (documented forward reference). Omitted → stdout only.
@@ -386,6 +428,10 @@ def run_delegation(ns: argparse.Namespace) -> int:
             os.path.join(ns.output_dir, f"{ns.capability}.raw.json"), "w", encoding="utf-8"
         ) as fh:
             fh.write(rendered)
+    # Local token accounting (R12), separate from Claude/Anthropic usage. Best-effort:
+    # write into --output-dir when given, else cwd (MS3 replaces this default with the
+    # managed temp run dir).
+    stats.write(ns.output_dir if ns.output_dir is not None else os.getcwd())
     print(rendered)
     return 0
 
