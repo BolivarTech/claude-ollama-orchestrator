@@ -572,6 +572,9 @@ def test_map_http_error_body_read_failure_falls_back_to_empty_detail():
         def read(self, size=-1):
             raise ConnectionResetError("connection reset while reading error body")
 
+        def close(self):
+            pass
+
     exc = urllib.error.HTTPError("u", 503, "Down", {}, _BrokenBody())
     with pytest.raises(OllamaBackendError):
         map_http_error(exc, redact=lambda s: s)
