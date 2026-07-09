@@ -426,9 +426,15 @@ def managed_run_dir(
       path below. Re-raising `GeneratorExit` after cleanup satisfies the generator
       close() protocol (a caught `GeneratorExit` must be re-raised, not swallowed).
     - **Any other exception:** the dir *and* its lock are retained, unchanged, and the
-      exception is re-raised as-is. The lock stops a concurrent ``cleanup_old_runs``
-      from pruning the debug artifacts before its staleness bound elapses (or the
-      owning PID dies) -- it is released **only** on the success path above.
+      exception is re-raised as-is. The lock stops a concurrent ``cleanup_old_runs`` from
+      pruning the dir before its staleness bound elapses (or the owning PID dies) -- it is
+      released **only** on the success path above. NOTE: :func:`_write_artifacts` runs only
+      on the SUCCESS path, so a dir retained after a *failure* holds just the lock -- the
+      failure diagnostic is shown live on stderr (via the stderr shim, R19/R20), not
+      persisted here. Persisting partial failure-path artifacts (the prompt / stderr
+      buffer) for post-mortem debugging is a deliberate future enhancement, NOT implemented
+      in this milestone; the retention still serves R27's invariant (a live-marked dir that
+      a concurrent cleanup must not prune).
 
     **Explicit `output_dir` path** (`--output-dir`, an advanced override): the directory
     is created (:func:`create_output_dir`) but is otherwise entirely caller-managed --
