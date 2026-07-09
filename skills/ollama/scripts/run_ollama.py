@@ -35,7 +35,12 @@ from validate import MAX_INPUT_FILE_SIZE, validate_output
 
 MAX_HISTORY_RUNS = 5
 
-_RETRY_FEEDBACK = "\n\n---RETRY-FEEDBACK---\nYour previous output failed: {error}\n{schema}\n"
+# Retry feedback (R25) is built by explicit concatenation, NOT str.format — the parser/
+# validator error text and the JSON-Schema both contain literal braces. Concatenation is
+# crash-proof by construction (no format-field parsing of dynamic content) and future-proof
+# against a stray brace ever being introduced into a template.
+_RETRY_FEEDBACK_PREFIX = "\n\n---RETRY-FEEDBACK---\nYour previous output failed: "
+_RETRY_FEEDBACK_SCHEMA_INTRO = "Return JSON conforming to this schema:\n"
 # agents/ live one level up from scripts/ (skills/ollama/agents/).
 _AGENTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "agents")
 
@@ -347,9 +352,16 @@ def dispatch(
             last_error = str(exc)
             # Reinject the ACTUAL per-capability JSON-Schema (not just the key list) so the
             # model gets the precise contract on retry — maximizes corrective effectiveness.
-            attempt_prompt = prompt + _RETRY_FEEDBACK.format(
-                error=last_error,
-                schema="Return JSON conforming to this schema:\n" + json.dumps(SCHEMAS[capability]),
+            # Built by concatenation (not str.format) so braces in last_error / the schema
+            # JSON can never be misparsed as format fields.
+            attempt_prompt = (
+                prompt
+                + _RETRY_FEEDBACK_PREFIX
+                + last_error
+                + "\n"
+                + _RETRY_FEEDBACK_SCHEMA_INTRO
+                + json.dumps(SCHEMAS[capability])
+                + "\n"
             )
     raise ValidationError(f"{capability} output invalid after retry: {last_error}")
 
