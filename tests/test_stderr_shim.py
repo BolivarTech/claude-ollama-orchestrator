@@ -74,3 +74,40 @@ def test_exit_flush_failure_is_best_effort_and_never_raises(monkeypatch):
     with buffered_stderr_while(active=True) as buf:
         buf.write("captured but never successfully flushed")
     # Reaching this line (context manager exited cleanly) is the assertion.
+
+
+def test_active_shim_proxies_real_stderr_stream_attributes(monkeypatch):
+    # Balthasar WARNING: in active mode the shimmed sys.stderr must honor the stream
+    # contract — fileno/encoding/isatty proxy to the real stream. A bare io.StringIO has no
+    # `.encoding` and its `fileno()` raises, breaking code that probes sys.stderr while the
+    # display owns the terminal. Writes still go to the capture buffer ONLY (never the real
+    # stream mid-block) so the display's ANSI redraw is protected.
+    class _FakeReal:
+        encoding = "utf-8"
+
+        def __init__(self) -> None:
+            self.written: list[str] = []
+
+        def fileno(self) -> int:
+            return 2
+
+        def isatty(self) -> bool:
+            return False
+
+        def write(self, s: str) -> int:
+            self.written.append(s)
+            return len(s)
+
+        def flush(self) -> None:
+            pass
+
+    fake = _FakeReal()
+    monkeypatch.setattr(sys, "stderr", fake)
+    with buffered_stderr_while(active=True) as buf:
+        assert sys.stderr.encoding == "utf-8"  # proxied (raw StringIO has no .encoding)
+        assert sys.stderr.fileno() == 2  # proxied (raw StringIO.fileno() raises)
+        assert sys.stderr.isatty() is False  # proxied
+        sys.stderr.write("captured\n")
+        assert fake.written == []  # active mode: NOTHING reaches the real stream mid-block
+    assert buf.getvalue() == "captured\n"
+    assert "".join(fake.written) == "captured\n"  # delivered to the real stream once, on exit
