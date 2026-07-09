@@ -973,6 +973,34 @@ def test_status_display_stop_called_even_on_interrupt(tmp_path, monkeypatch):
     assert stopped["n"] == 1  # stop() ran in the finally despite the interrupt
 
 
+def test_raising_display_stop_does_not_mask_interrupt_or_defeat_r27_cleanup(tmp_path, monkeypatch):
+    # R27 regression guard: if StatusDisplay.stop()'s stderr flush raises at teardown
+    # (a broken/closed stream on Ctrl-C / pipe closure), an UNGUARDED stop() in the
+    # `finally` would REPLACE the propagating KeyboardInterrupt with a plain OSError — so
+    # managed_run_dir's (KeyboardInterrupt, SystemExit, GeneratorExit) rmtree path would
+    # miss the interrupt and WRONGLY RETAIN the dir. The guarded _safe_display_stop must
+    # swallow the flush failure so the KeyboardInterrupt still wins AND the dir is cleaned.
+    container = _wire(monkeypatch, tmp_path, DelegationResult("x", 1, 1, False, 0.1))
+
+    class _RaisingStopDisplay:
+        def __init__(self, agents, **kw):
+            pass
+
+        def update(self, *a, **k):
+            pass
+
+        def stop(self):
+            raise OSError("stderr is closed")
+
+    monkeypatch.setattr(run_ollama, "StatusDisplay", _RaisingStopDisplay)
+    monkeypatch.setattr(
+        run_ollama, "dispatch", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt())
+    )
+    with pytest.raises(KeyboardInterrupt):  # NOT OSError — the interrupt must still win
+        run_ollama.main(["coder", "x"])  # display active (no --no-status)
+    assert not [x for x in os.listdir(container) if x.startswith("ollama-run-")]  # R27: cleaned
+
+
 def test_failed_delegation_marks_display_failed(tmp_path, monkeypatch):
     # R20: a delegation that raises must mark its row "failed" in the live status
     # tree before the exception propagates — never left frozen on "running".
