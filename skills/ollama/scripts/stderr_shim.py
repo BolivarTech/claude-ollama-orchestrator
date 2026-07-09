@@ -49,6 +49,43 @@ class _TeeStderr:
         return getattr(self._real, name)
 
 
+class _BufferOnlyStderr:
+    """Capture-only stderr proxy: writes go ONLY to the buffer, never the real stream.
+
+    Used when a live status display owns the terminal (``active=True``): stderr writes are
+    withheld from the real stream (so the display's in-place ANSI redraw is never corrupted)
+    and captured for later persistence, then flushed to the real stream once on block exit.
+
+    Unlike a bare ``io.StringIO``, this proxies every OTHER attribute (``fileno``,
+    ``buffer``, ``encoding``, ``isatty``, ...) to the real stderr via ``__getattr__``, so
+    code that probes ``sys.stderr`` during the block still sees a faithful stream interface.
+    A raw ``StringIO`` has no ``.buffer``/``.encoding`` and its ``fileno()`` raises, which
+    violates the ``sys.stderr`` contract callers may rely on.
+    """
+
+    def __init__(self, real: TextIO, buffer: io.StringIO) -> None:
+        self._real = real
+        self._buffer = buffer
+
+    def write(self, s: str) -> int:
+        return self._buffer.write(s)
+
+    def writelines(self, lines: Iterable[str]) -> None:
+        """Route each line to the capture buffer ONLY (never the real stream)."""
+        for line in lines:
+            self._buffer.write(line)
+
+    def flush(self) -> None:
+        # Buffer-only: nothing reaches the real stream until the on-exit flush, so a
+        # mid-block flush is a no-op (matching the raw io.StringIO this replaces).
+        pass
+
+    def __getattr__(self, name: str) -> Any:
+        # Proxy every non-overridden attribute to the real stderr so the stream contract
+        # (fileno/buffer/encoding/isatty/...) is honored during the block. Any is idiomatic.
+        return getattr(self._real, name)
+
+
 @contextlib.contextmanager
 def buffered_stderr_while(active: bool) -> Iterator[io.StringIO]:
     """Capture ``sys.stderr`` for the duration, always yielding the capture buffer.
@@ -78,7 +115,9 @@ def buffered_stderr_while(active: bool) -> Iterator[io.StringIO]:
     """
     real = sys.stderr
     buffer = io.StringIO()
-    sys.stderr = buffer if active else _TeeStderr(real, buffer)
+    # active: capture-only but proxy the real stream's attributes (contract-faithful);
+    # inactive (--no-status): tee live to the real stream AND capture.
+    sys.stderr = _BufferOnlyStderr(real, buffer) if active else _TeeStderr(real, buffer)
     try:
         yield buffer
     finally:
