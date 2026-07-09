@@ -7,6 +7,7 @@
 import json
 import os
 import threading
+import time
 
 import pytest
 
@@ -268,3 +269,53 @@ def test_write_returns_none_when_fsync_fails_best_effort(tmp_path, monkeypatch):
     ts.record("coder", "m", _res())
     assert ts.write(str(tmp_path)) is None
     assert not os.path.exists(os.path.join(str(tmp_path), "token_stats.json"))
+
+
+def test_write_retries_os_replace_on_permission_error_then_succeeds(tmp_path, monkeypatch):
+    # Windows: os.replace can transiently fail with PermissionError (WinError 5) under
+    # concurrent contention onto the shared destination path — unlike POSIX rename().
+    # write() must RETRY rather than give up on the first PermissionError, then still
+    # land the file atomically. Without the retry loop this would return None on the
+    # first failure, so this test directly exercises that new behavior.
+    ts = TokenStats()
+    ts.record("coder", "m", _res())
+    real_replace = os.replace
+    attempts = {"n": 0}
+
+    def _flaky_replace(src, dst):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise PermissionError("[WinError 5] Access is denied")
+        return real_replace(src, dst)
+
+    slept: list[float] = []
+    monkeypatch.setattr(os, "replace", _flaky_replace)
+    monkeypatch.setattr(time, "sleep", slept.append)  # record backoff, don't actually sleep
+    path = ts.write(str(tmp_path))
+    assert path == os.path.join(str(tmp_path), "token_stats.json")  # succeeded, not None
+    assert attempts["n"] == 2  # first PermissionError retried, second attempt succeeded
+    assert len(slept) == 1  # exactly one backoff between the two attempts
+    assert json.loads(open(path, encoding="utf-8").read())["coder"]["m"]["http_calls"] == 1
+
+
+def test_write_returns_none_after_exhausting_os_replace_permission_error_retries(
+    tmp_path, monkeypatch
+):
+    # If os.replace raises PermissionError on EVERY attempt (a destination that stays
+    # contended/locked), write() must give up after a BOUNDED number of retries and
+    # degrade to best-effort None — never loop forever, never leave a partial final file.
+    from token_stats import _REPLACE_MAX_RETRIES
+
+    ts = TokenStats()
+    ts.record("coder", "m", _res())
+    attempts = {"n": 0}
+
+    def _always_denied(src, dst):
+        attempts["n"] += 1
+        raise PermissionError("[WinError 5] Access is denied")
+
+    monkeypatch.setattr(os, "replace", _always_denied)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)  # don't actually sleep the backoffs
+    assert ts.write(str(tmp_path)) is None  # exhausted → best-effort None
+    assert attempts["n"] == _REPLACE_MAX_RETRIES  # bounded: exactly N attempts, no infinite loop
+    assert not os.path.exists(os.path.join(str(tmp_path), "token_stats.json"))  # no partial file
