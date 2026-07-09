@@ -551,6 +551,33 @@ def _safe_display_update(display: "StatusDisplay | None", capability: str, state
         print(f"WARNING: status display update failed: {exc}", file=sys.stderr)
 
 
+def _safe_display_stop(display: "StatusDisplay | None") -> None:
+    """Best-effort ``StatusDisplay.stop`` -- never raises into the caller's ``finally``.
+
+    ``run_delegation`` calls this in a ``finally`` that runs while an exception -- possibly
+    ``KeyboardInterrupt`` -- is in flight (R27). ``StatusDisplay.stop`` flushes the REAL
+    stderr, which can raise ``OSError`` when that stream is broken/closed at teardown
+    (Ctrl-C / pipe closure -- exactly R27's scenario). An unguarded raise from a ``finally``
+    REPLACES the propagating exception, so ``managed_run_dir``'s
+    ``except (KeyboardInterrupt, SystemExit, GeneratorExit)`` rmtree path would miss the
+    interrupt (seeing a plain ``OSError`` instead) and wrongly RETAIN the run dir. Any
+    failure here is swallowed -- including from the warning ``print`` itself, since stderr
+    may be the very stream that is broken -- so the real exception always wins.
+
+    Args:
+        display: The active ``StatusDisplay``, or ``None`` (``--no-status``) -- a no-op.
+    """
+    if display is None:
+        return
+    try:
+        display.stop()
+    except Exception as exc:  # noqa: BLE001 — must never shadow the real exception in flight.
+        try:
+            print(f"WARNING: status display stop failed: {exc}", file=sys.stderr)
+        except Exception:  # noqa: BLE001 — stderr itself may be the broken stream.
+            pass
+
+
 def _write_artifacts(
     output_dir: str,
     capability: str,
@@ -762,9 +789,9 @@ def run_delegation(ns: argparse.Namespace) -> int:
             raise
         finally:
             # R20: flush/restore the live display even on interrupt or a mid-run
-            # exception.
-            if display is not None:
-                display.stop()
+            # exception. Guarded (R27): a raising stop() must never REPLACE the exception
+            # in flight (esp. KeyboardInterrupt), or managed_run_dir's rmtree path is missed.
+            _safe_display_stop(display)
     return 0
 
 
