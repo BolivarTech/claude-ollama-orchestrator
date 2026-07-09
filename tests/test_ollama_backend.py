@@ -87,6 +87,15 @@ def test_delegation_result_tok_per_s_never_negative_on_defensive_negative_elapse
     assert DelegationResult("x", 0, 30, False, -1.5).tok_per_s == 0.0
 
 
+def test_delegation_result_tok_per_s_returns_zero_on_non_finite_elapsed():
+    # elapsed_s is always finite in practice (time.monotonic() delta, and TokenStats.record
+    # rejects NaN/inf), but tok_per_s is a PUBLIC property that must not propagate NaN/inf:
+    # `NaN <= 0` is False, so without an explicit isfinite guard it would divide by NaN/inf
+    # and return NaN/0.0 unpredictably. It must return 0.0 for any non-finite elapsed_s.
+    assert DelegationResult("x", 0, 30, False, float("nan")).tok_per_s == 0.0
+    assert DelegationResult("x", 0, 30, False, float("inf")).tok_per_s == 0.0
+
+
 def test_delegation_result_parsed_defaults_none():
     assert DelegationResult("x", 1, 1, False, 0.1).parsed is None
 
