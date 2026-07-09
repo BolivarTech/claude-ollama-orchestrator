@@ -346,6 +346,12 @@ def _consume(
             # maps RecursionError -> a handled JSONDecodeError); never let it
             # propagate and crash the run.
             continue
+        if not isinstance(chunk, dict):
+            # A `data:` line that is valid JSON but not a JSON object (e.g. an array or a
+            # bare scalar) is malformed for our envelope: skip it rather than crash on
+            # `chunk.get("usage")` below (a non-dict has no `.get`) — R7b: a malformed
+            # delta must never crash the run, only be tolerated/skipped.
+            continue
         try:
             delta = chunk["choices"][0]["delta"].get("content")
         except (KeyError, IndexError, TypeError, AttributeError):

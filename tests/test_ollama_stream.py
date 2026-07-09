@@ -76,6 +76,22 @@ def test_stream_skips_malformed_and_non_string_deltas():
     assert res.content == "ok"
 
 
+def test_stream_skips_a_non_dict_json_data_line_without_crashing():
+    # R7b: a `data:` line that is valid JSON but NOT an object (a JSON array or a bare
+    # scalar) must be tolerated/skipped — never crash. Without the isinstance(chunk, dict)
+    # guard, chunk["choices"] raises TypeError (caught) but chunk.get("usage") then raises
+    # AttributeError (a non-dict has no .get), which is uncaught.
+    urlopen = _sse(
+        'data: {"choices":[{"delta":{"content":"ok"}}]}\n',
+        "data: [1, 2, 3]\n",  # valid JSON, non-dict (array) → skip, no AttributeError
+        "data: 42\n",  # valid JSON, bare scalar → skip
+        'data: {"choices":[{"delta":{"content":"!"}}]}\n',
+        "data: [DONE]\n",
+    )
+    res = stream_run(_cfg(), "s", "p", "m", 60, sink=lambda _s: None, urlopen=urlopen)
+    assert res.content == "ok!"
+
+
 def test_stream_skips_delta_causing_recursion_error_in_json_loads(monkeypatch):
     """A pathologically deeply-nested JSON delta can raise `RecursionError` from
     `json.loads` (a theoretical DoS) — it must be treated as a malformed delta
