@@ -3,7 +3,9 @@
 # Date: 2026-07-05
 """CLI orchestrator: argparse surface, --ollama-init short-circuit, single dispatch."""
 
+import json
 import os
+import tempfile
 from dataclasses import replace
 from types import MappingProxyType
 
@@ -598,7 +600,10 @@ def test_main_aborts_when_preflight_fails(monkeypatch):
 
 
 def test_output_dir_writes_raw_artifact(tmp_path, monkeypatch):
-    # R28: --output-dir persists the raw output to a caller-owned dir (cleanup/lock is MS3).
+    # R28: --output-dir persists the raw output to a caller-owned dir. Since MS3 (Task 5),
+    # {cap}.raw.json follows the canonical R18 artifact format (`_write_artifacts`, a JSON
+    # envelope `{"content": ...}`) for BOTH a managed run dir and an explicit --output-dir —
+    # the interim MS1/MS2 verbatim-text dump is superseded by that standardized format.
     cfg = _cfg_with_structured()  # real config; coder→"off" free-text → content written verbatim
     monkeypatch.setattr(run_ollama, "resolve_config", lambda **kw: cfg)
     # **kw absorbs preflight's capability=/effective_model= kwargs (R10/R28 fix) — the
@@ -608,7 +613,8 @@ def test_output_dir_writes_raw_artifact(tmp_path, monkeypatch):
     monkeypatch.setattr(run_ollama, "_make_backend", lambda cfg: _FakeBackend(["hi there"]))
     rc = run_ollama.main(["coder", "write hi", "--no-status", "--output-dir", str(tmp_path)])
     assert rc == 0
-    assert (tmp_path / "coder.raw.json").read_text(encoding="utf-8") == "hi there"
+    raw = json.loads((tmp_path / "coder.raw.json").read_text(encoding="utf-8"))
+    assert raw["content"] == "hi there"
 
 
 def test_main_rejects_vision_as_actionable_nonzero_not_a_traceback(monkeypatch, capsys):
@@ -689,10 +695,6 @@ def test_main_handles_unreadable_input_file_as_actionable_nonzero_not_a_tracebac
 
 # --- Task 5: managed run-dir lifecycle + artifacts + interrupt cleanup ---
 
-import tempfile  # noqa: E402 — grouped with the Task-5 test block it belongs to.
-
-import json  # noqa: E402
-
 
 def _wire(monkeypatch, tmp_path, result, *, container=None):
     """Point the run-dir namespace at an isolated container and stub the pipeline."""
@@ -732,6 +734,26 @@ def _run_dir(container):
     ]
     assert dirs, "no run dir created"
     return dirs[0]
+
+
+def _delegate(argv):
+    """Parse *argv* and drive ``run_delegation`` directly, bypassing ``main()``'s
+    exception-to-exit-code conversion.
+
+    ``main()`` deliberately catches the full domain-error family (incl.
+    ``OllamaBackendError``/``OSError``, the latter covering ``TimeoutError``) and turns
+    each into an actionable stderr message plus a non-zero exit code — that CLI-facing
+    contract is established, tested MS1 behavior (``test_main_aborts_when_preflight_fails``
+    et al.) and is not part of Task 5's scope. A few of Task 5's own tests need the RAW
+    exception itself (to assert a side effect of ``run_delegation``/``managed_run_dir``'s
+    exception handling — the status-display state update, or the run dir being
+    retained/rmtree'd) rather than main()'s converted exit code, so those drive
+    ``run_delegation`` directly instead of going through ``main()``.
+    """
+    parser = run_ollama.build_parser()
+    ns = parser.parse_args(argv)
+    run_ollama._validate_args(parser, ns)
+    return run_ollama.run_delegation(ns)
 
 
 def test_managed_run_writes_full_artifacts_and_removes_lock(tmp_path, monkeypatch):
@@ -892,8 +914,12 @@ def test_interrupt_rmtrees_dir_but_plain_exception_keeps_it(tmp_path, monkeypatc
     monkeypatch.setattr(
         run_ollama, "dispatch", lambda *a, **k: (_ for _ in ()).throw(OllamaBackendError("boom"))
     )
+    # Drive run_delegation directly: main()'s comprehensive except clause (established MS1
+    # behavior) would otherwise catch OllamaBackendError and convert it to a non-zero exit
+    # code — this test needs the raw exception to observe managed_run_dir's retain-on-
+    # exception side effect, not main()'s CLI-facing conversion (see _delegate's docstring).
     with pytest.raises(OllamaBackendError):
-        run_ollama.main(["coder", "x", "--no-status"])
+        _delegate(["coder", "x", "--no-status"])
     assert [x for x in os.listdir(container) if x.startswith("ollama-run-")]  # kept for debug
 
 
@@ -943,8 +969,11 @@ def test_failed_delegation_marks_display_failed(tmp_path, monkeypatch):
     monkeypatch.setattr(
         run_ollama, "dispatch", lambda *a, **k: (_ for _ in ()).throw(OllamaBackendError("boom"))
     )
+    # Drive run_delegation directly (see _delegate's docstring): main()'s established
+    # except clause would otherwise convert this into a non-zero exit code before this
+    # test can observe the raw exception.
     with pytest.raises(OllamaBackendError):
-        run_ollama.main(["coder", "x"])  # display active (no --no-status)
+        _delegate(["coder", "x"])  # display active (no --no-status)
     assert ("coder", "failed") in updates
 
 
@@ -968,8 +997,11 @@ def test_timeout_delegation_marks_display_timeout(tmp_path, monkeypatch):
     monkeypatch.setattr(
         run_ollama, "dispatch", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("timed out"))
     )
+    # Drive run_delegation directly (see _delegate's docstring): main()'s established
+    # except clause catches OSError (TimeoutError's parent) and would otherwise convert
+    # this into a non-zero exit code before this test can observe the raw exception.
     with pytest.raises(TimeoutError):
-        run_ollama.main(["coder", "x"])
+        _delegate(["coder", "x"])
     assert ("coder", "timeout") in updates
     assert ("coder", "failed") not in updates
 

@@ -6,10 +6,15 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
+import shutil
 import sys
+import tempfile
 import time
+from collections.abc import Iterator
 from dataclasses import replace
 from typing import Any
 
@@ -20,7 +25,6 @@ from errors import (
     InvalidInputError,
     OllamaBackendError,
     OllamaConfigError,
-    OllamaPreflightError,
     ValidationError,
 )
 from ollama_config import CAPABILITIES, OllamaAgentsConfig
@@ -30,6 +34,15 @@ from ollama_config import CAPABILITIES, OllamaAgentsConfig
 from ollama_config import resolve_config as resolve_config
 from ollama_preflight import preflight
 from parse_output import parse_agent_output
+from run_lock import remove_lock, staleness_bound_for_timeout, write_lock
+from status_display import StatusDisplay
+from stderr_shim import buffered_stderr_while
+from temp_dirs import (
+    cleanup_old_runs,
+    create_output_dir,
+    project_run_root,
+    resolve_project_root,
+)
 from token_stats import TokenStats
 from validate import MAX_INPUT_FILE_SIZE, validate_output
 
@@ -381,58 +394,376 @@ def _repo_toml() -> str:
     return os.path.join(os.getcwd(), ".claude", "ollama-agents.toml")
 
 
-def run_delegation(ns: argparse.Namespace) -> int:
-    """Resolve config, preflight, load the prompt, delegate once, print the output.
+@contextlib.contextmanager
+def managed_run_dir(
+    keep_runs: int, timeout: int, *, output_dir: str | None = None
+) -> Iterator[str]:
+    """Own the run-directory lifecycle for one delegation (R15-R18, R27).
 
-    Aborts (non-zero, informing) if preflight fails — never silently falls back to Claude
-    generation (R14). The delegated output is untrusted data for Claude to review; it is
-    printed, never auto-applied.
+    Extracted out of ``run_delegation`` (SRP: one function, one reason to change), this
+    context manager owns exactly the run-directory slice of the lifecycle, so the caller
+    reads as a plain ``with`` block around whatever it wants to do with the directory.
+
+    **Managed temp path** (``output_dir is None``, the default): resolves the
+    per-project namespace (:func:`resolve_project_root` -> :func:`project_run_root`),
+    prunes older runs to ``keep_runs - 1`` (skipped when the namespace degraded to the
+    shared ``tempfile.gettempdir()`` -- pruning there would touch *other* projects'
+    runs, R15), creates a fresh run dir (:func:`create_output_dir`), and writes the
+    process-liveness lock (:func:`write_lock`, sized by
+    :func:`staleness_bound_for_timeout`). On exit:
+
+    - **Normal exit (no exception):** the lock is removed (:func:`remove_lock`) -- the
+      delegation succeeded, nothing needs to survive for debugging.
+    - **`KeyboardInterrupt`/`SystemExit`/`GeneratorExit`:** the in-progress dir is
+      ``rmtree``-d (the lock goes with the tree) before the exception is re-raised --
+      R27, no orphaned ``ollama-run-*`` dirs on Ctrl-C. `GeneratorExit` is included
+      alongside the other two: like them it is a `BaseException`, not an `Exception`,
+      and it means this generator-based context manager's `with` body was torn down by
+      abandonment (the generator was closed/garbage-collected without a normal
+      `__exit__`) rather than by a reported failure -- an abandoned run is being
+      discarded, so it gets the same cleanup as an interrupt, not the retain-for-debug
+      path below. Re-raising `GeneratorExit` after cleanup satisfies the generator
+      close() protocol (a caught `GeneratorExit` must be re-raised, not swallowed).
+    - **Any other exception:** the dir *and* its lock are retained, unchanged, and the
+      exception is re-raised as-is. The lock stops a concurrent ``cleanup_old_runs``
+      from pruning the debug artifacts before its staleness bound elapses (or the
+      owning PID dies) -- it is released **only** on the success path above.
+
+    **Explicit `output_dir` path** (`--output-dir`, an advanced override): the directory
+    is created (:func:`create_output_dir`) but is otherwise entirely caller-managed --
+    no lock is written, no pruning happens, and nothing is ever removed on any exit path
+    (success, interrupt, or exception). The caller is responsible for not sharing it
+    between concurrent delegations (R28).
+
+    Args:
+        keep_runs: The `--keep-runs` budget passed to :func:`cleanup_old_runs` (pruned
+            to `keep_runs - 1` so the total lands exactly on `keep_runs` once the new
+            dir is created). Ignored when `output_dir` is given.
+        timeout: The per-delegation timeout in seconds, used to size the lock's
+            staleness bound. Ignored when `output_dir` is given.
+        output_dir: An explicit caller-managed directory, or `None` for a managed temp
+            run dir (the default).
+
+    Yields:
+        The output directory to write artifacts into.
+
+    Raises:
+        KeyboardInterrupt: re-raised after `rmtree`-ing the managed temp dir (R27).
+        SystemExit: re-raised after `rmtree`-ing the managed temp dir (R27).
+        GeneratorExit: re-raised after `rmtree`-ing the managed temp dir (R27) -- an
+            abandoned generator means the run is being discarded, same as an interrupt.
+        Exception: re-raised unchanged; the managed temp dir and its lock are retained
+            for debugging.
+    """
+    if output_dir is not None:
+        yield create_output_dir(output_dir)
+        return
+
+    run_root = project_run_root(resolve_project_root())
+    # Skip cleanup when project_run_root degraded to the SHARED gettempdir --
+    # pruning there would scan/remove OTHER projects' ollama-run-* dirs (R15).
+    if run_root != tempfile.gettempdir():
+        cleanup_old_runs(keep_runs - 1, run_root)
+    run_dir = create_output_dir(None, run_root)
+    write_lock(run_dir, staleness_bound_for_timeout(timeout))
+    try:
+        yield run_dir
+    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        # R27: an interrupt (or an abandoned/GC'd generator -- GeneratorExit, same
+        # BaseException family) orphans the in-progress dir -> rmtree it (the lock goes
+        # with the tree). Re-raising satisfies the generator close() protocol for
+        # GeneratorExit too (a caught GeneratorExit must be re-raised, never swallowed).
+        try:
+            shutil.rmtree(run_dir)
+        except OSError as exc:
+            print(f"WARNING: cleanup failed for {run_dir}: {exc}", file=sys.stderr)
+        raise
+    else:
+        # Reached only on a normal (no-exception) exit -- any OTHER exception skips this
+        # `else` entirely and propagates WITHOUT touching the lock or the dir: the lock
+        # is RETAINED so a concurrent `cleanup_old_runs` can't prune the debug artifacts
+        # before the staleness bound elapses (or the owning PID dies). Released ONLY
+        # here, on success.
+        remove_lock(run_dir)
+
+
+def _derive_retried(stats_dict: object) -> list[str]:
+    """Return capabilities whose bucket shows more ``http_calls`` than ``delegations``.
+
+    A **structural guard**, MS3-local: ``stats_dict`` is expected to be MS2's
+    ``TokenStats.to_dict()`` shape (``{capability: {model: {"http_calls": int,
+    "delegations": int, ...}}}``), but that exact shape is not trusted blindly.
+    Anything unexpected -- not a dict, a non-dict bucket, missing/non-numeric
+    ``http_calls``/``delegations`` -- is skipped rather than raising, so
+    ``ollama-report.json``'s ``retried`` field degrades gracefully to ``[]`` instead of
+    crashing ``_write_artifacts`` on a shape mismatch.
+
+    Args:
+        stats_dict: The result of ``TokenStats.to_dict()`` (or anything else, by
+            contract -- this function never raises regardless of input shape).
+
+    Returns:
+        List of capability names (insertion order) with at least one retried model
+        bucket (empty if the input is malformed or nothing retried).
+    """
+    if not isinstance(stats_dict, dict):
+        return []
+    retried: list[str] = []
+    for capability, models in stats_dict.items():
+        if not isinstance(models, dict):
+            continue
+        for bucket in models.values():
+            if not isinstance(bucket, dict):
+                continue
+            http_calls = bucket.get("http_calls")
+            delegations = bucket.get("delegations")
+            if (
+                isinstance(http_calls, (int, float))
+                and isinstance(delegations, (int, float))
+                and not isinstance(http_calls, bool)
+                and not isinstance(delegations, bool)
+                and http_calls > delegations
+            ):
+                retried.append(capability)
+                break
+    return retried
+
+
+def _safe_display_update(display: "StatusDisplay | None", capability: str, state: str) -> None:
+    """Best-effort ``StatusDisplay.update`` -- never raises into the caller's except/finally.
+
+    Used on `run_delegation`'s exception paths (R20) to reflect a failed/timed-out
+    delegation in the live status tree before the real exception propagates. A broken
+    or already-stopped display must never mask the original failure, so any exception
+    *this* raises is itself caught and only warned about.
+
+    Args:
+        display: The active ``StatusDisplay``, or ``None`` (``--no-status``) -- a no-op.
+        capability: The delegation's capability name (the row to update).
+        state: One of ``StatusDisplay.VALID_STATES`` (here: ``"failed"`` or ``"timeout"``).
+    """
+    if display is None:
+        return
+    try:
+        display.update(capability, state)
+    except Exception as exc:  # noqa: BLE001 — must never shadow the real exception in flight.
+        print(f"WARNING: status display update failed: {exc}", file=sys.stderr)
+
+
+def _write_artifacts(
+    output_dir: str,
+    capability: str,
+    ns_input: str,
+    result: DelegationResult,
+    stats: TokenStats,
+    errbuf: io.StringIO,
+) -> None:
+    """Write the full R18 artifact set for one delegation into *output_dir*.
+
+    ``{cap}.stream.log`` is written by MS4's streaming layer; here the transactional
+    content lands in ``{cap}.raw.json`` (+ ``{cap}.parsed.json`` for structured output).
+    Every file write is **best-effort**: an ``OSError`` on any one artifact logs a
+    warning and the remaining artifacts still get written -- the delegation's primary
+    result is already on stdout (R19), so a disk hiccup on a side artifact must never
+    crash the run nor abort the rest of the set.
+
+    ``stats.write(output_dir)`` (``token_stats.json``) is wrapped in its own local
+    ``try/except OSError`` here too: MS2's ``TokenStats.write`` already returns ``str |
+    None`` (``None`` if the dir is unwritable) rather than raising, but
+    ``_write_artifacts`` enforces its never-raise contract **locally** -- as
+    defense-in-depth -- instead of depending on that internal safety holding across
+    milestones.
+
+    The ``retried`` field is derived from ``stats.to_dict()`` defensively via
+    :func:`_derive_retried` (MS3-local structural guard; MS2's ``TokenStats.to_dict``
+    contract is untouched).
+
+    **Outer guard: contained runtime-failure modes, not a blanket catch-all.** This
+    function's entire body is wrapped in one top-level ``except (OSError, TypeError,
+    ValueError, RecursionError)`` -- not ``except Exception``. Those four classes are
+    exactly the REALISTIC runtime/environment failure modes an artifact-writing pass
+    can hit:
+
+    - ``OSError`` -- disk/IO failures (disk full, permission denied, path too long, ...)
+      that slip past a narrower per-file guard.
+    - ``TypeError`` -- a non-JSON-serializable value inside ``stats.to_dict()``'s
+      report (e.g. a bare ``object()``), rejected by ``json.dumps``.
+    - ``ValueError`` -- a malformed value ``json.dumps``/formatting rejects.
+    - ``RecursionError`` -- ``json.dumps`` hitting Python's recursion limit on a
+      pathologically deep/self-referential structure inside ``stats.to_dict()``'s
+      report. This is a ``RuntimeError`` subclass, not an ``OSError``/``TypeError``/
+      ``ValueError``, so it would otherwise slip past the narrower three-class guard.
+
+    Any of these is caught, logged as one actionable ``WARNING`` to stderr, and the
+    function returns. A genuinely unexpected exception (``AttributeError``,
+    ``KeyError``, ``IndexError``, or any other bug-shaped failure) is **NOT** caught
+    here and is left to propagate: it indicates a real defect in this function or its
+    inputs, and surfacing it loudly is more useful than a WARNING that quietly hides
+    the bug. ``KeyboardInterrupt``/``SystemExit`` are ``BaseException``, not
+    ``Exception`` (and ``RecursionError`` is a ``RuntimeError``, so adding it does not
+    blur that boundary either), so neither the narrow nor a blanket form of this guard
+    was ever going to catch them -- R27's interrupt-cleanup path is unaffected either
+    way.
+
+    Args:
+        output_dir: The managed (or caller-owned) run directory to write into.
+        capability: The delegation's capability name (artifact filename prefix).
+        ns_input: The actual prompt text delegated (written to ``{cap}.prompt.txt``).
+        result: The delegation's ``DelegationResult``.
+        stats: The run's local token accumulator (R12).
+        errbuf: The captured stderr buffer (R18/R20) for ``{cap}.stderr.log``.
     """
     try:
-        cfg = resolve_config(global_path=_global_toml(), repo_path=_repo_toml(), env=os.environ)
-        # R10/R28: resolve the EFFECTIVE model (the --model override when given, else
-        # the capability's configured model) BEFORE preflight, and thread it in — so a
-        # bad --model override aborts here (actionable), never a later chat-time 404.
-        model = ns.model or cfg.models[ns.capability]
-        preflight(cfg, capability=ns.capability, effective_model=model)
-    except (OllamaConfigError, OllamaPreflightError) as exc:
+
+        def _w(name: str, text: str) -> None:
+            try:
+                with open(os.path.join(output_dir, name), "w", encoding="utf-8") as fh:
+                    fh.write(text)
+            except OSError as exc:
+                print(f"WARNING: could not write artifact {name}: {exc}", file=sys.stderr)
+
+        _w(f"{capability}.prompt.txt", ns_input)
+        _w(f"{capability}.raw.json", json.dumps({"content": result.content}, indent=2))
+        if result.parsed is not None:
+            _w(f"{capability}.parsed.json", json.dumps(result.parsed, indent=2))
+        _w(f"{capability}.stderr.log", errbuf.getvalue())
+        try:
+            stats.write(output_dir)  # token_stats.json
+        except OSError as exc:
+            print(f"WARNING: could not write token_stats.json: {exc}", file=sys.stderr)
+        stats_dict = stats.to_dict()
+        # R18 telemetry: `retried` = capabilities whose backend made more http_calls than
+        # logical delegations (a parse/schema retry, R25); `timings` = per-delegation
+        # wall-clock; `guard` = diff-grounding result (R30), None here (diff-guard lands
+        # in MS7).
+        retried = _derive_retried(stats_dict)
+        report = {
+            "capability": capability,
+            "tokens_by_model": stats_dict,
+            "input_size": {"chars": len(ns_input), "est_tokens": len(ns_input) // 4},
+            "estimated": result.estimated,
+            "tok_per_s": result.tok_per_s,
+            "timings": {capability: result.elapsed_s},
+            "retried": retried,
+            "guard": None,
+        }
+        _w("ollama-report.json", json.dumps(report, indent=2))
+    except (OSError, TypeError, ValueError, RecursionError) as exc:
+        # Contained runtime-failure modes ONLY: disk/IO errors (OSError), a
+        # non-JSON-serializable stats.to_dict() value (TypeError), a malformed value
+        # json.dumps rejects (ValueError), or json.dumps hitting the recursion limit on
+        # a pathologically deep structure (RecursionError -- a RuntimeError subclass
+        # that would otherwise slip past the other three) -- every realistic
+        # artifact-writing runtime failure. The delegation's primary result is already
+        # on stdout (R19) by the time this runs, so a side-artifact failure like this
+        # must never crash the run. Deliberately NOT `except Exception`: an
+        # AttributeError/KeyError here would mean a real bug in this function or its
+        # inputs, and that must surface, not be silently swallowed as a "warning".
         print(
-            f"Ollama unavailable: {exc}\nNot delegating; resolve the issue and retry "
-            "(or generate with Claude explicitly).",
+            f"WARNING: artifact write pass failed for capability {capability!r}: {exc}",
             file=sys.stderr,
         )
-        return 2
-    system_prompt = load_system_prompt(ns.capability)
-    prompt = _load_input(ns.input)
-    stats = TokenStats()
-    result = dispatch(
-        ns.capability,
-        prompt,
-        backend=_make_backend(cfg),
-        model=model,
-        timeout=ns.timeout,
-        system_prompt=system_prompt,
-        config=cfg,
-        stats=stats,
-    )
-    # The reviewable output is the validated structured dict (`.parsed`) when present, else
-    # the raw text content — both untrusted data for Claude to review, never auto-applied.
-    review = result.parsed if result.parsed is not None else result.content
-    rendered = review if isinstance(review, str) else json.dumps(review, indent=2)
-    # --output-dir (R28): when given, persist the raw output to a caller-owned dir. No
-    # lock/prune here — the temp-managed run-dir lifecycle and the --keep-runs cleanup it
-    # controls land in MS3 (documented forward reference). Omitted → stdout only.
-    if ns.output_dir is not None:
-        os.makedirs(ns.output_dir, exist_ok=True)
-        with open(
-            os.path.join(ns.output_dir, f"{ns.capability}.raw.json"), "w", encoding="utf-8"
-        ) as fh:
-            fh.write(rendered)
-    # Local token accounting (R12), separate from Claude/Anthropic usage. Best-effort:
-    # write into --output-dir when given, else cwd (MS3 replaces this default with the
-    # managed temp run dir).
-    stats.write(ns.output_dir if ns.output_dir is not None else os.getcwd())
-    print(rendered)
+        return
+
+
+def run_delegation(ns: argparse.Namespace) -> int:
+    """Resolve config, delegate once inside a managed run dir, write artifacts.
+
+    The run-directory lifecycle itself (namespace resolution, pruning, `mkdtemp`, lock,
+    and the R27 interrupt/retain/release rules) is entirely owned by
+    :func:`managed_run_dir` -- this function only drives one delegation *inside* that
+    context: resolve config, run preflight + dispatch under a `StatusDisplay` +
+    `buffered_stderr_while`, and write the artifacts.
+
+    Preflight runs INSIDE the stderr shim so its warn-and-proceed warnings (404/501,
+    R10) are captured in ``{cap}.stderr.log`` (R18); it still aborts fail-fast on an
+    unreachable host or missing model -- that abort is a normal exception, so
+    `managed_run_dir` retains the dir with the diagnostic (R27 only `rmtree`s on
+    `KeyboardInterrupt`/`SystemExit`/`GeneratorExit`). Before any non-interrupt
+    exception propagates, the live display (if up) is marked ``"timeout"`` for a
+    ``TimeoutError`` or ``"failed"`` for anything else (R20's state set), via the
+    guarded `_safe_display_update` -- so the tree never freezes on ``"running"`` for a
+    delegation that actually failed. `KeyboardInterrupt`/`SystemExit` need no dedicated
+    `except` clause here: as a `BaseException` it already skips past `except
+    TimeoutError`/`except Exception` on its own, still runs `finally: display.stop()`
+    (R20 -- the display is restored even on interrupt), and then propagates out to
+    `managed_run_dir`'s own interrupt handler, which performs the R27 `rmtree`.
+    `buffered_stderr_while`'s `active` flag tracks whether the live display owns the
+    terminal: buffer-then-flush when it does, tee (live + captured) when ``--no-status``
+    leaves no display up -- so ``{cap}.stderr.log`` is always populated (R18) without
+    silencing diagnostics when there is no display to protect.
+
+    R10/R28: the effective model (the `--model` override when given, else the
+    capability's configured model) is resolved BEFORE preflight, and threaded into it,
+    so a bad `--model` override aborts here (actionable), never a later chat-time 404.
+
+    The reviewable output (`.parsed` when present, else `.content`) is untrusted data
+    for Claude to review; it is printed, never auto-applied (R8/R14).
+    """
+    cfg = resolve_config(global_path=_global_toml(), repo_path=_repo_toml(), env=os.environ)
+
+    with managed_run_dir(ns.keep_runs, ns.timeout, output_dir=ns.output_dir) as output_dir:
+        # StatusDisplay captures the REAL sys.stderr at construction (before the shim
+        # below), so it still renders live while the shim buffers everyone else's stderr.
+        display = None if not ns.show_status else StatusDisplay([ns.capability])
+        try:
+            # `active` = a live StatusDisplay owns the terminal -> buffer only (protects
+            # the ANSI redraw, flush once on exit). `--no-status` -> display is None ->
+            # active=False -> tee: diagnostics stay live on the real stderr AND are still
+            # captured into `errbuf` for {cap}.stderr.log (R18) -- either mode always
+            # yields a usable buffer.
+            with buffered_stderr_while(active=(display is not None)) as errbuf:
+                model = ns.model or cfg.models[ns.capability]
+                # Preflight INSIDE the shim -> its warn-and-proceed warnings (404/501,
+                # R10) land in {cap}.stderr.log (R18). Still fail-fast: an unreachable
+                # host / missing model aborts here; `managed_run_dir` retains the dir
+                # with the stderr.log diagnostic.
+                preflight(cfg, capability=ns.capability, effective_model=model)
+                system_prompt = load_system_prompt(ns.capability)
+                prompt = _load_input(ns.input)
+                stats = TokenStats()
+                if display is not None:
+                    display.update(ns.capability, "running")
+                result = dispatch(
+                    ns.capability,
+                    prompt,
+                    backend=_make_backend(cfg),
+                    model=model,
+                    timeout=ns.timeout,
+                    system_prompt=system_prompt,
+                    config=cfg,
+                    stats=stats,
+                )
+                _write_artifacts(output_dir, ns.capability, prompt, result, stats, errbuf)
+                if display is not None:
+                    display.update(ns.capability, "success", tok_per_s=result.tok_per_s)
+                # The reviewable output is the validated structured dict (`.parsed`)
+                # when present, else the raw text content -- both untrusted data for
+                # Claude to review, never auto-applied.
+                review = result.parsed if result.parsed is not None else result.content
+                rendered = review if isinstance(review, str) else json.dumps(review, indent=2)
+                print(rendered)  # Claude reviews stdout before applying via Edit/Write
+        except TimeoutError:
+            # R20: a timed-out delegation gets its own distinguishable state (not the
+            # generic "failed") -- the display update itself never raises (guarded
+            # helper).
+            _safe_display_update(display, ns.capability, "timeout")
+            raise
+        except Exception:
+            # R20: any other failure (preflight abort, backend error, parse/schema
+            # exhaustion, ...) marks the row "failed" before propagating, so the status
+            # tree reflects reality instead of freezing on "running". Never masks the
+            # real exception (guarded helper). (KeyboardInterrupt/SystemExit are
+            # BaseException, not Exception, so they bypass this clause on their own --
+            # no dedicated clause is needed for them here; they still run the `finally`
+            # below, then propagate to managed_run_dir's own handler.)
+            _safe_display_update(display, ns.capability, "failed")
+            raise
+        finally:
+            # R20: flush/restore the live display even on interrupt or a mid-run
+            # exception.
+            if display is not None:
+                display.stop()
     return 0
 
 
