@@ -3,8 +3,11 @@
 # Date: 2026-07-05
 """CLI orchestrator: argparse surface, --ollama-init short-circuit, single dispatch."""
 
+import dataclasses
+import io
 import json
 import os
+import sys
 import tempfile
 from dataclasses import replace
 from types import MappingProxyType
@@ -13,8 +16,10 @@ import pytest
 
 import run_ollama
 from backend import DelegationResult
-from errors import OllamaBackendError, OllamaPreflightError, ValidationError
+from errors import OllamaBackendError, OllamaPreflightError, SinkError, ValidationError
+from ollama_config import resolve_config
 from run_ollama import _validate_args, build_parser
+from token_stats import TokenStats
 
 
 def test_capability_positional_rejects_invalid_choice():
@@ -1184,3 +1189,208 @@ def test_managed_run_dir_with_explicit_output_dir_skips_lock_and_prune(tmp_path,
         assert not os.path.exists(os.path.join(output_dir, ".ollama-lock"))
     assert os.path.exists(output_dir)  # never removed by managed_run_dir
     assert calls["cleanup"] == 0  # a caller-managed dir is never pruned
+
+
+# --- Task 4: per-capability streaming vs transactional + the stdout Sink ---
+
+
+def _cfg(**overrides):
+    """Canonical MS4 test config factory — the ONE place all MS4 test files build a
+    config variant from: resolve the REAL config via `resolve_config`, then apply
+    field overrides via `dataclasses.replace`. NEVER mutate a resolved (frozen)
+    config with `object.__setattr__` — that mutates the returned instance in place
+    (rather than producing an independent copy) and silently drifts from the
+    dataclass's actual shape as fields are added/renamed."""
+    base = resolve_config(global_path=None, repo_path=None, env={})
+    return dataclasses.replace(base, **overrides) if overrides else base
+
+
+def _stream_cfg(**flags):
+    """Config variant with the per-capability `stream` bool map overridden, merged
+    over the resolved defaults. Built strictly on top of `_cfg` (`dataclasses.replace`)
+    — the pattern to follow for any other per-field test override in this file."""
+    base = resolve_config(global_path=None, repo_path=None, env={})
+    return _cfg(stream={**base.stream, **flags})
+
+
+def test_dispatch_uses_stream_when_capability_streams(monkeypatch):
+    import run_ollama
+
+    calls = {"stream": 0, "transactional": 0}
+
+    def _fake_stream(
+        config, system_prompt, prompt, model, timeout, *, sink, response_format=None, **kw
+    ):
+        calls["stream"] += 1
+        sink("tok")
+        return DelegationResult("tok", 1, 1, True, 0.1)
+
+    class _FakeBackend:
+        def run(self, *a, **k):
+            calls["transactional"] += 1
+            return DelegationResult("x", 1, 1, True, 0.1)
+
+    monkeypatch.setattr(run_ollama, "stream_run", _fake_stream)
+    emitted: list[str] = []
+    out = run_ollama.dispatch(
+        "coder",
+        "write",
+        backend=_FakeBackend(),
+        model="m",
+        timeout=10,
+        system_prompt="sys",
+        config=_stream_cfg(coder=True),
+        stats=TokenStats(),
+        sink=emitted.append,
+    )
+    assert calls["stream"] == 1 and calls["transactional"] == 0
+    assert emitted == ["tok"] and out.content == "tok"
+
+
+def test_dispatch_stream_false_uses_transactional_unchanged(monkeypatch):
+    """Regression: the stream=false path is the MS1 transactional core, unchanged.
+
+    Uses "coder" (structured="off" by default), NOT "reviewer"/"tester": those default
+    to structured="schema", so a plain non-JSON stub body like "core" would fail
+    parse+validate and retry — exercising the R25 retry loop instead of the plain
+    free-text passthrough this test targets. "coder" isolates the ONE thing under
+    test here: with `[stream].coder=False`, dispatch's free-text branch must still go
+    straight to the transactional `backend.run`, unchanged from MS1.
+    """
+    import run_ollama
+
+    class _FakeBackend:
+        def run(
+            self,
+            capability,
+            system_prompt,
+            prompt,
+            model,
+            timeout,
+            *,
+            response_format=None,
+            deadline=None,
+        ):
+            return DelegationResult("core", 7, 3, False, 0.2)
+
+    out = run_ollama.dispatch(
+        "coder",
+        "write",
+        backend=_FakeBackend(),
+        model="m",
+        timeout=10,
+        system_prompt="sys",
+        config=_stream_cfg(coder=False),
+        stats=TokenStats(),
+        sink=None,
+    )
+    assert out.content == "core" and (out.prompt_tokens, out.completion_tokens) == (7, 3)
+
+
+def test_stdout_sink_writes_and_flushes(monkeypatch):
+    import run_ollama
+
+    buf = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", buf)
+    run_ollama.stdout_sink("hello")
+    assert buf.getvalue() == "hello"
+
+
+def test_make_file_sink_opens_once_and_appends(tmp_path, monkeypatch):
+    import run_ollama
+
+    opens = {"n": 0}
+    _real_open = open
+
+    def _counting_open(*a, **k):
+        opens["n"] += 1
+        return _real_open(*a, **k)
+
+    monkeypatch.setattr("builtins.open", _counting_open)
+    p = tmp_path / "coder.stream.log"
+    sink = run_ollama.make_file_sink(str(p))
+    sink("a")
+    sink("b")
+    sink("c")
+    sink.close()
+    assert opens["n"] == 1  # opened ONCE, not per delta
+    assert p.read_text(encoding="utf-8") == "abc"
+
+
+def test_file_sink_close_is_idempotent(tmp_path):
+    import run_ollama
+
+    p = tmp_path / "reviewer.stream.log"
+    sink = run_ollama.make_file_sink(str(p))
+    sink("x")
+    sink.close()
+    sink.close()  # double-close (e.g. stream already
+    # closed it, then a `finally` closes
+    # again) must NOT raise
+    assert p.read_text(encoding="utf-8") == "x"
+
+
+def test_file_sink_context_manager_closes_on_exit(tmp_path):
+    """`with make_file_sink(path) as sink:` opens once and guarantees close() on exit."""
+    import run_ollama
+
+    p = tmp_path / "coder.stream.log"
+    with run_ollama.make_file_sink(str(p)) as sink:
+        sink("x")
+        sink("y")
+    assert sink._closed is True
+    assert p.read_text(encoding="utf-8") == "xy"
+
+
+def test_file_sink_call_after_close_raises_clear_error(tmp_path):
+    """Use-after-close is a caller bug — it must raise a CLEAR, actionable SinkError,
+    never the raw `ValueError: I/O operation on closed file` from the underlying
+    handle (which would be confusing and not classifiable by callers as a sink fault)."""
+    import run_ollama
+
+    p = tmp_path / "coder.stream.log"
+    sink = run_ollama.make_file_sink(str(p))
+    sink("x")
+    sink.close()
+    with pytest.raises(SinkError):
+        sink("y")  # write after close: must not silently
+        # no-op nor raise a raw ValueError
+    assert p.read_text(encoding="utf-8") == "x"  # the post-close write never landed
+
+
+def test_make_file_sink_closes_handle_on_construction_failure(monkeypatch, tmp_path):
+    """If `_FileSink.__init__` fails AFTER `make_file_sink` has already opened the
+    file, the already-opened handle must be closed — never leaked as an orphan open
+    file descriptor — and the original error must still propagate to the caller
+    unchanged (not swallowed by the cleanup)."""
+    import run_ollama
+
+    class _TrackedHandle:
+        def __init__(self):
+            self.closed = False
+
+        def write(self, _s):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    handles: list[_TrackedHandle] = []
+
+    def _fake_open(*_a, **_k):
+        h = _TrackedHandle()
+        handles.append(h)
+        return h
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+
+    def _boom_init(self, fh):
+        raise RuntimeError("boom during _FileSink construction")
+
+    monkeypatch.setattr(run_ollama._FileSink, "__init__", _boom_init)
+
+    with pytest.raises(RuntimeError, match="boom during _FileSink construction"):
+        run_ollama.make_file_sink(str(tmp_path / "coder.stream.log"))
+
+    assert len(handles) == 1
+    assert handles[0].closed is True  # no leaked handle
