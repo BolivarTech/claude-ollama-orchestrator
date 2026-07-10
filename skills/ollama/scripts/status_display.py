@@ -54,7 +54,22 @@ class StatusDisplay:
 
     def __init__(self, agents: list[str], *, stream: TextIO | None = None) -> None:
         self._agents = list(agents)
-        self._stream = stream if stream is not None else sys.stderr
+        if stream is not None:
+            self._stream = stream
+        else:
+            # INFO fix #7 (MS5): unwrap stderr_shim's per-delegation dispatching proxy to
+            # the REAL stream if it has already been installed by the time this display is
+            # constructed. Functionally this is often already a no-op today (the
+            # orchestrator task's ContextVar is never set by any delegation's
+            # `capture_stderr_for_delegation()`, so the proxy's `write()` already falls
+            # through to the real stream when called from here) — but pinning `.real`
+            # explicitly makes that correct regardless of ContextVar-isolation reasoning
+            # holding for every future call site.
+            from stderr_shim import _DispatchingStderr
+
+            self._stream = (
+                sys.stderr.real if isinstance(sys.stderr, _DispatchingStderr) else sys.stderr
+            )
         self._state: dict[str, str] = {a: "pending" for a in self._agents}
         self._rate: dict[str, float | None] = {a: None for a in self._agents}
         self._use_ansi = bool(getattr(self._stream, "isatty", lambda: False)())

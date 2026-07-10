@@ -6,6 +6,7 @@
 import email.utils
 import io
 import json
+import threading
 import urllib.error
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -25,7 +26,10 @@ from backend import (
     map_http_error,
     retry_after_delay,
 )
-from errors import OllamaBackendError  # domain exceptions come from errors, never backend
+from errors import (
+    OllamaBackendError,
+    RateLimitError,
+)  # domain exceptions come from errors, never backend
 from ollama_config import resolve_config
 
 
@@ -286,6 +290,21 @@ def test_429_backoff_is_bounded_by_the_per_delegation_deadline():
     rec = _Recorder(error=err)
     be = OllamaBackend(_cfg(), urlopen=rec, sleep=slept.append)
     with pytest.raises(OllamaBackendError):
+        be.run("coder", "s", "p", "m", 1)  # 1s budget « 999999s Retry-After → deadline
+    assert slept == []  # never slept past the deadline
+
+
+def test_429_deadline_exceeded_raises_rate_limit_error_not_plain_backend_error():
+    # R14b: a deadline hit DURING a 429 backoff loop is still throttling, not a dead
+    # model. It must raise the RateLimitError SUBTYPE (which `_execute_delegation` catches
+    # ahead of the generic OllamaBackendError arm and EXCLUDES from the per-model breaker),
+    # never a plain OllamaBackendError — otherwise a healthy-but-throttled model whose 429
+    # backoff simply outran the delegation's time budget would wrongly trip its breaker.
+    err = urllib.error.HTTPError("u", 429, "Too Many", {"Retry-After": "999999"}, io.BytesIO(b""))
+    slept: list[float] = []
+    rec = _Recorder(error=err)
+    be = OllamaBackend(_cfg(), urlopen=rec, sleep=slept.append)
+    with pytest.raises(RateLimitError):
         be.run("coder", "s", "p", "m", 1)  # 1s budget « 999999s Retry-After → deadline
     assert slept == []  # never slept past the deadline
 
@@ -629,3 +648,81 @@ def test_make_redactor_masks_key_and_is_identity_when_absent():
 
 def test_delegation_result_truncated_defaults_false():
     assert DelegationResult("x", 1, 1, False, 0.1).truncated is False
+
+
+# --- Task 3 (MS5): 429 anti-thundering-herd under concurrency (breaker excludes 429) ---
+
+
+def test_429_exhausted_raises_rate_limit_error_not_httperror():
+    err = urllib.error.HTTPError("u", 429, "Too Many", {}, io.BytesIO(b""))
+    rec = _Recorder(error=err)  # always 429
+    be = OllamaBackend(_cfg(), urlopen=rec, sleep=lambda _s: None, max_backoffs=2)
+    with pytest.raises(RateLimitError):  # NOT urllib.error.HTTPError
+        be.run("coder", "s", "p", "m", 60)
+    # RateLimitError IS-A OllamaBackendError — any MS1 caller catching the base class
+    # (e.g. run_delegation's existing except OllamaBackendError) is unaffected.
+    with pytest.raises(OllamaBackendError):
+        be.run("coder", "s", "p", "m", 60)
+
+
+def test_429_jitter_is_independent_across_calls():
+    # Two backends with distinct rng seeds → distinct backoff delays (no phase-lock).
+    err = urllib.error.HTTPError("u", 429, "Too Many", {}, io.BytesIO(b""))  # no Retry-After
+    slept_a, slept_b = [], []
+    seq_a, seq_b = iter([0.1, 0.9]), iter([0.8, 0.2])
+    be_a = OllamaBackend(
+        _cfg(),
+        urlopen=_Recorder(content="ok", error_once=err),
+        sleep=slept_a.append,
+        rng=lambda: next(seq_a),
+    )
+    be_b = OllamaBackend(
+        _cfg(),
+        urlopen=_Recorder(content="ok", error_once=err),
+        sleep=slept_b.append,
+        rng=lambda: next(seq_b),
+    )
+    be_a.run("coder", "s", "p", "m", 60)
+    be_b.run("coder", "s", "p", "m", 60)
+    assert slept_a and slept_b and slept_a != slept_b  # independent jitter
+
+
+def test_429_default_rng_draws_independent_jitter_under_real_concurrency():
+    # INFO fix (#6): with the DEFAULT rng (module-level `random.random`, thread-safe,
+    # no per-backend `random.Random()` — see this milestone's Interfaces note), two
+    # backends racing 429-backoffs to the SAME model CONCURRENTLY (real threads,
+    # synchronized with a Barrier to maximize overlap) must draw INDEPENDENT jitter —
+    # not lockstep in phase, and not serialized by some hidden shared lock around the
+    # RNG. Unlike test_429_jitter_is_independent_across_calls (deterministic injected
+    # sequences), this exercises the actual default path with genuine concurrency.
+    err = urllib.error.HTTPError("u", 429, "Too Many", {}, io.BytesIO(b""))
+    slept_a: list[float] = []
+    slept_b: list[float] = []
+    be_a = OllamaBackend(
+        _cfg(), urlopen=_Recorder(content="ok", error_once=err), sleep=slept_a.append
+    )  # default rng, no injected sequence
+    be_b = OllamaBackend(
+        _cfg(), urlopen=_Recorder(content="ok", error_once=err), sleep=slept_b.append
+    )  # default rng, no injected sequence
+
+    barrier = threading.Barrier(2)
+
+    def _run(be: "OllamaBackend") -> None:
+        barrier.wait()  # release both threads at (as close as possible to) the same instant
+        be.run("coder", "s", "p", "m", 60)
+
+    threads = [
+        threading.Thread(target=_run, args=(be_a,)),
+        threading.Thread(target=_run, args=(be_b,)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert slept_a and slept_b
+    # Independent draws from the shared thread-safe random.random: the two jitter
+    # sequences are, with cryptographically negligible probability of collision,
+    # NOT identical — if they were somehow lockstepped/serialized around a shared
+    # RNG state, they would match exactly on every run.
+    assert slept_a != slept_b

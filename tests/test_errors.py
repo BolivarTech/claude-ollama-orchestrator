@@ -3,6 +3,8 @@
 # Date: 2026-07-05
 """Verify the domain-exception hierarchy and the deliberate sibling relationship."""
 
+import pytest
+
 from errors import (
     DelegationError,
     InvalidInputError,
@@ -28,3 +30,14 @@ def test_invalid_input_error_is_sibling_not_subclass_of_validation_error():
     # `except (ValidationError, JSONDecodeError)` in the retry path.
     assert not issubclass(InvalidInputError, ValidationError)
     assert issubclass(InvalidInputError, Exception)
+
+
+def test_rate_limit_error_is_a_backend_error_subclass():
+    # Additive/backward-compatible (R14b/Task 3): MS5 adds this to MS1's hierarchy, but
+    # it IS-A OllamaBackendError, so any existing `except OllamaBackendError` (incl. MS1's
+    # own tests) still catches it unchanged.
+    from errors import RateLimitError
+
+    assert issubclass(RateLimitError, OllamaBackendError)
+    with pytest.raises(OllamaBackendError):
+        raise RateLimitError("429 exhausted")
