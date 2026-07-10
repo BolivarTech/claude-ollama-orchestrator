@@ -1075,8 +1075,18 @@ def run_delegation(ns: argparse.Namespace) -> int:
                         # around whatever the error handler prints next, breaking R22b's
                         # framing integrity on the error path (the frame's whole point is
                         # that Claude can trust the BEGIN..END bounds).
-                        sys.stdout.write(frame_footer + "\n")
-                        sys.stdout.flush()
+                        #
+                        # Best-effort: if stdout itself is broken (e.g. BrokenPipeError)
+                        # WHILE a `dispatch` exception is already in flight, swallow this
+                        # write's OSError -- a `finally` that raised here would MASK the
+                        # original delegation exception the outer handlers below need to see
+                        # (and a broken stdout means no reader is left to care about the
+                        # closing marker anyway).
+                        try:
+                            sys.stdout.write(frame_footer + "\n")
+                            sys.stdout.flush()
+                        except OSError:
+                            pass
                 _write_artifacts(output_dir, ns.capability, prompt, result, stats, errbuf)
                 if display is not None:
                     display.update(ns.capability, "success", tok_per_s=result.tok_per_s)
