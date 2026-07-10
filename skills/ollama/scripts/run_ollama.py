@@ -45,7 +45,14 @@ from ollama_stream import stream_run
 from ollama_vision import stream_vision
 from parse_output import parse_agent_output
 from run_lock import remove_lock, staleness_bound_for_timeout, write_lock
+from sanitize import build_user_prompt, wrap_output
 from scheduler import Scheduler
+from startup_hardening import (
+    enable_utf8_console_io,
+    warn_if_config_world_readable,
+    warn_if_oversize,
+    warn_if_remote_http_with_api_key,
+)
 from status_display import StatusDisplay
 from stderr_shim import (
     buffered_stderr_while,
@@ -488,8 +495,10 @@ def dispatch(
 
     Args:
         capability: The capability name.
-        prompt: The user prompt, passed as-is in MS1 (anti-injection sanitization is
-            added in M6 — this is a forward reference, MS1 does not sanitize).
+        prompt: The user prompt, passed as-is — the caller (``run_delegation``, MS6
+            Task 6) is responsible for anti-injection sanitization via
+            ``sanitize.build_user_prompt`` (R22) before this function ever sees it;
+            ``dispatch`` itself performs no sanitization of its own.
         backend: An ``AgentBackend`` (injected).
         model: Resolved model tag.
         timeout: Per-delegation timeout.
@@ -956,7 +965,12 @@ def run_delegation(ns: argparse.Namespace) -> int:
     invariant -- stdout streams only when a single delegation is in flight -- always
     holds here.
     """
-    cfg = resolve_config(global_path=_global_toml(), repo_path=_repo_toml(), env=os.environ)
+    global_path, repo_path = _global_toml(), _repo_toml()
+    cfg = resolve_config(global_path=global_path, repo_path=repo_path, env=os.environ)
+    # NR3/NR9 pre-dispatch warnings, once config is resolved (startup_hardening.py).
+    for cfg_path in (repo_path, global_path):
+        warn_if_config_world_readable(cfg_path)
+    warn_if_remote_http_with_api_key(cfg.base_url, cfg.api_key)
 
     with managed_run_dir(ns.keep_runs, ns.timeout, output_dir=ns.output_dir) as output_dir:
         # StatusDisplay captures the REAL sys.stderr at construction (before the shim
@@ -976,7 +990,9 @@ def run_delegation(ns: argparse.Namespace) -> int:
                 # with the stderr.log diagnostic.
                 preflight(cfg, capability=ns.capability, effective_model=model)
                 system_prompt = load_system_prompt(ns.capability)
-                prompt = _load_input(ns.input)
+                raw_input = _load_input(ns.input)
+                warn_if_oversize(raw_input, ns.warn_input_tokens)  # R24
+                prompt = build_user_prompt(raw_input)  # R22: sanitize + nonce-wrap
                 stats = TokenStats()
                 if display is not None:
                     display.update(ns.capability, "running")
@@ -1001,7 +1017,9 @@ def run_delegation(ns: argparse.Namespace) -> int:
                 # Claude to review, never auto-applied.
                 review = result.parsed if result.parsed is not None else result.content
                 rendered = review if isinstance(review, str) else json.dumps(review, indent=2)
-                print(rendered)  # Claude reviews stdout before applying via Edit/Write
+                # R22b: nonce-wrap the delegated output before Claude ever sees it —
+                # untrusted model output, never auto-applied (R8/R14).
+                print(wrap_output(rendered))  # Claude reviews stdout before applying
         except TimeoutError:
             # R20: a timed-out delegation gets its own distinguishable state (not the
             # generic "failed") -- the display update itself never raises (guarded
@@ -1046,12 +1064,17 @@ def main(argv: list[str] | None = None) -> int:
     ``KeyboardInterrupt``/``SystemExit`` are intentionally NOT caught here — they propagate
     unchanged so the R27 interrupt-cleanup path (landing in MS3) stays intact.
 
+    ``enable_utf8_console_io`` (R26) is called as the FIRST statement, before even the
+    ``--ollama-init`` short-circuit, so the console hardening applies regardless of
+    which code path runs.
+
     Args:
         argv: CLI args (defaults to ``sys.argv[1:]``).
 
     Returns:
         Process exit code (0 on success; non-zero on any caught domain/OS failure).
     """
+    enable_utf8_console_io()
     args = sys.argv[1:] if argv is None else argv
     # Detect the flag ONLY as the first token (the documented invocation
     # `run_ollama.py --ollama-init`), so input text that merely contains the
