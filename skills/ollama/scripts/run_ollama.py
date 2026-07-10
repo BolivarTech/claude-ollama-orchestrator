@@ -1235,12 +1235,19 @@ def run_delegation(ns: argparse.Namespace) -> int:
                         if used_stdout:
                             return _stream_to_stdout_framed()
                         # R7d loser: another process holds the terminal, so DON'T stream
-                        # token-by-token to the shared stdout (that is what would interleave).
-                        # Capture the raw stream to this delegation's own file, then present
-                        # the buffered result to Claude ONCE, nonce-wrapped (R22b) -- Claude
-                        # reads THIS process's own stdout capture (separate from the winner's),
-                        # so a single wrapped block never interleaves the winner's live stream
-                        # yet a token-loser is never handed empty stdout.
+                        # token-by-token to the shared stdout -- interleaving per-token deltas
+                        # with the winner's live stream is exactly what the token prevents.
+                        # Capture the raw stream to this delegation's own file, then present the
+                        # buffered result to Claude ONCE as a single nonce-framed block (R22b).
+                        # Data integrity does NOT rely on stdout being private (R7d's whole
+                        # premise is a SHARED terminal): `wrap_output` brackets this result with
+                        # a UNIQUE per-delegation nonce, distinct from the winner's own frame
+                        # nonce, so a nonce-aware consumer (Claude, R22b) always recovers both
+                        # blocks intact. If the loser finishes first, its one block can appear
+                        # between the winner's deltas -- a benign visual interleave, never a
+                        # torn/ambiguous frame -- and a token-loser is never handed empty stdout.
+                        # (A naive first-BEGIN..first-END parser would mis-close; the R22b
+                        # contract is nonce-matched extraction, which this preserves.)
                         with make_file_sink(
                             os.path.join(output_dir, f"{ns.capability}.stream.log")
                         ) as fsink:
