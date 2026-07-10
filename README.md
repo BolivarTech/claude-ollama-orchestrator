@@ -19,7 +19,7 @@ Edit/Write tools. The goal: **cut Anthropic token cost** and keep bulk generatio
 
 > [!IMPORTANT]
 > ### Project Status
-> **Early development (v0.0.4).** Built under the SBTDD workflow (Spec + Behavior +
+> **Early development (v0.0.5).** Built under the SBTDD workflow (Spec + Behavior +
 > Test-Driven Development). The authoritative description of *what* to build lives in
 > `sbtdd/`; the tree, tables, and commands below describe the **intended design**, and
 > production code lands milestone-by-milestone, test-first.
@@ -30,12 +30,18 @@ Edit/Write tools. The goal: **cut Anthropic token cost** and keep bulk generatio
 > accounting** (per-delegation tok/s + token counts, `token_stats.json` kept **separate**
 > from Claude usage); **output management** — a per-project temp namespace, a cross-platform
 > process-liveness lock, LRU cleanup that never prunes a live run, per-run artifacts, a live
-> per-agent status display, and interrupt-safe cleanup; and **visible streaming** — a
+> per-agent status display, and interrupt-safe cleanup; **visible streaming** — a
 > hardened SSE reader (idle timeout, bounded reassembly buffer, UTF-8-boundary output cap,
 > transport-error-safe) wired per-capability as a **decoupled layer** over the transactional
 > core (toggle `[stream]`), streaming tokens to stdout when a single delegation is in flight
-> while structured capabilities stay transactional. Bounded concurrency, untrusted-I/O
-> hardening, and the vision / transcribe / thinking capabilities are the remaining milestones.
+> while structured capabilities stay transactional; and **bounded concurrency** — a fan-out
+> `run_batch` bounded by a `max_parallel_agents` semaphore plus a hard-capped
+> `max_queued_agents` queue (overflow rejected fail-closed, per-delegation, as a DoS
+> backstop), a **per-model circuit breaker** (K consecutive backend failures open a model's
+> circuit without blocking others; a 429 is throttling, excluded, with `Retry-After` +
+> jittered backoff), per-delegation stderr capture via `contextvars`, and R7c sink routing
+> (stdout only at effective concurrency 1, else per-delegation files). Untrusted-I/O
+> hardening and the vision / transcribe / thinking capabilities are the remaining milestones.
 
 ---
 
