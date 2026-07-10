@@ -6,11 +6,15 @@
 
 import os
 import time
+from datetime import datetime, timedelta, timezone
 
 import run_lock
 from run_lock import (
+    STDOUT_TOKEN_FILENAME,
+    acquire_token,
     is_dir_live,
     is_pid_alive,
+    release_token,
     remove_lock,
     staleness_bound_ephemeral,
     staleness_bound_for_timeout,
@@ -160,3 +164,98 @@ def test_hostile_binary_lock_content_never_raises_and_is_treated_as_corrupt(tmp_
     os.utime(str(tmp_path), (old, old))
     # Aged past the 6h floor → not live. Either way: no exception ever escapes.
     assert is_dir_live(str(tmp_path)) is False
+
+
+# --- Cross-process stdout token (R7d) — shared ephemeral-lock primitive ---
+
+
+def _write_ephemeral(path, pid, bound, *, iso=None):
+    """Fabricate a 3-line ephemeral lockfile (PID / ISO-8601 UTC / bound) for a test."""
+    iso = iso or datetime.now(timezone.utc).isoformat()
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(f"{pid}\n{iso}\n{bound}\n")
+
+
+def test_stdout_token_is_exclusive_across_processes(tmp_path):
+    tok = str(tmp_path / STDOUT_TOKEN_FILENAME)
+    assert acquire_token(tok, timeout=60) is True      # holder wins → streams to stdout
+    assert acquire_token(tok, timeout=60) is False     # concurrent process → file-only
+    release_token(tok)
+    assert acquire_token(tok, timeout=60) is True      # reclaimable once released
+
+
+def test_stdout_token_uses_the_run_lock_3_line_format_and_short_bound(tmp_path):
+    tok = str(tmp_path / STDOUT_TOKEN_FILENAME)
+    acquire_token(tok, timeout=30)
+    lines = open(tok, encoding="utf-8").read().splitlines()
+    assert len(lines) == 3                              # PID / ISO-8601 UTC / bound
+    assert int(lines[0]) == os.getpid()
+    datetime.fromisoformat(lines[1])                    # line 2 parses as ISO-8601
+    assert int(lines[2]) == staleness_bound_ephemeral(30) == 60   # 2*timeout, NO 6h floor
+
+
+def test_stdout_token_reclaimed_from_dead_holder_with_ownership_reverify(tmp_path, monkeypatch):
+    tok = str(tmp_path / STDOUT_TOKEN_FILENAME)
+    _write_ephemeral(tok, pid=999_999, bound=120)       # a "dead" holder
+    monkeypatch.setattr(run_lock, "is_pid_alive", lambda pid: pid == os.getpid())
+    assert acquire_token(tok, timeout=60) is True        # stale token reclaimed
+    assert int(open(tok, encoding="utf-8").readline()) == os.getpid()  # ownership re-verified
+
+
+def test_live_holder_within_short_bound_is_never_reclaimed(tmp_path, monkeypatch):
+    tok = str(tmp_path / STDOUT_TOKEN_FILENAME)
+    _write_ephemeral(tok, pid=4321, bound=3600)          # fresh, within bound
+    monkeypatch.setattr(run_lock, "is_pid_alive", lambda pid: True)   # holder alive
+    assert acquire_token(tok, timeout=60) is False        # live PID inside bound → not stolen
+
+
+def test_live_pid_past_the_ephemeral_bound_is_reclaimed_pid_recycling_safe(
+    tmp_path, monkeypatch
+):
+    """PID-recycling regression: for the SHORT ephemeral bound, staleness is
+    AUTHORITATIVE even when the PID field currently belongs to a live process. A
+    legitimate holder is a SINGLE delegation bounded by its own `2*timeout`, so a lock
+    older than that can never still be that same legitimate holder — either it crashed
+    (PID dead) or the OS recycled its PID into an unrelated process, which a
+    liveness-only rule would report as "held" FOREVER (the bug this closes). Accepted
+    trade-off (documented on `_lockfile_holder_is_live`): a genuinely SUSPENDED holder
+    (e.g. laptop sleep) past its bound could have its token reclaimed here too — a brief
+    over-commit — but this SELF-HEALS: on resume its own monotonic deadline (R25) is
+    already exceeded, so it aborts and releases without ever completing as a second live
+    holder of the same resource."""
+    tok = str(tmp_path / STDOUT_TOKEN_FILENAME)
+    _write_ephemeral(tok, pid=os.getpid(), bound=60,
+                     iso="2020-01-01T00:00:00+00:00")     # ancient timestamp => age >> bound
+    monkeypatch.setattr(run_lock, "is_pid_alive", lambda pid: pid == os.getpid())
+    assert acquire_token(tok, timeout=30) is True         # bound-expired => reclaimed despite live PID
+
+
+def test_run_dir_lock_keeps_a_distinct_longer_bound_policy_from_the_ephemeral_one(
+    tmp_path, monkeypatch
+):
+    """Distinctness regression: `is_dir_live` (MS3, unchanged by MS7) applies the exact
+    same "dead PID OR age >= bound" rule as `_lockfile_holder_is_live` above, but a RUN
+    DIR's persisted bound carries the 6h floor (`staleness_bound_for_timeout`) while an
+    ephemeral lock's bound is short (`staleness_bound_ephemeral`, no floor). The SAME
+    5-minute age that would reclaim an ephemeral token/slot must NOT reclaim a run dir
+    lock — pinning the two lock classes apart so a future edit can't accidentally
+    collapse them onto the same (wrong-for-one-of-them) bound."""
+    run_dir = str(tmp_path)
+    write_lock(run_dir, max_age_seconds=staleness_bound_for_timeout(30))  # 6h-floored bound
+    lock = os.path.join(run_dir, ".ollama-lock")
+    lines = open(lock, encoding="utf-8").read().splitlines()
+    backdated = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    open(lock, "w", encoding="utf-8").write(f"{lines[0]}\n{backdated}\n{lines[2]}\n")
+    monkeypatch.setattr(run_lock, "is_pid_alive", lambda pid: pid == int(lines[0]))
+    assert is_dir_live(run_dir) is True                   # 5min age << 6h floor => still live
+    # The SAME 5-minute age exceeds a typical ephemeral bound (2*30=60s here) and would be
+    # reclaimed by `_lockfile_holder_is_live` instead — sanity-check the bounds differ.
+    assert 300 >= staleness_bound_ephemeral(30)
+
+
+def test_release_token_is_idempotent(tmp_path):
+    tok = str(tmp_path / STDOUT_TOKEN_FILENAME)
+    acquire_token(tok, timeout=60)
+    release_token(tok)
+    release_token(tok)                                    # no raise
+    assert not os.path.exists(tok)

@@ -3115,3 +3115,35 @@ def test_streaming_output_strips_invisibles_for_defense_in_depth(capsys, monkeyp
     out = capsys.readouterr().out
     assert "\u200b" not in out  # zero-width space stripped from the streamed stdout
     assert "safecode" in out  # the visible content survives; only the invisible is gone
+
+
+# --- Cross-process stdout token wiring (R7d + R27) ---
+
+
+def test_stream_with_stdout_token_holder_uses_stdout(tmp_path):
+    tok = str(tmp_path / ".ollama-stdout.lock")
+    seen = {}
+    result, used = run_ollama._stream_with_stdout_token(
+        tok, 60, lambda used_stdout: seen.setdefault("used", used_stdout) or "ok")
+    assert result == "ok" and used is True and seen["used"] is True
+
+
+def test_stream_with_stdout_token_second_process_is_file_only(tmp_path):
+    tok = str(tmp_path / ".ollama-stdout.lock")
+    from run_lock import acquire_token
+    acquire_token(tok, 60)                                # another process holds it
+    result, used = run_ollama._stream_with_stdout_token(tok, 60, lambda used_stdout: used_stdout)
+    assert used is False and result is False              # degraded to file-only, no interleave
+
+
+def test_stream_with_stdout_token_releases_on_interrupt(tmp_path):
+    tok = str(tmp_path / ".ollama-stdout.lock")
+    from run_lock import acquire_token
+
+    def _boom(_used_stdout):
+        raise KeyboardInterrupt("ctrl-c mid-stream")
+
+    with pytest.raises(KeyboardInterrupt):
+        run_ollama._stream_with_stdout_token(tok, 60, _boom)
+    # The finally released the token \u2192 the next process can take it immediately.
+    assert acquire_token(tok, 60) is True
