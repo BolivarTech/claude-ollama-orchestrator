@@ -370,3 +370,19 @@ def test_multipart_body_escapes_a_filename_with_quotes_backslashes_and_a_newline
     recovered = file_part.get_filename()
     assert "\r" not in recovered and "\n" not in recovered
     assert recovered != hostile_filename  # never passed through unescaped
+
+
+def test_escape_multipart_filename_strips_every_control_char_not_only_crlf():
+    """[SECURITY/defense-in-depth] CR/LF are the only *exploitable* chars (MIME headers
+    split solely on them), but the escape strips EVERY C0 control char, DEL, and the
+    Unicode line/paragraph separators (VT, FF, NUL, TAB, DEL, NEL, LS, PS) as well, so no
+    control character rides into the quoted header value at all. Printable content — and
+    the escaping of `"`/`\\` into `\\"`/`\\\\` — is preserved."""
+    from transcribe import _escape_multipart_filename
+
+    control = "a\x00\t\x0b\x0c\x7f  b"
+    assert _escape_multipart_filename(control) == "ab"
+    # quote and backslash are escaped (kept as printable), not stripped
+    assert _escape_multipart_filename('q"x\\y') == 'q\\"x\\\\y'
+    # a legitimate non-ASCII filename is untouched
+    assert _escape_multipart_filename("café_日本.wav") == "café_日本.wav"

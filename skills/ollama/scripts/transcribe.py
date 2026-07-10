@@ -207,7 +207,13 @@ def _escape_multipart_filename(filename: str) -> str:
     Returns:
         A filename string safe to interpolate inside a double-quoted header value.
     """
-    return filename.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "").replace("\n", "")
+    escaped = filename.replace("\\", "\\\\").replace('"', '\\"')
+    # CR/LF are the ONLY exploitable characters here (MIME headers split solely on them, and
+    # the multipart boundary is an unguessable uuid4), but stripping EVERY C0 control char,
+    # DEL, and the Unicode line/paragraph separators (NEL/LS/PS) as well is cheap
+    # defense-in-depth: no control character rides into the header value at all. The escape
+    # of `\`/`"` above produces `\\`/`\"` (both printable), so it survives this pass.
+    return "".join(c for c in escaped if ord(c) >= 0x20 and c != "\x7f" and c not in "  ")
 
 
 def _multipart_body(
