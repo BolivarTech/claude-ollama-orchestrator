@@ -287,3 +287,20 @@ def test_buffered_stderr_while_flushes_to_the_real_target_pinned_at_entry():
         assert impostor.chunks == []  # the impostor never saw the flush
     finally:
         sys.stderr = sys.__stderr__
+
+
+def test_dispatching_stderr_close_does_not_close_the_borrowed_real_stderr():
+    # INFO fix: the proxy BORROWS the real stderr for a batch's duration (it does not own
+    # it -- install_dispatching_stderr restores the prior stream on exit). A bare
+    # __getattr__ would forward close() straight to the real stderr and shut the process's
+    # stderr down mid-batch. close() must therefore be a guarded no-op that leaves the
+    # borrowed stream OPEN.
+    import io
+
+    from stderr_shim import _DispatchingStderr
+
+    real = io.StringIO()
+    proxy = _DispatchingStderr(real)
+    proxy.close()
+    assert real.closed is False  # the borrowed real stream must stay open
+    real.write("still usable")  # would raise ValueError on a closed StringIO

@@ -70,6 +70,20 @@ class _DispatchingStderr:
         if buf is None or _current_tee.get():
             self._real.flush()
 
+    def close(self) -> None:
+        """Guarded no-op close: flush, but NEVER close the borrowed real stderr.
+
+        This proxy only BORROWS ``self._real`` for the batch's duration —
+        :func:`install_dispatching_stderr` restores the prior ``sys.stderr`` on exit, so the
+        underlying process stderr's lifecycle is owned by the caller, not by this proxy.
+        Without this explicit override, ``__getattr__`` would forward ``close()`` straight
+        to the real stderr and shut the process's stderr down mid-batch (after which every
+        subsequent write — sibling delegations, the status display, teardown diagnostics —
+        would fail). Flushing on close preserves the stream contract's intent without
+        destroying the borrowed stream.
+        """
+        self.flush()
+
     @property
     def real(self) -> TextIO:
         """The underlying real stderr (used by the status display, R20/MS5 INFO fix #7)."""
