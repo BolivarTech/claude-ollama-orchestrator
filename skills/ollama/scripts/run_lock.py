@@ -277,3 +277,260 @@ def is_dir_live(run_dir: str) -> bool:
         return age < threshold
     except Exception:  # noqa: BLE001 — total: never raise into cleanup.
         return True
+
+
+# --- Shared ephemeral-lock primitive (R7d stdout token, MS7 Task 3 concurrency slots) ---
+#
+# Reused verbatim by both the cross-process stdout token (below) and the concurrency
+# slot-counter (MS7 Task 3) so every ephemeral lockfile this runtime creates shares ONE
+# on-disk format, ONE parser, and ONE TOCTOU-safe acquire/reclaim algorithm (DRY) --
+# tuned only by a caller-supplied SHORT staleness bound (:func:`staleness_bound_ephemeral`,
+# no 6h floor), as opposed to the run-dir lock's 6h-floored
+# :func:`staleness_bound_for_timeout` above.
+
+STDOUT_TOKEN_FILENAME = ".ollama-stdout.lock"
+_EPHEMERAL_RECLAIM_RETRIES = 3  # bounded reclaim attempts -> no livelock on a hot race
+
+
+def _ephemeral_payload(bound: int) -> bytes:
+    """Return the 3-line ephemeral lock payload (PID / ISO-8601 UTC / bound).
+
+    Byte-for-byte the SAME shape ``write_lock`` writes for a run dir, so every lock
+    this runtime creates (run dir, stdout token, concurrency slots) shares one format
+    and one parser -- the ephemeral variants only differ in the SHORT ``bound`` value
+    (:func:`staleness_bound_ephemeral`, no 6h floor).
+
+    Args:
+        bound: The staleness bound (seconds) to persist.
+
+    Returns:
+        The UTF-8-encoded 3-line payload.
+    """
+    return (f"{os.getpid()}\n{datetime.now(timezone.utc).isoformat()}\n{int(bound)}\n").encode(
+        "utf-8"
+    )
+
+
+def _read_lock_fields(path: str) -> tuple[int | None, float | None, int | None]:
+    """Parse ``(pid, age_seconds, bound)`` from a 3-line ephemeral lockfile at *path*.
+
+    Mirrors the run-dir ``_parse_lock`` but reads an ARBITRARY lockfile path (a token or
+    slot file, not ``<dir>/.ollama-lock``). Any unreadable/malformed field degrades to
+    ``None`` (conservative -- the caller decides liveness from what it could parse).
+
+    **Documented limitation -- wall-clock age, not monotonic (accepted).** ``age`` is
+    computed from the persisted ISO-8601 UTC WALL-CLOCK timestamp (``datetime.now(utc)``
+    at write time) compared against ``datetime.now(utc)`` at read time -- necessarily so,
+    since a per-process ``time.monotonic()`` value is meaningless across process
+    boundaries (each process's monotonic clock has its own arbitrary epoch); wall-clock
+    is the only clock two different processes can compare at all. This makes the age
+    comparison subject to WALL-CLOCK SKEW between the writer and the reader. For the
+    SUPPORTED, SAME-MACHINE case (the only one this primitive targets) every process
+    shares exactly one system clock, so there is no skew to speak of. Coordinating this
+    lock across DIFFERENT MACHINES is already unsupported (PIDs are local-machine-only
+    by construction) and would additionally require NTP-level clock synchronization to
+    keep this age comparison meaningful -- that is explicitly out of scope, not a gap
+    introduced here.
+
+    Args:
+        path: The ephemeral lockfile to parse.
+
+    Returns:
+        A ``(pid, age_seconds, bound)`` tuple; any field that could not be parsed is
+        ``None``.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None, None, None
+    pid = age = bound = None
+    if lines:
+        try:
+            pid = int(lines[0].strip())
+        except ValueError:
+            pid = None
+    if len(lines) > 1:
+        try:
+            started = datetime.fromisoformat(lines[1].strip())
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - started).total_seconds()
+        except ValueError:
+            age = None
+    if len(lines) > 2:
+        try:
+            bound = int(lines[2].strip())
+        except ValueError:
+            bound = None
+    return pid, age, bound
+
+
+def _lockfile_holder_is_live(path: str) -> bool:
+    """Return True if the ephemeral lockfile at *path* is held by a live process.
+
+    **The short ephemeral bound is AUTHORITATIVE -- reclaimable if the PID is dead OR its
+    persisted age has reached the bound, whichever comes first.** This is the exact same
+    rule ``is_dir_live`` (above, unchanged) applies (``age < threshold`` there); the only
+    difference between the two is WHICH bound gets persisted by their respective callers
+    -- this primitive is always used with :func:`staleness_bound_ephemeral` (short,
+    un-floored), vs. the run-dir lock's 6h-floored ``staleness_bound_for_timeout``. So the
+    two locks share ONE policy, tuned by two different bound values for two different
+    holder lifetimes -- not two different policies.
+
+    Why bound-authoritative even when the PID is alive (PID-recycling safety): a
+    legitimate holder of an EPHEMERAL lock (a stdout token, a concurrency slot) is a
+    SINGLE delegation that cannot outlive its own timeout -- its persisted bound is
+    ``2*timeout``. A lock whose age has already reached that bound is therefore
+    DEFINITELY not still held by the process that wrote it: either that process died and
+    released nothing (crash), or -- the case a purely liveness-based rule gets wrong --
+    the OS RECYCLED its PID number to a different, unrelated, live process, which would
+    make a liveness-only check report the lock "held" FOREVER, permanently wedging a
+    stdout token or a concurrency slot. Treating the bound as authoritative closes that
+    hole: once a lock is definitively past its own holder's maximum possible lifetime, it
+    is reclaimable, regardless of whether *some* live process now happens to own that PID
+    number.
+
+    Accepted trade-off, self-healing (documented): a process genuinely SUSPENDED (e.g. a
+    laptop put to sleep mid-delegation) past ``2*timeout`` could have its token/slot
+    reclaimed here while it is technically still alive -- a brief over-commit at the
+    endpoint (two holders of the same resource for a short window). This is judged
+    acceptable because it SELF-HEALS: on resume, that delegation's own monotonic deadline
+    (R25, checked before every retry/backoff) is already exceeded, so it aborts and
+    releases on its own without ever completing -- it can race with, but never
+    permanently coexist with, a reclaimer.
+
+    Rules, in priority order:
+      1. PID field unparseable (``pid is None``) -> INDETERMINATE: fall back to the
+         age/bound heuristic -- fresh (``age < bound``) -> treated as held (not yet
+         reclaimable); past the bound, or age/bound themselves unparseable -> reclaimable.
+      2. PID parses but the process is dead (``is_pid_alive`` is False) -> reclaimable.
+      3. PID parses and the process is alive, but ``age``/``bound`` both parse and
+         ``age >= bound`` -> reclaimable (PID-recycling-safe: the bound overrides a live
+         PID that cannot possibly still be the original legitimate holder).
+      4. PID parses and is alive, and (``age < bound``, or either is unparseable) -> held.
+
+    Args:
+        path: The ephemeral lockfile to inspect.
+
+    Returns:
+        True if a live process holds the lock and its bound has not yet elapsed (do not
+        steal it); False if it is reclaimable (dead PID, bound-expired despite a live
+        PID, or an indeterminate/corrupt lock past its fallback bound).
+    """
+    pid, age, bound = _read_lock_fields(path)
+    if pid is None:
+        # Corrupt/indeterminate PID: liveness cannot be checked at all, so the bound
+        # decides (same fallback role as in is_dir_live's lockless-dir branch, above).
+        return age is not None and bound is not None and age < bound
+    if not is_pid_alive(pid):
+        return False
+    if age is not None and bound is not None and age >= bound:
+        return False  # bound-expired: reclaimable even though a live process owns this PID
+    return True
+
+
+def _acquire_ephemeral(path: str, bound: int) -> bool:
+    """Atomically acquire the ephemeral lockfile at *path*, reclaiming a stale holder.
+
+    Fresh path -> ``O_CREAT|O_EXCL`` create wins outright (we own it, no re-verify needed).
+    Path held by a LIVE process -> return False. Path whose holder is DEAD/stale ->
+    TOCTOU-safe bounded reclaim: for at most ``_EPHEMERAL_RECLAIM_RETRIES`` rounds,
+    remove the stale file and ``O_EXCL``-recreate it, then **re-verify ownership** by
+    re-reading the PID on disk -- if a competing reclaimer beat us (the PID isn't ours),
+    back off (return False) rather than assume we hold it. Bounded retries avoid a
+    livelock when two processes race to reclaim the same corpse.
+
+    Args:
+        path: The lockfile path to acquire.
+        bound: The staleness bound (seconds) to persist (short/ephemeral).
+
+    Returns:
+        True if this process now holds the lock, False otherwise.
+    """
+    payload = _ephemeral_payload(bound)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.write(fd, payload)
+        os.close(fd)
+        return True
+    except FileExistsError:
+        pass
+    for _ in range(_EPHEMERAL_RECLAIM_RETRIES):
+        if _lockfile_holder_is_live(path):
+            return False  # live holder -> do not steal
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass  # another reclaimer already removed it
+        except OSError:
+            return False
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.write(fd, payload)
+            os.close(fd)
+        except FileExistsError:
+            continue  # lost the recreate race -> retry
+        except OSError:
+            return False
+        pid, _age, _bound = _read_lock_fields(path)  # ownership re-verification
+        return pid == os.getpid()
+    return False
+
+
+def _release_ephemeral(path: str) -> None:
+    """Remove the ephemeral lockfile at *path* if present (best-effort, idempotent).
+
+    Args:
+        path: The ephemeral lockfile to remove.
+    """
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def acquire_token(path: str, timeout: int) -> bool:
+    """Acquire the cross-process stdout stream token (R7d).
+
+    At most one delegation ACROSS ALL PROCESSES streams tokens to the terminal. Uses the
+    shared ephemeral primitive with a SHORT bound (:func:`staleness_bound_ephemeral`,
+    ~2x``timeout``, NO 6h floor) so a crashed holder frees the token in minutes, not hours.
+
+    **WARNING -- mid-stream holder crash (documented, bounded, not permanent).** The
+    normal release path is the ``finally`` in ``run_ollama._stream_with_stdout_token``,
+    which runs on any Python-level exception including ``KeyboardInterrupt``. A HARD
+    crash that bypasses Python entirely (SIGKILL, OOM-kill, power loss) skips that
+    ``finally``, so the token lockfile is left behind and is NOT released proactively.
+    This is NOT an unbounded interleaving risk, for two independent reasons, either of
+    which resolves it: (1) the crashed holder's PID dies with it, so
+    ``_lockfile_holder_is_live``'s ``is_pid_alive`` check reports it dead essentially
+    IMMEDIATELY on the very next `acquire_token` call from any other process -- no need
+    to wait out the bound at all; (2) even in the pathological case where the OS has
+    already recycled that PID number into a different, unrelated LIVE process (so the
+    liveness check alone would be fooled), the SHORT ephemeral bound (~2x``timeout``) is
+    authoritative and reclaims the token anyway once the bound elapses (see
+    ``_lockfile_holder_is_live``). So the token is reclaimed either near-instantly (dead
+    PID, the common crash case) or within one bound window (the PID-recycling edge
+    case) -- no periodic liveness-polling loop is needed. Until reclaimed, a NEW
+    delegation simply goes file-only (never stdout) rather than interleaving with a
+    ghost -- there is no window in which two processes both believe they hold the token.
+
+    Args:
+        path: The token lockfile (``<project_run_root>/.ollama-stdout.lock``).
+        timeout: Per-delegation timeout (drives the short staleness bound).
+
+    Returns:
+        True if this process now holds the token (-> stream to stdout); False if a live
+        holder exists (-> route this delegation's stream to ``{cap}.stream.log`` instead).
+    """
+    return _acquire_ephemeral(path, staleness_bound_ephemeral(timeout))
+
+
+def release_token(path: str) -> None:
+    """Release the stdout token if held (best-effort, idempotent).
+
+    Args:
+        path: The token lockfile to release.
+    """
+    _release_ephemeral(path)

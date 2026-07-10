@@ -44,7 +44,14 @@ from ollama_preflight import preflight
 from ollama_stream import stream_run
 from ollama_vision import stream_vision
 from parse_output import parse_agent_output
-from run_lock import remove_lock, staleness_bound_for_timeout, write_lock
+from run_lock import (
+    STDOUT_TOKEN_FILENAME,  # noqa: F401 -- consumed at the R7d integration call site (MS7)
+    acquire_token,
+    release_token,
+    remove_lock,
+    staleness_bound_for_timeout,
+    write_lock,
+)
 from sanitize import build_user_prompt, open_output_frame, strip_invisibles, wrap_output
 from scheduler import Scheduler
 from startup_hardening import (
@@ -1120,6 +1127,41 @@ def run_delegation(ns: argparse.Namespace) -> int:
             # in flight (esp. KeyboardInterrupt), or managed_run_dir's rmtree path is missed.
             _safe_display_stop(display)
     return 0
+
+
+def _stream_with_stdout_token(
+    token_path: str,
+    timeout: int,
+    run: Callable[[bool], Any],
+    *,
+    acquire: Callable[[str, int], bool] = acquire_token,
+    release: Callable[[str], None] = release_token,
+) -> tuple[Any, bool]:
+    """Run *run(used_stdout)* while (or without) holding the cross-process stdout token.
+
+    The token is acquired before streaming; ``run`` is told via ``used_stdout`` whether it
+    won stdout (stream live) or must go file-only (``{cap}.stream.log``). The token is
+    released in a ``finally`` on ANY ``BaseException`` -- including ``KeyboardInterrupt``
+    (Ctrl-C / SIGINT, R27) -- so an interrupted delegation never leaves a live token that
+    would force the next process file-only. A process that never held the token (file-only)
+    releases nothing (idempotent).
+
+    Args:
+        token_path: The ``.ollama-stdout.lock`` path in the per-project namespace.
+        timeout: Per-delegation timeout (short staleness bound).
+        run: Callback receiving ``used_stdout: bool``; returns the delegation result.
+        acquire: Injectable token acquirer (tests).
+        release: Injectable token releaser (tests).
+
+    Returns:
+        ``(result, used_stdout)``.
+    """
+    used_stdout = acquire(token_path, timeout)
+    try:
+        return run(used_stdout), used_stdout
+    finally:
+        if used_stdout:
+            release(token_path)
 
 
 def main(argv: list[str] | None = None) -> int:

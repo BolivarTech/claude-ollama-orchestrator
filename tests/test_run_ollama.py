@@ -3135,9 +3135,10 @@ def test_stream_with_stdout_token_holder_uses_stdout(tmp_path):
 def test_stream_with_stdout_token_second_process_is_file_only(tmp_path):
     tok = str(tmp_path / ".ollama-stdout.lock")
     from run_lock import acquire_token
-    acquire_token(tok, 60)                                # another process holds it
+
+    acquire_token(tok, 60)  # another process holds it
     result, used = run_ollama._stream_with_stdout_token(tok, 60, lambda used_stdout: used_stdout)
-    assert used is False and result is False              # degraded to file-only, no interleave
+    assert used is False and result is False  # degraded to file-only, no interleave
 
 
 def test_stream_with_stdout_token_releases_on_interrupt(tmp_path):
