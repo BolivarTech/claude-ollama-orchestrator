@@ -294,6 +294,21 @@ def test_429_backoff_is_bounded_by_the_per_delegation_deadline():
     assert slept == []  # never slept past the deadline
 
 
+def test_429_deadline_exceeded_raises_rate_limit_error_not_plain_backend_error():
+    # R14b: a deadline hit DURING a 429 backoff loop is still throttling, not a dead
+    # model. It must raise the RateLimitError SUBTYPE (which `_execute_delegation` catches
+    # ahead of the generic OllamaBackendError arm and EXCLUDES from the per-model breaker),
+    # never a plain OllamaBackendError — otherwise a healthy-but-throttled model whose 429
+    # backoff simply outran the delegation's time budget would wrongly trip its breaker.
+    err = urllib.error.HTTPError("u", 429, "Too Many", {"Retry-After": "999999"}, io.BytesIO(b""))
+    slept: list[float] = []
+    rec = _Recorder(error=err)
+    be = OllamaBackend(_cfg(), urlopen=rec, sleep=slept.append)
+    with pytest.raises(RateLimitError):
+        be.run("coder", "s", "p", "m", 1)  # 1s budget « 999999s Retry-After → deadline
+    assert slept == []  # never slept past the deadline
+
+
 def test_run_honors_a_caller_supplied_deadline_over_timeout():
     # R25 propagation: when the caller (dispatch) passes an ALREADY-ELAPSED deadline,
     # run must NOT derive a fresh timeout budget — the first 429 backoff is refused

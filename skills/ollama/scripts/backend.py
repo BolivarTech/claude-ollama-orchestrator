@@ -551,7 +551,15 @@ class OllamaBackend(AgentBackend):
                 # inline logic this replaces.
                 delay = retry_after_delay(rl.exc, attempt, self._rng)
                 if time.monotonic() + delay > deadline:
-                    raise OllamaBackendError(
+                    # A deadline hit DURING a 429 backoff is still throttling (R14b), not a
+                    # dead model — raise the RateLimitError SUBTYPE (same as the exhausted-
+                    # backoffs branch above) so `_execute_delegation`'s `except RateLimitError`
+                    # arm EXCLUDES it from the per-model breaker. A plain OllamaBackendError
+                    # here would trip the breaker for a healthy-but-throttled model whose
+                    # backoff merely outran the delegation's time budget. RateLimitError
+                    # IS-A OllamaBackendError, so every `except OllamaBackendError` still
+                    # catches it unchanged (additive, backward-compatible).
+                    raise RateLimitError(
                         self._redact(
                             "Ollama 429 rate limit: retry deadline exceeded before backoff."
                         )
