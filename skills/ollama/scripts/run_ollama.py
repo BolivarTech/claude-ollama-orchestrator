@@ -25,6 +25,7 @@ from typing import Any, TextIO
 from agent_schema import DISCRIMINATOR_KEYS, SCHEMAS
 from backend import AgentBackend, DelegationResult, OllamaBackend
 from circuit_breaker import CircuitBreaker
+from diff_guard import validate_findings
 from errors import (
     DelegationError,
     InvalidInputError,
@@ -134,6 +135,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--warn-input-tokens", type=int, default=150_000, help="Oversize warning threshold (tokens)"
+    )
+    parser.add_argument(
+        "--diff",
+        default=None,
+        help="Path to a unified diff (or inline diff text) grounding reviewer findings "
+        "against it (R30); omit for no grounding",
     )
     # --ollama-init is intentionally NOT an argparse flag: it is handled solely by the
     # pre-parse first-token short-circuit in `main` (before argparse ever runs), so there
@@ -521,6 +528,7 @@ def dispatch(
     config: OllamaAgentsConfig,
     stats: TokenStats | None = None,
     sink: Callable[[str], None] | None = None,
+    diff: str | None = None,
 ) -> DelegationResult:
     """Run one delegation; for the ``schema`` mode parse+validate with one retry.
 
@@ -563,6 +571,20 @@ def dispatch(
             default) never streams regardless of *config*'s ``[stream]`` setting —
             callers that want streaming must supply one (e.g. ``stdout_sink`` for the
             single in-flight delegation).
+        diff: Optional unified diff (R30) grounding ``reviewer``'s findings against the
+            change Claude is reviewing. Consulted ONLY for ``reviewer``: right after the
+            structured output is parsed + schema-validated and BEFORE the result is
+            returned, a finding whose claimed ``file`` is absent from *diff* is
+            HARD-DROPPED — it never reaches the caller; one whose ``line`` is outside
+            the changed range is kept, soft-annotated
+            (``diff_guard.validate_findings``). ``None`` (the default, for both this
+            parameter and the CLI's ``--diff``) is a strict no-op: ``diff_guard`` is
+            never even called, and every finding passes through byte-for-byte
+            unchanged. Accepted uniformly for every capability (one signature), but
+            capabilities other than ``reviewer`` — including ``coder`` (free-text,
+            ``structured="off"``) — never consult it: a documented, intentional
+            no-op there, not a silent gap. A coder response is raw code text with no
+            structured ``file``/``line`` claims to ground in this build.
 
     Returns:
         The ``DelegationResult`` — with the validated dict in ``.parsed`` for schema mode,
@@ -644,7 +666,6 @@ def dispatch(
             stats.record(capability, model, result, counts_as_delegation=(attempt == 0))
         try:
             parsed = validate_output(capability, parse_agent_output(result.content, keys))
-            return replace(result, parsed=parsed)
         except (ValidationError, json.JSONDecodeError) as exc:
             last_error = str(exc)
             # Reinject the ACTUAL per-capability JSON-Schema (not just the key list) so the
@@ -660,6 +681,17 @@ def dispatch(
                 + json.dumps(SCHEMAS[capability])
                 + "\n"
             )
+            continue
+        if capability == "reviewer" and diff is not None:
+            # R30: ground the model's file:line claims against the PROVIDED diff, right
+            # after schema validation and BEFORE the result is returned to
+            # run_delegation/Claude. A fabricated-file finding is HARD-DROPPED here — it
+            # never reaches the caller; an out-of-range one is kept, soft-annotated.
+            # `diff=None` (the default) skips this branch entirely, so `tester` and every
+            # other capability (and `reviewer` itself with no `--diff`) is unaffected.
+            kept, _dropped = validate_findings(parsed["findings"], diff)
+            parsed = {**parsed, "findings": kept}
+        return replace(result, parsed=parsed)
     raise ValidationError(f"{capability} output invalid after retry: {last_error}")
 
 
@@ -1056,6 +1088,11 @@ def run_delegation(ns: argparse.Namespace) -> int:
                 raw_input = _load_input(ns.input)
                 warn_if_oversize(raw_input, ns.warn_input_tokens)  # R24
                 prompt = build_user_prompt(raw_input)  # R22: sanitize + nonce-wrap
+                # R30: `--diff` is loaded through the SAME file-or-inline-text helper as
+                # `input` (same MAX_INPUT_FILE_SIZE guard, same errors="replace" decode) —
+                # no bespoke size/encoding path for the diff. `None` (the default) is a
+                # strict no-op forwarded to `dispatch` unchanged.
+                diff = _load_input(ns.diff) if ns.diff is not None else None
                 stats = TokenStats()
                 if display is not None:
                     display.update(ns.capability, "running")
@@ -1084,6 +1121,7 @@ def run_delegation(ns: argparse.Namespace) -> int:
                         config=cfg,
                         stats=stats,
                         sink=sink,
+                        diff=diff,
                     )
 
                 def _stream_to_stdout_framed() -> DelegationResult:

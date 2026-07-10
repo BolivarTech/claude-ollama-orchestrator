@@ -244,7 +244,10 @@ def test_reviewer_finding_optional_file_and_line_validate_when_present():
 def test_reviewer_finding_without_file_or_line_still_validates():
     # Backward compatibility: MS1's original finding shape (no location claim) is
     # untouched by this additive schema change.
-    obj = {"capability": "reviewer", "findings": [{"severity": "info", "title": "t", "detail": "d"}]}
+    obj = {
+        "capability": "reviewer",
+        "findings": [{"severity": "info", "title": "t", "detail": "d"}],
+    }
     assert validate_output("reviewer", obj)["findings"][0].get("file") is None
 
 

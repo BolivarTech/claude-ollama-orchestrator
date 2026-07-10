@@ -167,23 +167,38 @@ def validate_output(capability: str, obj: dict[str, Any]) -> dict[str, Any]:
             # SCHEMAS["reviewer"]["properties"]["findings"]["items"]["properties"] in
             # agent_schema.py (no jsonschema engine here, R29 is stdlib-only) — the
             # bidirectional corpus test (test_agent_schema.py) is the safety net that
-            # catches drift if one side is edited without the other.
+            # catches drift if one side is edited without the other. ``file``/``line``
+            # (MS7 Task 7, R30) are OPTIONAL: allowed but not required, so a finding
+            # that omits them (MS1's original shape) still validates unchanged.
             if not isinstance(f, dict) or {"severity", "title", "detail"} - f.keys():
                 raise ValidationError("reviewer: malformed finding")
-            _reject_extra_keys(f, {"severity", "title", "detail"}, "reviewer finding")
+            _reject_extra_keys(
+                f, {"severity", "title", "detail", "file", "line"}, "reviewer finding"
+            )
             if f["severity"] not in SEVERITIES:
                 raise ValidationError(f"reviewer: bad severity {f['severity']!r}")
             # Lockstep with the schema's ``type: "string"`` (R29): reject a non-string
             # instead of ``str()``-coercing it (which would accept ints/None the schema rejects).
             if not isinstance(f["title"], str) or not isinstance(f["detail"], str):
                 raise ValidationError("reviewer: 'title' and 'detail' must be strings")
-            new_findings.append(
-                {
-                    "severity": f["severity"],
-                    "title": clean_title(f["title"]),  # identity field: reject empty
-                    "detail": _strip_invisibles(f["detail"]),  # free text: keep formatting (R23)
-                }
-            )
+            cleaned_finding: dict[str, Any] = {
+                "severity": f["severity"],
+                "title": clean_title(f["title"]),  # identity field: reject empty
+                "detail": _strip_invisibles(f["detail"]),  # free text: keep formatting (R23)
+            }
+            if "file" in f:
+                # Lockstep with the schema's ``type: "string"`` (R29): reject non-strings.
+                if not isinstance(f["file"], str):
+                    raise ValidationError("reviewer: 'file' must be a string")
+                cleaned_finding["file"] = _strip_invisibles(f["file"])
+            if "line" in f:
+                # Lockstep with the schema's ``type: "integer"`` (R29): reject a bool
+                # (a `bool` is an `int` subclass in Python) and any non-int, e.g. the
+                # string "11" a model might emit instead of the bare integer 11.
+                if isinstance(f["line"], bool) or not isinstance(f["line"], int):
+                    raise ValidationError("reviewer: 'line' must be an integer")
+                cleaned_finding["line"] = f["line"]
+            new_findings.append(cleaned_finding)
         cleaned["findings"] = new_findings
     elif capability == "tester":
         tests = obj["tests"]
