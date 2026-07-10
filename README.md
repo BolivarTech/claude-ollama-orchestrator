@@ -115,18 +115,41 @@ The first token after `/ollama` selects one of the seven capabilities — analog
 `/magi <mode>`. Omit it and the orchestrator classifies the task and picks the fitting
 capability; an invalid capability errors with the valid list.
 
+**Text capabilities** (`coder`, `reviewer`, `tester`, `explainer`, `thinking`) take your
+request as free text:
+
 ```
 /ollama coder      write a retry decorator with exponential backoff
-/ollama vision     <attach a screenshot> what UI pattern is this?
+/ollama reviewer   review the auth changes in this diff for security issues
 /ollama thinking   should we shard by tenant or by region? weigh the trade-offs
-/ollama            <request>            # no capability → auto-routed
+/ollama            <request>            # no capability → auto-routed by Claude's judgment
 ```
 
-Scaffold the config once, then delegate:
+**Media capabilities** take a **file path** as the input (validated by magic bytes, not
+the extension):
+
+```
+/ollama vision      path/to/screenshot.png      # analyzes the image (v0.0.7 uses a built-in
+                                                 # analysis prompt; a custom prompt lands in v0.2)
+/ollama transcribe  path/to/recording.mp3       # experimental; requires the endpoint to expose
+                                                 # /audio/transcriptions OR an audio-multimodal model
+```
+
+- `vision` needs a **multimodal** model (default `minimax-m3:cloud`); a text-only model is
+  detected and rejected with an actionable error.
+- `transcribe` is **experimental and gated**: if the endpoint supports neither audio path, it
+  fails with a clear message (never a crash) — it does not block the other six capabilities.
+
+### First-time setup
 
 ```bash
-# Generate ./.claude/ollama-agents.toml from defaults (refuses to overwrite)
+# 1. (cloud models) sign the local daemon in to Ollama Cloud — no weight download
+ollama signin
+
+# 2. Scaffold ./.claude/ollama-agents.toml from defaults (refuses to overwrite an existing one)
 python skills/ollama/scripts/run_ollama.py --ollama-init
+
+# 3. Edit the TOML if you want different models / a LAN or direct-cloud base_url, then delegate.
 ```
 
 ---
@@ -329,7 +352,7 @@ token is released.
 
 ---
 
-## Project Structure (target)
+## Project Structure
 
 ```
 .claude-plugin/
@@ -350,30 +373,36 @@ skills/ollama/                -- dir == skill name == command (MAGI standard)
     run_ollama.py             -- CLI orchestrator (capability positional arg; --ollama-init)
     ollama_init.py            -- renders ollama-agents.toml from defaults (refuse-if-exists)
     ollama_stream.py          -- streaming text delegation (token/speed metrics)
-    ollama_vision.py          -- streaming vision delegation
+    ollama_vision.py          -- vision delegation: image_url data-URI, magic-byte MIME
+    transcribe.py             -- experimental audio transcription (endpoint/audio-chat, gated)
     ollama_config.py          -- layered config resolver (env > repo > global > default)
     ollama_preflight.py       -- fail-fast host + model-availability check
     backend.py                -- OpenAI-compatible /v1 transport (chat/completions)
+    errors.py                 -- domain exceptions (Ollama*/Delegation/Validation/InvalidInput)
+    scheduler.py              -- bounded concurrency: max_parallel semaphore + max_queued queue
+    circuit_breaker.py        -- per-model circuit breaker (K failures open; 429 excluded)
     token_stats.py            -- local token accounting (independent of Claude usage)
     temp_dirs.py              -- per-project temp namespace, unique run dirs, LRU cleanup
-    run_lock.py               -- .ollama-lock (PID/liveness/bound), cross-platform probe
+    run_lock.py               -- .ollama-lock + cross-process stdout token / .ollama-slots (R7d/R21c)
     status_display.py         -- live status tree (ANSI/TTY, plain on pipe, ASCII fallback)
     stderr_shim.py            -- buffers real stderr while the status display renders
-    sanitize.py               -- 4-layer anti-prompt-injection + nonce delimiters
+    sanitize.py               -- 4-layer anti-prompt-injection + nonce delimiters (input & output)
+    startup_hardening.py      -- Windows console UTF-8 + world-readable/plaintext-key warnings
     parse_output.py           -- tolerant JSON extractor (<think> recovery, fail-closed, DoS bounds)
-    validate.py               -- domain ValidationError + guards + clean_title
+    binary_input.py           -- bounded magic-byte-checked binary loader (vision/transcribe)
+    validate.py               -- domain guards + clean_title + output-size cap
     agent_schema.py           -- per-capability JSON-Schema (lockstep with validate.py)
     input_size.py             -- token estimate (chars/4) + oversize warning
-    diff_guard.py             -- (optional) unified-diff parser + hallucination guard
+    diff_guard.py             -- (optional) unified-diff parser + hallucination guard (R30)
 tests/                        -- pytest suite (BDD-named, HTTP mocked at the urllib edge)
-docs/                         -- user & architecture docs
 pyproject.toml                -- Python >= 3.12, dual license, dev deps, tool config
 conftest.py                   -- tdd-guard pytest plugin + sys.path setup
 Makefile                      -- verify, test, lint, format, typecheck targets
 ```
 
-> The exact module split is fixed by the spec-base — treat the tree as the intended shape,
-> not a contract, until the spec lands.
+> This is the shipped structure as of v0.0.7: the 20 script modules above, one dedicated
+> pytest suite per module, the `SKILL.md` orchestrator, and the seven `agents/` system
+> prompts — all implemented, `mypy --strict` clean, stdlib-only runtime.
 
 ---
 
