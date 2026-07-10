@@ -631,26 +631,34 @@ def release_token(path: str) -> None:
 SLOTS_DIRNAME = ".ollama-slots"
 
 
-def _cleanup_orphaned_slots(slots_dir: str) -> None:
-    """Best-effort sweep of reclaimable ``slot-*.lock`` files under *slots_dir*.
+def _cleanup_orphaned_slots(slots_dir: str, max_parallel: int) -> None:
+    """Best-effort sweep of reclaimable OUT-OF-RANGE ``slot-*.lock`` files under *slots_dir*.
 
-    `acquire_slot`'s own probe loop already reclaims (by overwriting) a stale file it
-    happens to land on WITHIN the current ``0..max_parallel-1`` range, but a slot file
-    OUTSIDE that range -- e.g. ``slot-5.lock`` left behind by a previous, larger
-    ``max_parallel_agents`` -- would otherwise never be probed again and accumulate
-    under ``.ollama-slots/`` forever. This sweep runs once per `acquire_slot` call and
-    removes every ``slot-*.lock`` whose holder :func:`_lockfile_holder_is_live` reports
-    reclaimable, regardless of its index. The ``.ollama-slots/`` dir lives under the
-    per-project namespace (alongside the ``ollama-run-*`` dirs, R15) -- its stale files
-    are reclaimed on the next `acquire_slot` from ANY process of that project, never
-    another project's.
+    A slot file OUTSIDE the current probe range -- e.g. ``slot-5.lock`` left behind by a
+    previous, larger ``max_parallel_agents`` -- is never probed again by `acquire_slot`
+    (which only touches ``0..max_parallel-1``) and would otherwise accumulate under
+    ``.ollama-slots/`` forever. This sweep removes each such orphan whose holder
+    :func:`_lockfile_holder_is_live` reports reclaimable.
 
-    Total: a listing/stat/remove failure is a silent no-op -- this is pure hygiene
-    (disk cleanliness), never load-bearing for the concurrency cap itself (which is
-    enforced solely by `acquire_slot`'s own atomic probe/reclaim).
+    **In-range slots (index < *max_parallel*) are deliberately LEFT ALONE** and reclaimed
+    by `acquire_slot`'s own atomic ``O_EXCL`` probe/reclaim instead. Sweeping them here
+    would open an R21c TOCTOU: this function's check-then-``os.remove`` is not atomic, so a
+    concurrent `acquire_slot` that reclaims the same index between our liveness check and
+    our remove (A reads the old dead PID, B swaps in a fresh live file, A removes B's file)
+    would delete a slot that is actually held -> a freed-but-held slot -> over-subscription
+    by one. Out-of-range orphans have NO concurrent acquirer under the supported model (all
+    processes of a project share the same ``max_parallel`` -- an env override that differs
+    per process is documented as unsupported in :func:`acquire_slot`), so removing them is
+    race-free. This keeps the sweep pure hygiene, never load-bearing for the cap (enforced
+    solely by `acquire_slot`'s atomic probe/reclaim). The ``.ollama-slots/`` dir lives under
+    the per-project namespace (alongside the ``ollama-run-*`` dirs, R15).
+
+    Total: a listing/stat/remove failure -- or an unparseable ``slot-<x>.lock`` index -- is
+    a silent no-op.
 
     Args:
         slots_dir: The per-project slots dir to sweep.
+        max_parallel: The current global cap; only indices ``>= max_parallel`` are swept.
     """
     try:
         names = os.listdir(slots_dir)
@@ -659,6 +667,12 @@ def _cleanup_orphaned_slots(slots_dir: str) -> None:
     for name in names:
         if not (name.startswith("slot-") and name.endswith(".lock")):
             continue
+        try:
+            index = int(name[len("slot-") : -len(".lock")])
+        except ValueError:
+            continue  # not a `slot-<int>.lock` -- not ours to classify, leave it
+        if index < max_parallel:
+            continue  # in-range: owned by acquire_slot's atomic reclaim, never swept here
         path = os.path.join(slots_dir, name)
         try:
             if not _lockfile_holder_is_live(path):
@@ -672,13 +686,14 @@ def acquire_slot(slots_dir: str, max_parallel: int, timeout: int) -> int | None:
 
     Bounds concurrent Ollama agents to *max_parallel* GLOBALLY across processes -- the
     in-process ``Scheduler`` semaphore (MS5) only caps one process. First opportunistically
-    sweeps `.ollama-slots/` for any reclaimable slot file (:func:`_cleanup_orphaned_slots`
-    -- including ones outside the current probe range, so orphans from a previous, larger
-    ``max_parallel_agents`` don't accumulate), then probes indices ``0..max_parallel-1``
-    and acquires the FIRST free one via the shared ephemeral-lock primitive (``O_EXCL``
-    create, 3-line short-bound payload, TOCTOU-safe dead-slot reclaim). All slots held by
-    live processes -> returns None, which the caller treats as an R21b queue/rejection
-    (never a silent over-subscription of the endpoint).
+    sweeps `.ollama-slots/` for reclaimable OUT-OF-RANGE orphans (:func:`_cleanup_orphaned_slots`
+    -- indices ``>= max_parallel`` left by a previous, larger ``max_parallel_agents`` that
+    would otherwise accumulate; in-range indices are left to the atomic probe/reclaim below to
+    avoid a sweep-vs-acquire TOCTOU), then probes indices ``0..max_parallel-1`` and acquires
+    the FIRST free one via the shared ephemeral-lock primitive (``O_EXCL`` create, 3-line
+    short-bound payload, TOCTOU-safe dead-slot reclaim). All slots held by live processes ->
+    returns None, which the caller treats as an R21b queue/rejection (never a silent
+    over-subscription of the endpoint).
 
     Accepted, documented (INFO): the probe is ``O(max_parallel)`` filesystem
     round-trips per acquisition -- trivial at the default ``max_parallel_agents = 3``
@@ -702,7 +717,7 @@ def acquire_slot(slots_dir: str, max_parallel: int, timeout: int) -> int | None:
         os.makedirs(slots_dir, exist_ok=True)
     except OSError:
         return None
-    _cleanup_orphaned_slots(slots_dir)
+    _cleanup_orphaned_slots(slots_dir, max_parallel)
     bound = staleness_bound_ephemeral(timeout)
     for index in range(max_parallel):
         slot_path = os.path.join(slots_dir, f"slot-{index}.lock")

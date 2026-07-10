@@ -333,6 +333,29 @@ def test_orphaned_dead_slot_file_outside_probe_range_is_cleaned_up_on_acquire(
     assert not os.path.exists(orphan)  # swept anyway, not left behind
 
 
+def test_cleanup_leaves_in_range_slots_to_atomic_reclaim_sweeps_only_out_of_range(
+    tmp_path, monkeypatch
+):
+    """R21c TOCTOU guard: the hygiene sweep must NOT remove an IN-RANGE slot file, even a
+    reclaimable-looking one. An in-range slot is owned by `acquire_slot`'s atomic O_EXCL
+    probe/reclaim; removing it here can race a concurrent acquirer that just swapped in a
+    fresh file at the same path (A reads the old dead PID, B reclaims, A's os.remove kills
+    B's live file) -> a freed-but-held slot -> over-subscription by one. Only OUT-OF-RANGE
+    orphans (index >= max_parallel, left by a previous larger cap) -- which no current
+    process ever probes -- are swept here; in-range dead files are reclaimed atomically by
+    the probe loop instead."""
+    slots = str(tmp_path / SLOTS_DIRNAME)
+    os.makedirs(slots)
+    in_range = os.path.join(slots, "slot-0.lock")
+    out_of_range = os.path.join(slots, "slot-9.lock")
+    _write_ephemeral(in_range, pid=999_999, bound=60)  # dead PID, index inside range(0, 3)
+    _write_ephemeral(out_of_range, pid=999_999, bound=60)  # dead PID, index >= 3
+    monkeypatch.setattr(run_lock, "is_pid_alive", lambda pid: pid == os.getpid())
+    run_lock._cleanup_orphaned_slots(slots, max_parallel=3)
+    assert os.path.exists(in_range)  # in-range: NOT swept, left to atomic reclaim
+    assert not os.path.exists(out_of_range)  # out-of-range orphan: swept
+
+
 def test_release_slot_is_idempotent(tmp_path):
     slots = str(tmp_path / SLOTS_DIRNAME)
     acquire_slot(slots, 1, 60)
