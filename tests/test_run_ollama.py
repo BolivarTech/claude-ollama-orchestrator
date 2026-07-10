@@ -2948,3 +2948,55 @@ def test_load_input_reads_invalid_utf8_bytes_without_crashing(tmp_path):
     bad.write_bytes(b"prefix \xff\xfe\x80 suffix")  # invalid UTF-8 byte sequence
     text = run_ollama._load_input(str(bad))
     assert "prefix" in text and "suffix" in text  # decoded via errors="replace", no crash
+
+
+def test_make_backend_wires_the_configured_output_cap():
+    # R24c (Task 8): the layered config's max_output_bytes must reach the
+    # transactional backend at construction time, not just its own module default.
+    base = resolve_config(global_path=None, repo_path=None, env={})
+    cfg = dataclasses.replace(base, max_output_bytes=12345)
+    backend = run_ollama._make_backend(cfg)
+    assert backend._max_output_bytes == 12345
+
+
+def test_run_once_streaming_path_receives_the_configured_output_cap(monkeypatch):
+    # R24c (Task 8): the SAME layered value must reach the streaming path's
+    # stream_run/stream_vision call, per-call, not just the transactional backend.
+    from backend import DelegationResult
+
+    seen = {}
+
+    def _fake_stream_run(
+        config,
+        system_prompt,
+        prompt,
+        model,
+        timeout,
+        *,
+        sink,
+        response_format=None,
+        max_output_bytes=None,
+        deadline=None,
+    ):
+        seen["max_output_bytes"] = max_output_bytes
+        return DelegationResult("ok", 1, 1, True, 0.1)
+
+    monkeypatch.setattr(run_ollama, "stream_run", _fake_stream_run)
+    base = resolve_config(global_path=None, repo_path=None, env={})
+    cfg = dataclasses.replace(
+        base,
+        max_output_bytes=999,
+        stream={**base.stream, "coder": True},
+    )
+    run_ollama._run_once(
+        "coder",
+        "sys",
+        "prompt",
+        "model",
+        60,
+        backend=object(),
+        config=cfg,
+        sink=lambda _s: None,
+        response_format=None,
+    )
+    assert seen["max_output_bytes"] == 999
