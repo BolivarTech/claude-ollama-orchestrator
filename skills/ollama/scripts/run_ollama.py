@@ -446,6 +446,7 @@ def _run_once(
             timeout,
             sink=sink,
             response_format=response_format,
+            max_output_bytes=config.max_output_bytes,
         )
     return backend.run(
         capability,
@@ -606,8 +607,13 @@ def dispatch(
 
 
 def _make_backend(cfg: OllamaAgentsConfig) -> OllamaBackend:
-    """Construct the transactional backend (seam for tests)."""
-    return OllamaBackend(cfg)
+    """Construct the transactional backend (seam for tests).
+
+    Threads the layered ``max_output_bytes`` (R24c, Task 8) into the backend at
+    construction time, so the transactional path's anti-runaway output cap reflects the
+    resolved config instead of silently falling back to the module's own default.
+    """
+    return OllamaBackend(cfg, max_output_bytes=cfg.max_output_bytes)
 
 
 def _global_toml() -> str:

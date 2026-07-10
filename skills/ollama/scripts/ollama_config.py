@@ -23,6 +23,11 @@ DEFAULT_MAX_PARALLEL_AGENTS = 3
 # anti-DoS backstop, not a resource limit; see spec-behavior.md for the rationale. Shared
 # with ollama_init.render_template (see DEFAULT_MAX_PARALLEL_AGENTS above).
 DEFAULT_MAX_QUEUED_AGENTS = 32
+# Default anti-runaway output cap in UTF-8 bytes (R24c) -- must match
+# backend.DEFAULT_MAX_OUTPUT_BYTES / ollama_stream.DEFAULT_MAX_OUTPUT_BYTES (MS4/MS6 Task
+# 4) exactly, enforced by a three-way equality test (Task 8), so the layered default never
+# drifts from the two consumers' own module defaults.
+DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
 
 
 def normalize_base_url(raw: str) -> str:
@@ -124,6 +129,11 @@ class OllamaAgentsConfig:
     stream: Mapping[str, bool]
     max_parallel_agents: int
     max_queued_agents: int
+    # R24c: trailing field WITH a default (unlike the two int fields above), so every
+    # pre-existing OllamaAgentsConfig(...) construction across MS1-MS7's own fixtures
+    # (which predate this field and pass only the original seven fields) keeps compiling
+    # unchanged, per standard dataclass trailing-default-field rules.
+    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
 
 
 def _load_toml(path: str | None) -> dict[str, Any]:
@@ -418,5 +428,14 @@ def resolve_config(
             "max_queued_agents",
             DEFAULT_MAX_QUEUED_AGENTS,
             0,
+        ),
+        max_output_bytes=_resolve_int(
+            env,
+            "OLLAMA_AGENTS_MAX_OUTPUT_BYTES",
+            repo,
+            glob,
+            "max_output_bytes",
+            DEFAULT_MAX_OUTPUT_BYTES,
+            1,
         ),
     )
