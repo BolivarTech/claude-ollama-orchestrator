@@ -189,22 +189,22 @@ class CircuitBreaker:
             return "probe"
 
     def is_open(self, model: str, now: float) -> bool:
-        """Return True while *model*'s circuit is blocking new delegations.
+        """Boolean :meth:`try_enter` alias — True iff the circuit is OPEN, **and, as a
+        SIDE EFFECT, reserves the half-open probe slot on the first call after cooldown**.
 
-        Backward-compatible alias of :meth:`try_enter` (DRY, gate-closing
-        round — no separately maintained copy of the check-and-reserve
-        logic): ``True`` iff ``try_enter(model, now) == "open"``. A
-        ``"probe"`` result means THIS call itself was just admitted as the
-        (sole) half-open probe — the delegation is meant to proceed, so that
-        case must report ``False`` (not blocked), same as ``"closed"``; only
-        ``"open"`` means fail-fast. Kept for existing callers/tests that only
-        need the combined boolean; a new caller that must know WHETHER it is
-        the probe (to know whether to report an outcome back) should call
-        :meth:`try_enter` directly, and a caller that must never reserve
-        anything (a pre-scheduling filter) must call
-        :meth:`is_definitively_open` instead — this method retains the exact
-        same reserve-on-first-call-after-cooldown behavior it has always had,
-        so it is NOT safe to call speculatively on a delegation that might not
-        execute.
+        ⚠ NOT a pure predicate despite the name: this MUTATES breaker state — it is
+        literally ``try_enter(model, now) == "open"``. **Production code must NEVER call
+        it.** The two, and only two, entry points production uses are
+        :meth:`is_definitively_open` (a read-only, never-reserving peek — for a
+        speculative or pre-scheduling check on a delegation that might not run) and
+        :meth:`try_enter` (the sole reserving call, made exactly once immediately before a
+        delegation runs). ``is_open`` exists ONLY as a test-facing convenience for
+        asserting the combined boolean; calling it speculatively on a delegation that may
+        not execute would leak the probe slot — the exact bug
+        :meth:`is_definitively_open` was introduced to prevent.
+
+        A ``"probe"`` result means THIS call was just admitted as the (sole) half-open
+        probe — the delegation is meant to proceed, so that case reports ``False`` (not
+        blocked), same as ``"closed"``; only ``"open"`` reports ``True`` (fail-fast).
         """
         return self.try_enter(model, now) == "open"
