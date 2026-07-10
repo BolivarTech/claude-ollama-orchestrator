@@ -21,25 +21,26 @@ diff --git a/src/app.py b/src/app.py
 def test_parse_diff_extracts_files_and_added_lines():
     files, ranges = parse_diff(_DIFF)
     assert "src/app.py" in files
-    assert {11, 12} <= ranges["src/app.py"]        # the two added lines
+    assert {11, 12} <= ranges["src/app.py"]  # the two added lines
 
 
 def test_finding_on_fabricated_file_is_hard_dropped():
     kept, dropped = validate_findings(
-        [{"file": "does/not/exist.py", "line": 5, "title": "ghost"}], _DIFF)
+        [{"file": "does/not/exist.py", "line": 5, "title": "ghost"}], _DIFF
+    )
     assert kept == [] and len(dropped) == 1
 
 
 def test_finding_in_range_is_kept():
-    kept, _ = validate_findings(
-        [{"file": "src/app.py", "line": 11, "title": "real"}], _DIFF)
+    kept, _ = validate_findings([{"file": "src/app.py", "line": 11, "title": "real"}], _DIFF)
     assert kept[0]["title"] == "real"
     assert "annotation" not in kept[0]
 
 
 def test_finding_out_of_range_is_soft_annotated_but_kept():
     kept, _ = validate_findings(
-        [{"file": "src/app.py", "line": 99, "title": "far"}], _DIFF, margin=3)
+        [{"file": "src/app.py", "line": 99, "title": "far"}], _DIFF, margin=3
+    )
     assert kept[0]["annotation"] == "[outside changed range]"
 
 
@@ -57,11 +58,12 @@ def test_binary_diff_file_finding_is_not_hard_dropped():
         "Binary files a/assets/logo.png and b/assets/logo.png differ\n"
     )
     files, ranges = parse_diff(diff)
-    assert "assets/logo.png" in files              # registered as touched
-    assert ranges["assets/logo.png"] == set()       # no added-line info for a binary
+    assert "assets/logo.png" in files  # registered as touched
+    assert ranges["assets/logo.png"] == set()  # no added-line info for a binary
     kept, dropped = validate_findings(
-        [{"file": "assets/logo.png", "line": 1, "title": "meta"}], diff)
-    assert dropped == [] and kept[0]["title"] == "meta"   # kept, not hard-dropped
+        [{"file": "assets/logo.png", "line": 1, "title": "meta"}], diff
+    )
+    assert dropped == [] and kept[0]["title"] == "meta"  # kept, not hard-dropped
 
 
 def test_renamed_file_findings_validate_against_the_new_path():
@@ -77,27 +79,27 @@ def test_renamed_file_findings_validate_against_the_new_path():
         "+added on the renamed file\n"
     )
     files, ranges = parse_diff(diff)
-    assert "new_name.py" in files                   # the NEW path is what findings reference
-    kept, dropped = validate_findings(
-        [{"file": "new_name.py", "line": 2, "title": "ok"}], diff)
+    assert "new_name.py" in files  # the NEW path is what findings reference
+    kept, dropped = validate_findings([{"file": "new_name.py", "line": 2, "title": "ok"}], diff)
     assert kept and kept[0]["title"] == "ok" and dropped == []
 
 
 def test_pure_rename_without_hunk_still_registers_the_new_path():
-    diff = (
-        "diff --git a/a.py b/b.py\n"
-        "similarity index 100%\n"
-        "rename from a.py\n"
-        "rename to b.py\n"
-    )
+    diff = "diff --git a/a.py b/b.py\nsimilarity index 100%\nrename from a.py\nrename to b.py\n"
     files, _ = parse_diff(diff)
-    assert "b.py" in files                          # tracked even with no +++/hunk
+    assert "b.py" in files  # tracked even with no +++/hunk
 
 
 def test_malformed_diff_never_raises():
-    for junk in ("@@ garbage no numbers @@", "+++ ", "Binary files broken\n",
-                 "@@ -x +y @@\n+z", "rename to\n", "\x00\x01\x02"):
-        files, ranges = parse_diff(junk)            # must not raise
+    for junk in (
+        "@@ garbage no numbers @@",
+        "+++ ",
+        "Binary files broken\n",
+        "@@ -x +y @@\n+z",
+        "rename to\n",
+        "\x00\x01\x02",
+    ):
+        files, ranges = parse_diff(junk)  # must not raise
         assert isinstance(files, set) and isinstance(ranges, dict)
         kept, dropped = validate_findings([{"file": "z", "line": 1}], junk)  # must not raise
         assert isinstance(kept, list) and isinstance(dropped, list)
@@ -116,7 +118,7 @@ def test_no_newline_marker_does_not_shift_subsequent_line_numbers():
         "+second added line\n"
     )
     files, ranges = parse_diff(diff)
-    assert ranges["src/app.py"] == {10, 11}   # NOT {10, 12} — the marker must not count
+    assert ranges["src/app.py"] == {10, 11}  # NOT {10, 12} — the marker must not count
 
 
 def test_parse_diff_context_lines_advance_line_numbers():
