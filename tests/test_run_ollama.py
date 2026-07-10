@@ -3000,3 +3000,45 @@ def test_run_once_streaming_path_receives_the_configured_output_cap(monkeypatch)
         response_format=None,
     )
     assert seen["max_output_bytes"] == 999
+
+
+def test_streaming_output_to_claude_is_nonce_framed_and_not_duplicated(
+    capsys, monkeypatch, tmp_path
+):
+    # R22b streaming path (Loop-1 fix): the OUTPUT-side mirror of
+    # test_delegated_output_shown_to_claude_is_nonce_wrapped for a STREAMING capability.
+    # A streaming cap (coder: [stream]=True, [structured]=off) writes RAW deltas to stdout
+    # live, so run_delegation brackets that live stream with nonce BEGIN/END markers
+    # instead of ALSO printing wrap_output(rendered) -- so the streamed output reaches
+    # Claude framed as untrusted data, exactly ONCE (no duplication, no unframed copy).
+    monkeypatch.chdir(tmp_path)
+    import run_ollama
+    from backend import DelegationResult
+
+    def _fake_stream_run(
+        config,
+        system_prompt,
+        prompt,
+        model,
+        timeout,
+        *,
+        sink,
+        response_format=None,
+        max_output_bytes=None,
+    ):
+        sink("HELLO ")  # raw deltas stream to stdout via stdout_sink
+        sink("WORLD")
+        return DelegationResult("HELLO WORLD", 1, 1, True, 0.1)
+
+    cfg = _cfg_with_structured()  # coder default: [stream]=True, [structured]=off -> streaming path
+    monkeypatch.setattr(run_ollama, "resolve_config", lambda **kw: cfg)
+    monkeypatch.setattr(run_ollama, "preflight", lambda cfg, **kw: None)
+    monkeypatch.setattr(run_ollama, "load_system_prompt", lambda cap: "sys")
+    monkeypatch.setattr(run_ollama, "_make_backend", lambda cfg: object())
+    monkeypatch.setattr(run_ollama, "stream_run", _fake_stream_run)
+    run_ollama.main(["coder", "write it", "--no-status"])
+    out = capsys.readouterr().out
+    assert "BEGIN UNTRUSTED MODEL OUTPUT" in out  # frame opened around the live stream
+    assert "END UNTRUSTED MODEL OUTPUT" in out  # frame closed after it
+    assert "HELLO WORLD" in out  # streamed content present, inside the frame
+    assert out.count("HELLO WORLD") == 1  # NOT duplicated (no second wrap_output print)

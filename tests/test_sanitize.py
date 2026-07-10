@@ -118,3 +118,26 @@ def test_wrap_output_strips_invisible_characters_defense_in_depth():
     assert zwj not in wrapped
     assert bom not in wrapped
     assert "safetextwithinvisibleshere" in wrapped
+
+
+def test_open_output_frame_brackets_a_live_stream_with_matching_nonce_markers():
+    # R22b streaming path: the raw token stream is bracketed by nonce BEGIN/END markers
+    # (printed around dispatch's live stdout writes) instead of buffering + wrap_output.
+    # The header carries the untrusted-output marker; header and footer share ONE nonce so
+    # a forged in-stream `---END ... <guess>---` cannot terminate the real frame (2**-128).
+    from sanitize import open_output_frame
+
+    header, footer = open_output_frame(nonce_factory=lambda: "STREAMNONCE")
+    assert header.startswith("---BEGIN UNTRUSTED MODEL OUTPUT STREAMNONCE---\n")
+    assert "UNTRUSTED MODEL OUTPUT" in header  # the data-not-instructions marker line
+    assert footer == "\n---END UNTRUSTED MODEL OUTPUT STREAMNONCE---"
+    # header + <streamed content> + footer must reuse the SAME nonce on both ends
+    assert header.count("STREAMNONCE") == 1 and footer.count("STREAMNONCE") == 1
+
+
+def test_open_output_frame_uses_a_fresh_128bit_nonce_per_call_by_default():
+    from sanitize import open_output_frame
+
+    h1, f1 = open_output_frame()
+    h2, f2 = open_output_frame()
+    assert h1 != h2 and f1 != f2  # fresh per call, unpredictable (not a static banner)

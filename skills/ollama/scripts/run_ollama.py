@@ -45,7 +45,7 @@ from ollama_stream import stream_run
 from ollama_vision import stream_vision
 from parse_output import parse_agent_output
 from run_lock import remove_lock, staleness_bound_for_timeout, write_lock
-from sanitize import build_user_prompt, wrap_output
+from sanitize import build_user_prompt, open_output_frame, wrap_output
 from scheduler import Scheduler
 from startup_hardening import (
     enable_utf8_console_io,
@@ -1002,6 +1002,25 @@ def run_delegation(ns: argparse.Namespace) -> int:
                 stats = TokenStats()
                 if display is not None:
                     display.update(ns.capability, "running")
+                # R22b sink strategy: a STREAMING capability writes RAW deltas to stdout
+                # live inside `dispatch` (stdout_sink), so we bracket that live stream with
+                # nonce BEGIN/END markers (`open_output_frame`) — the streamed output reaches
+                # Claude already framed as untrusted data, with NO second `wrap_output` print
+                # of the same content (which would both DUPLICATE the output on stdout and
+                # leave the streamed copy unframed, defeating R22b). A TRANSACTIONAL
+                # capability streams nothing to stdout, so its single buffered result is
+                # `wrap_output`'d once below. `is_streaming` mirrors `_run_once`'s OWN
+                # streaming choice (per-capability `[stream]` true AND not a schema
+                # capability — schema never streams).
+                is_streaming = (
+                    bool(cfg.stream.get(ns.capability))
+                    and cfg.structured.get(ns.capability) != "schema"
+                )
+                frame_footer = ""
+                if is_streaming:
+                    frame_header, frame_footer = open_output_frame()
+                    sys.stdout.write(frame_header)
+                    sys.stdout.flush()
                 result = dispatch(
                     ns.capability,
                     prompt,
@@ -1018,14 +1037,18 @@ def run_delegation(ns: argparse.Namespace) -> int:
                 _write_artifacts(output_dir, ns.capability, prompt, result, stats, errbuf)
                 if display is not None:
                     display.update(ns.capability, "success", tok_per_s=result.tok_per_s)
-                # The reviewable output is the validated structured dict (`.parsed`)
-                # when present, else the raw text content -- both untrusted data for
-                # Claude to review, never auto-applied.
-                review = result.parsed if result.parsed is not None else result.content
-                rendered = review if isinstance(review, str) else json.dumps(review, indent=2)
-                # R22b: nonce-wrap the delegated output before Claude ever sees it —
-                # untrusted model output, never auto-applied (R8/R14).
-                print(wrap_output(rendered))  # Claude reviews stdout before applying
+                if is_streaming:
+                    # Close the nonce frame around the raw deltas already streamed above.
+                    sys.stdout.write(frame_footer + "\n")
+                    sys.stdout.flush()
+                else:
+                    # Transactional: the reviewable output is the validated structured dict
+                    # (`.parsed`) when present, else the raw text content -- buffered, so
+                    # nonce-wrap it once for Claude. Untrusted data, never auto-applied
+                    # (R8/R14).
+                    review = result.parsed if result.parsed is not None else result.content
+                    rendered = review if isinstance(review, str) else json.dumps(review, indent=2)
+                    print(wrap_output(rendered))  # Claude reviews stdout before applying
         except TimeoutError:
             # R20: a timed-out delegation gets its own distinguishable state (not the
             # generic "failed") -- the display update itself never raises (guarded

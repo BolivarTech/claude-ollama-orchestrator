@@ -99,6 +99,40 @@ def build_user_prompt(
     return f"---BEGIN USER CONTEXT {nonce}---\n{clean}\n---END USER CONTEXT {nonce}---"
 
 
+def open_output_frame(
+    *, nonce_factory: Callable[[], str] = lambda: secrets.token_hex(16)
+) -> tuple[str, str]:
+    """Return ``(header, footer)`` nonce-delimited markers to bracket a LIVE stream of
+    untrusted model output (R22b, streaming path).
+
+    The transactional path buffers the whole output and :func:`wrap_output`s it in one
+    shot. The streaming path (R7b) writes raw deltas to stdout token-by-token as they
+    arrive and cannot buffer first without destroying the "visible streaming" feature —
+    so the caller prints ``header`` BEFORE the stream, lets the raw deltas flow, then
+    prints ``footer`` AFTER, framing the live stream as untrusted data for Claude with the
+    SAME `[UNTRUSTED MODEL OUTPUT …]` marker and nonce-delimiter scheme
+    :func:`wrap_output` uses (the format lives HERE, not duplicated at the call site).
+
+    Unlike :func:`wrap_output`, no fail-closed collision check is possible on a
+    not-yet-produced stream; the 128-bit nonce makes a forged in-stream
+    ``---END UNTRUSTED MODEL OUTPUT <guess>---`` cryptographically infeasible (2**-128) to
+    terminate the real frame — the structural guarantee. ``header`` and ``footer`` share
+    ONE nonce so they always match.
+
+    Args:
+        nonce_factory: Returns the shared framing nonce (injectable for tests).
+
+    Returns:
+        A ``(header, footer)`` pair: ``header`` opens the frame (BEGIN marker + the
+        untrusted-output notice, newline-terminated so the stream starts on its own line);
+        ``footer`` closes it (leading newline + END marker).
+    """
+    nonce = nonce_factory()
+    header = f"---BEGIN UNTRUSTED MODEL OUTPUT {nonce}---\n{_OUTPUT_MARKER}\n"
+    footer = f"\n---END UNTRUSTED MODEL OUTPUT {nonce}---"
+    return header, footer
+
+
 def wrap_output(
     content: str, *, nonce_factory: Callable[[], str] = lambda: secrets.token_hex(16)
 ) -> str:
