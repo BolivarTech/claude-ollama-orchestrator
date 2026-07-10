@@ -1941,6 +1941,29 @@ def test_run_one_delegation_uses_real_dispatch_path(monkeypatch):
     assert seen == ["real-dispatch-output"]
 
 
+@pytest.mark.parametrize("media_cap", ["vision", "transcribe"])
+def test_run_one_delegation_rejects_media_caps_fail_closed(media_cap, monkeypatch):
+    """The batch/fan-out worker's `_Job` carries only (cap, model, prompt) -- no field for a
+    media file path -- so vision/transcribe cannot be dispatched through it. Rather than
+    SILENTLY misroute a media cap (dispatch with no image/audio), the worker fail-closes with
+    an actionable DelegationError, so a future fan-out wiring can never route media caps here.
+    The single-delegation CLI path (run_delegation) is the supported route for media."""
+    import run_ollama
+    from errors import DelegationError
+
+    monkeypatch.setattr(
+        run_ollama,
+        "dispatch",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not dispatch a media cap")),
+    )
+    monkeypatch.setattr(run_ollama, "_make_backend", lambda cfg: object())
+    monkeypatch.setattr(run_ollama, "load_system_prompt", lambda cap: "sys")
+    config = run_ollama._cfg_for_batch(max_parallel_agents=2, max_queued_agents=10)
+    job = run_ollama._Job(cap=media_cap, model="m", prompt="p")
+    with pytest.raises(DelegationError):
+        run_ollama._run_one_delegation(job, config, None)
+
+
 def test_run_batch_worker_none_drives_run_one_delegation(tmp_path, monkeypatch):
     # WARNING fix #4: the default `_worker=None` path in `run_batch` itself must
     # call `_run_one_delegation` via `asyncio.to_thread(...)` (kept, seventh

@@ -1751,9 +1751,23 @@ def _run_one_delegation(
 
     Raises:
         OllamaBackendError, TimeoutError, RateLimitError, ValidationError,
-        DelegationError: propagated as-is from `dispatch()`/the backend — the caller
-        (`_execute_delegation`) classifies these.
+        DelegationError: for a media capability (vision/transcribe) -- the batch `_Job`
+            has no field to carry the required media-file path, so this fail-closes rather
+            than silently misroute; and propagated as-is from `dispatch()`/the backend for
+            everything else — the caller (`_execute_delegation`) classifies these.
     """
+    # Fail-closed media guard (R2): `_Job` carries only (cap, model, prompt) -- it CANNOT
+    # carry the image/audio path vision/transcribe require. Dispatching a media cap here
+    # would silently misroute (a vision call with no image, etc.). Reject it explicitly so a
+    # future fan-out wiring can never route media caps through the batch path; the supported
+    # route for media is the single-delegation CLI path (`run_delegation`), which threads the
+    # media file through to `stream_vision`/`transcribe`.
+    if job.cap in _MEDIA_INPUT_CAPS:
+        raise DelegationError(
+            f"the batch/fan-out path does not support the media capability {job.cap!r} "
+            "(its input is a media-file path the batch _Job cannot carry); use the "
+            f"single-delegation path instead (/ollama {job.cap} <file>)"
+        )
     backend = _make_backend(config)
     return dispatch(
         job.cap,
