@@ -383,6 +383,21 @@ def make_file_sink(path: str) -> "_FileSink":
 _MS1_UNSUPPORTED_CAPS = frozenset({"vision", "transcribe"})
 
 
+def _capability_streams_to_stdout(config: OllamaAgentsConfig, capability: str) -> bool:
+    """Return True iff *capability* streams live deltas (R7b/R7c) rather than running
+    transactional.
+
+    The SINGLE source of truth for the streaming-vs-transactional choice, shared by
+    :func:`_run_once` (to route to ``stream_run``/``stream_vision`` vs ``backend.run``)
+    and :func:`run_delegation` (to decide R22b live-frame vs buffered ``wrap_output``), so
+    the two can never drift out of sync. A capability streams when its per-capability
+    ``[stream]`` flag is true AND it is not a ``schema`` capability — schema output is
+    parsed/validated, never streamed (making "structured → transactional" a code
+    invariant, not just a config default a user could override).
+    """
+    return bool(config.stream.get(capability)) and config.structured.get(capability) != "schema"
+
+
 def _run_once(
     capability: str,
     system_prompt: str,
@@ -435,8 +450,7 @@ def _run_once(
     # attempt's raw tokens with the retry's on the same sink. The spec's config rationale
     # is "structured/corto → transactional"; making it a code invariant (not just the
     # reviewer/tester [stream]=false default a user could override) closes that gap.
-    is_schema = config.structured.get(capability) == "schema"
-    if bool(config.stream.get(capability)) and sink is not None and not is_schema:
+    if _capability_streams_to_stdout(config, capability) and sink is not None:
         fn = stream_vision if capability == "vision" else stream_run
         return fn(
             config,
@@ -1012,36 +1026,40 @@ def run_delegation(ns: argparse.Namespace) -> int:
                 # `wrap_output`'d once below. `is_streaming` mirrors `_run_once`'s OWN
                 # streaming choice (per-capability `[stream]` true AND not a schema
                 # capability — schema never streams).
-                is_streaming = (
-                    bool(cfg.stream.get(ns.capability))
-                    and cfg.structured.get(ns.capability) != "schema"
-                )
+                is_streaming = _capability_streams_to_stdout(cfg, ns.capability)
                 frame_footer = ""
                 if is_streaming:
                     frame_header, frame_footer = open_output_frame()
                     sys.stdout.write(frame_header)
                     sys.stdout.flush()
-                result = dispatch(
-                    ns.capability,
-                    prompt,
-                    backend=_make_backend(cfg),
-                    model=model,
-                    timeout=ns.timeout,
-                    system_prompt=system_prompt,
-                    config=cfg,
-                    stats=stats,
-                    # R7c: this CLI drives exactly ONE delegation at a time (concurrency
-                    # is MS5) -- the single-in-flight case always gets the stdout sink.
-                    sink=stdout_sink,
-                )
+                try:
+                    result = dispatch(
+                        ns.capability,
+                        prompt,
+                        backend=_make_backend(cfg),
+                        model=model,
+                        timeout=ns.timeout,
+                        system_prompt=system_prompt,
+                        config=cfg,
+                        stats=stats,
+                        # R7c: this CLI drives exactly ONE delegation at a time (concurrency
+                        # is MS5) -- the single-in-flight case always gets the stdout sink.
+                        sink=stdout_sink,
+                    )
+                finally:
+                    if is_streaming:
+                        # ALWAYS close the R22b nonce frame around the (possibly partial)
+                        # streamed deltas -- even if `dispatch` raised. An unterminated BEGIN
+                        # marker left on stdout would keep the untrusted-output frame open
+                        # around whatever the error handler prints next, breaking R22b's
+                        # framing integrity on the error path (the frame's whole point is
+                        # that Claude can trust the BEGIN..END bounds).
+                        sys.stdout.write(frame_footer + "\n")
+                        sys.stdout.flush()
                 _write_artifacts(output_dir, ns.capability, prompt, result, stats, errbuf)
                 if display is not None:
                     display.update(ns.capability, "success", tok_per_s=result.tok_per_s)
-                if is_streaming:
-                    # Close the nonce frame around the raw deltas already streamed above.
-                    sys.stdout.write(frame_footer + "\n")
-                    sys.stdout.flush()
-                else:
+                if not is_streaming:
                     # Transactional: the reviewable output is the validated structured dict
                     # (`.parsed`) when present, else the raw text content -- buffered, so
                     # nonce-wrap it once for Claude. Untrusted data, never auto-applied

@@ -3042,3 +3042,40 @@ def test_streaming_output_to_claude_is_nonce_framed_and_not_duplicated(
     assert "END UNTRUSTED MODEL OUTPUT" in out  # frame closed after it
     assert "HELLO WORLD" in out  # streamed content present, inside the frame
     assert out.count("HELLO WORLD") == 1  # NOT duplicated (no second wrap_output print)
+
+
+def test_streaming_frame_is_closed_even_when_dispatch_raises(capsys, monkeypatch, tmp_path):
+    # R22b framing integrity on the ERROR path (MAGI WARNING fix): if a streaming
+    # delegation fails AFTER the BEGIN marker is printed, the END marker must STILL be
+    # written (a `finally`), so no unterminated untrusted-output frame is left open on
+    # stdout around whatever the error handler prints next.
+    monkeypatch.chdir(tmp_path)
+    import run_ollama
+    from errors import OllamaBackendError
+
+    def _boom_stream_run(
+        config,
+        system_prompt,
+        prompt,
+        model,
+        timeout,
+        *,
+        sink,
+        response_format=None,
+        max_output_bytes=None,
+    ):
+        sink("PARTIAL")  # some tokens stream out to stdout...
+        raise OllamaBackendError("mid-stream failure")  # ...then the delegation fails
+
+    cfg = _cfg_with_structured()  # coder: streaming path
+    monkeypatch.setattr(run_ollama, "resolve_config", lambda **kw: cfg)
+    monkeypatch.setattr(run_ollama, "preflight", lambda cfg, **kw: None)
+    monkeypatch.setattr(run_ollama, "load_system_prompt", lambda cap: "sys")
+    monkeypatch.setattr(run_ollama, "_make_backend", lambda cfg: object())
+    monkeypatch.setattr(run_ollama, "stream_run", _boom_stream_run)
+    rc = run_ollama.main(["coder", "write it", "--no-status"])
+    out = capsys.readouterr().out
+    assert "BEGIN UNTRUSTED MODEL OUTPUT" in out
+    assert "END UNTRUSTED MODEL OUTPUT" in out  # frame CLOSED despite the mid-stream failure
+    assert "PARTIAL" in out  # the partial stream sits inside the closed frame
+    assert rc != 0  # the delegation still reports failure
