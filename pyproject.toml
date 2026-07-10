@@ -20,6 +20,10 @@ asyncio_mode = "auto"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# The atheris fuzzing harness (CI/milestone gate, CLAUDE.local.md §0.3) deliberately
+# imports after a sys.path insert and inside atheris.instrument_imports() — patterns that
+# legitimately violate E402; it is not part of the linted plugin surface.
+exclude = ["fuzz"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -28,7 +32,7 @@ mypy_path = "skills/ollama/scripts"
 explicit_package_bases = true
 # Local developer tooling (gitignored, from BolivarTech/AI_Tools) is not held to
 # the plugin's strict typecheck. Harmless in the public repo (the dir is absent).
-exclude = ['^scripts/']
+exclude = ['^scripts/', '^fuzz/']
 
 [[tool.mypy.overrides]]
 module = "_pytest.*"
