@@ -25,19 +25,11 @@ from collections.abc import Callable
 from typing import Any
 
 from backend import DelegationResult, estimate_tokens, make_redactor
-from binary_input import load_binary
+from binary_input import audio_mime_from_bytes, load_binary
 from errors import OllamaBackendError
 from ollama_config import OllamaAgentsConfig
 from ollama_stream import stream_run
 
-# Audio MIME by extension for the multipart upload / content-part (defensive default).
-_AUDIO_MIME: dict[str, str] = {
-    ".wav": "audio/wav",
-    ".mp3": "audio/mpeg",
-    ".flac": "audio/flac",
-    ".ogg": "audio/ogg",
-}
-_DEFAULT_AUDIO_MIME = "audio/wav"
 _MULTIMODAL_AUDIO_HINTS = ("gemma", "qwen2-audio", "whisper", "audio")
 
 # Upper bound (seconds) on the capability-probe's OWN GET (INFO fix): the probe must never
@@ -89,10 +81,6 @@ def _default_multimodal_audio(model: str) -> bool:
     """
     m = model.lower()
     return any(hint in m for hint in _MULTIMODAL_AUDIO_HINTS)
-
-
-def _audio_mime(path: str) -> str:
-    return _AUDIO_MIME.get(os.path.splitext(path)[1].lower(), _DEFAULT_AUDIO_MIME)
 
 
 def transcribe(
@@ -313,7 +301,7 @@ def _via_audio_endpoint(
         file_field="file",
         filename=os.path.basename(audio_path),
         file_bytes=data,
-        mime=_audio_mime(audio_path),
+        mime=audio_mime_from_bytes(data),
     )
     req = urllib.request.Request(
         endpoint, data=body, method="POST", headers={"Content-Type": content_type}
@@ -358,7 +346,7 @@ def _via_audio_chat(
 ) -> DelegationResult:
     """Send audio as an ``input_audio`` chat content-part (audio-multimodal models)."""
     b64 = base64.b64encode(data).decode("ascii")
-    fmt = _audio_mime(audio_path).split("/", 1)[1]
+    fmt = audio_mime_from_bytes(data).split("/", 1)[1]
     content_parts = [
         {"type": "text", "text": "Transcribe this audio verbatim."},
         {"type": "input_audio", "input_audio": {"data": b64, "format": fmt}},
