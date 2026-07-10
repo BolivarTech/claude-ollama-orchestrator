@@ -1420,7 +1420,7 @@ def _reject_if_circuit_open(
     `_run_batch_serial_fast_path` calls it once for its single job.
 
     This is a READ-ONLY check — it calls `breaker.is_definitively_open(...)`, NEVER
-    `breaker.is_open(...)`/`try_enter(...)`. A job this check lets through (returns
+    `breaker._is_open(...)`/`try_enter(...)`. A job this check lets through (returns
     `None`) is NOT guaranteed to ever actually execute — the general path's caller may
     still overflow-reject it in the `Scheduler` (R21b) before it ever reaches
     `_execute_delegation`. Because `is_definitively_open` never reserves anything, a job
@@ -1866,7 +1866,7 @@ async def run_batch(
     # NEVER occupies a semaphore/queue slot — it cannot crowd out a healthy sibling's
     # spot against the max_parallel_agents + max_queued_agents ceiling (R21/R21b). This
     # is a READ-ONLY check (`_reject_if_circuit_open` uses `is_definitively_open`, never
-    # the reserving `is_open`/`try_enter`) — a job that passes here and is later
+    # the reserving `_is_open`/`try_enter`) — a job that passes here and is later
     # overflow-rejected by the `Scheduler` below (never reaching `_execute_delegation`)
     # can no longer have leaked a half-open probe reservation.
     results: list[Any] = [None] * len(jobs)

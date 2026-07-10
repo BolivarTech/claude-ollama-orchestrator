@@ -1709,7 +1709,7 @@ def test_run_batch_breaker_ignores_validation_and_delegation_errors(tmp_path):
         jobs, _job=_job, max_parallel=2, max_queued=10, output_dir=str(tmp_path), breaker=breaker
     )
     assert isinstance(results[0], ValidationError)
-    assert breaker.is_open("m", now=0.0) is False  # never trips the breaker
+    assert breaker._is_open("m", now=0.0) is False  # never trips the breaker
 
 
 def test_run_batch_breaker_opens_after_k_real_backend_errors(tmp_path):
@@ -1729,7 +1729,7 @@ def test_run_batch_breaker_opens_after_k_real_backend_errors(tmp_path):
         jobs, _job=_job, max_parallel=2, max_queued=10, output_dir=str(tmp_path), breaker=breaker
     )
     assert all(isinstance(r, OllamaBackendError) for r in results)
-    assert breaker.is_open("m", now=0.0) is True  # 2 real backend failures trip it
+    assert breaker._is_open("m", now=0.0) is True  # 2 real backend failures trip it
 
 
 def test_run_batch_breaker_ignores_rate_limit_errors(tmp_path):
@@ -1748,7 +1748,7 @@ def test_run_batch_breaker_ignores_rate_limit_errors(tmp_path):
         jobs, _job=_job, max_parallel=2, max_queued=10, output_dir=str(tmp_path), breaker=breaker
     )
     assert isinstance(results[0], RateLimitError)
-    assert breaker.is_open("m", now=0.0) is False  # never trips the breaker
+    assert breaker._is_open("m", now=0.0) is False  # never trips the breaker
 
 
 def test_run_batch_rmtrees_managed_output_dir_on_interrupt(tmp_path, monkeypatch):
@@ -1819,7 +1819,7 @@ def test_run_batch_probe_cancellation_releases_slot_for_a_later_probe(tmp_path):
     # forever (is_open would keep returning True) — 1e15 is far beyond any real
     # loop.time() value, so this proves the slot was released, not that the
     # cooldown merely happened to elapse.
-    assert breaker.is_open("flaky:cloud", now=1e15) is False  # a LATER probe is admitted
+    assert breaker._is_open("flaky:cloud", now=1e15) is False  # a LATER probe is admitted
 
 
 def test_run_one_delegation_uses_real_dispatch_path(monkeypatch):
@@ -1915,7 +1915,7 @@ def test_process_wide_breaker_singleton_persists_failure_count_across_batches(
         jobs_batch_1, _job=_job, max_parallel=2, max_queued=10, output_dir=str(tmp_path)
     )
     assert all(isinstance(r, OllamaBackendError) for r in r1)
-    assert run_ollama._PROCESS_CIRCUIT_BREAKER.is_open(model, now=0.0) is False
+    assert run_ollama._PROCESS_CIRCUIT_BREAKER._is_open(model, now=0.0) is False
 
     # Batch 2 -- a SEPARATE call, still no `breaker=` passed. Only ONE more
     # failure is needed to reach threshold=3; this is only possible if the
@@ -1926,7 +1926,7 @@ def test_process_wide_breaker_singleton_persists_failure_count_across_batches(
         jobs_batch_2, _job=_job, max_parallel=1, max_queued=0, output_dir=str(tmp_path)
     )
     assert isinstance(r2[0], OllamaBackendError)
-    assert run_ollama._PROCESS_CIRCUIT_BREAKER.is_open(model, now=0.0) is True
+    assert run_ollama._PROCESS_CIRCUIT_BREAKER._is_open(model, now=0.0) is True
 
 
 def test_run_batch_restores_sys_stderr_to_the_original_after_returning(tmp_path):
@@ -2037,7 +2037,7 @@ def test_run_batch_outer_interrupt_releases_probe_for_a_job_never_reached_by_one
     # fail-fast `breaker.is_open` check in `run_batch`, before `Scheduler.run_all`
     # ever got a chance to run -- let alone `_one()`'s own except clause) would stay
     # reserved forever.
-    assert breaker.is_open("flaky:cloud", now=1e15) is False
+    assert breaker._is_open("flaky:cloud", now=1e15) is False
 
 
 def test_run_batch_interrupt_evicts_the_dead_executor_from_the_loop_cache(tmp_path):
@@ -2255,8 +2255,8 @@ def test_general_and_serial_paths_both_route_through_execute_delegation_for_rate
         breaker=breaker_parallel,
     )
     assert all(isinstance(r, RateLimitError) for r in results_parallel)
-    assert breaker_parallel.is_open("m1", now=0.0) is False
-    assert breaker_parallel.is_open("m2", now=0.0) is False
+    assert breaker_parallel._is_open("m1", now=0.0) is False
+    assert breaker_parallel._is_open("m2", now=0.0) is False
 
     breaker_serial = CircuitBreaker(threshold=1, cooldown=1e9)
     jobs_serial = [run_ollama._Job(cap="coder", model="m3", prompt="p")]
@@ -2269,7 +2269,7 @@ def test_general_and_serial_paths_both_route_through_execute_delegation_for_rate
         breaker=breaker_serial,
     )
     assert isinstance(results_serial[0], RateLimitError)
-    assert breaker_serial.is_open("m3", now=0.0) is False
+    assert breaker_serial._is_open("m3", now=0.0) is False
 
     # Both concurrency shapes actually routed through the shared core.
     assert "m1" in calls and "m2" in calls and "m3" in calls
@@ -2396,7 +2396,7 @@ def test_run_batch_overflow_rejected_half_open_job_does_not_leak_the_probe(tmp_p
     # (threshold=1, so a fresh failure would immediately reopen -- but here we
     # just confirm the circuit is CLOSED, proving the earlier probe resolved
     # cleanly and nothing was left stuck from the overflow-rejected job).
-    assert breaker.is_open("flaky:cloud", now=1.0) is False
+    assert breaker._is_open("flaky:cloud", now=1.0) is False
 
 
 def test_run_batch_two_concurrent_half_open_candidates_exactly_one_becomes_probe(tmp_path):
@@ -2438,7 +2438,7 @@ def test_run_batch_two_concurrent_half_open_candidates_exactly_one_becomes_probe
     assert len(successes) >= 1
     # The probe resolved (record_success) -- the model is healthy again, and
     # nothing was left permanently reserved for the one that fast-failed.
-    assert breaker.is_open("flaky:cloud", now=1.0) is False
+    assert breaker._is_open("flaky:cloud", now=1.0) is False
 
 
 def test_run_batch_serial_fast_path_releases_probe_on_success(tmp_path):
@@ -2462,7 +2462,7 @@ def test_run_batch_serial_fast_path_releases_probe_on_success(tmp_path):
         jobs, _job=_job, max_parallel=1, max_queued=0, output_dir=str(tmp_path), breaker=breaker
     )
     assert getattr(results[0], "content", None) == "ok"
-    assert breaker.is_open("flaky:cloud", now=1.0) is False  # closed by record_success
+    assert breaker._is_open("flaky:cloud", now=1.0) is False  # closed by record_success
 
 
 def test_run_batch_serial_fast_path_releases_probe_on_failure(tmp_path):
@@ -2491,9 +2491,9 @@ def test_run_batch_serial_fast_path_releases_probe_on_failure(tmp_path):
     # the failed probe REOPENED for a fresh, FINITE cooldown -- not left CLOSED (record_success
     # would pop `open_until` -> is_open(0.0) False) and not STUCK in "probe in flight" forever
     # (a leaked probe -> is_open(1e15) True, since try_enter would keep returning "open").
-    assert breaker.is_open("flaky:cloud", now=0.0) is True  # reopened -> still open right after
+    assert breaker._is_open("flaky:cloud", now=0.0) is True  # reopened -> still open right after
     assert (
-        breaker.is_open("flaky:cloud", now=1e15) is False
+        breaker._is_open("flaky:cloud", now=1e15) is False
     )  # fresh cooldown elapsed -> a later probe is admitted (not stuck)
 
 

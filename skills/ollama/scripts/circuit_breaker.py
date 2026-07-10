@@ -98,7 +98,7 @@ class CircuitBreaker:
         Use when the probe delegation is cancelled/interrupted rather than
         succeeding or failing — e.g. Ctrl-C mid-probe, or a `BaseException`
         escaping `run_batch`'s fan-out. Without this, `model` would stay in
-        `_half_open_probe` forever: `is_open` would keep returning `True`
+        `_half_open_probe` forever: `_is_open` would keep returning `True`
         indefinitely (a "probe in flight" that never resolves), so no future
         caller could ever be admitted as a new probe — the model would be
         permanently blocked.
@@ -126,7 +126,7 @@ class CircuitBreaker:
         of them ever reaches the `Scheduler`. A job that filter lets through
         may still be overflow-rejected by the `Scheduler` before it ever runs
         (R21/R21b); if THIS method had reserved a probe for it (the way
-        `is_open`/`try_enter` do), that reservation would leak forever, since
+        `_is_open`/`try_enter` do), that reservation would leak forever, since
         an overflow-rejected job never reaches `_execute_delegation` to
         release it. Because this method never reserves anything, calling it
         on a job that never executes is always harmless.
@@ -188,20 +188,20 @@ class CircuitBreaker:
             self._half_open_probe.add(model)  # cooldown elapsed -> reserve the probe slot
             return "probe"
 
-    def is_open(self, model: str, now: float) -> bool:
-        """Boolean :meth:`try_enter` alias — True iff the circuit is OPEN, **and, as a
+    def _is_open(self, model: str, now: float) -> bool:
+        """PRIVATE, TEST-FACING boolean helper — True iff the circuit is OPEN, **and, as a
         SIDE EFFECT, reserves the half-open probe slot on the first call after cooldown**.
 
-        ⚠ NOT a pure predicate despite the name: this MUTATES breaker state — it is
-        literally ``try_enter(model, now) == "open"``. **Production code must NEVER call
-        it.** The two, and only two, entry points production uses are
-        :meth:`is_definitively_open` (a read-only, never-reserving peek — for a
-        speculative or pre-scheduling check on a delegation that might not run) and
-        :meth:`try_enter` (the sole reserving call, made exactly once immediately before a
-        delegation runs). ``is_open`` exists ONLY as a test-facing convenience for
-        asserting the combined boolean; calling it speculatively on a delegation that may
-        not execute would leak the probe slot — the exact bug
-        :meth:`is_definitively_open` was introduced to prevent.
+        The leading underscore is deliberate: this is **not part of the public API**. It
+        MUTATES breaker state (it is literally ``try_enter(model, now) == "open"``), so a
+        bare predicate name would be an attractive nuisance — a caller who assumed it was
+        pure would leak the probe slot and permanently block a model (the exact bug
+        :meth:`is_definitively_open` exists to prevent). Production code uses only the two
+        public entry points: :meth:`is_definitively_open` (a read-only, never-reserving
+        peek — for a speculative or pre-scheduling check on a delegation that might not
+        run) and :meth:`try_enter` (the sole reserving call, made exactly once immediately
+        before a delegation runs). This helper exists ONLY so tests can assert the combined
+        boolean without restating ``try_enter(...) == "open"`` at every call site.
 
         A ``"probe"`` result means THIS call was just admitted as the (sole) half-open
         probe — the delegation is meant to proceed, so that case reports ``False`` (not

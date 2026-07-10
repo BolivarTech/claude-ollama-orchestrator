@@ -13,15 +13,15 @@ def test_opens_after_threshold_failures_for_that_model_only():
     cb = CircuitBreaker(threshold=3, cooldown=10.0)
     for _ in range(3):
         cb.record_failure("minimax-m3:cloud", now=0.0)
-    assert cb.is_open("minimax-m3:cloud", now=1.0) is True
-    assert cb.is_open("kimi-k2.7-code:cloud", now=1.0) is False  # other model unaffected
+    assert cb._is_open("minimax-m3:cloud", now=1.0) is True
+    assert cb._is_open("kimi-k2.7-code:cloud", now=1.0) is False  # other model unaffected
 
 
 def test_reopens_closed_after_cooldown():
     cb = CircuitBreaker(threshold=1, cooldown=10.0)
     cb.record_failure("m", now=0.0)
-    assert cb.is_open("m", now=5.0) is True
-    assert cb.is_open("m", now=11.0) is False  # cooldown elapsed → half-open/closed
+    assert cb._is_open("m", now=5.0) is True
+    assert cb._is_open("m", now=11.0) is False  # cooldown elapsed → half-open/closed
 
 
 def test_success_resets_failure_count():
@@ -29,34 +29,34 @@ def test_success_resets_failure_count():
     cb.record_failure("m", now=0.0)
     cb.record_success("m")
     cb.record_failure("m", now=0.0)
-    assert cb.is_open("m", now=1.0) is False  # only 1 failure since reset
+    assert cb._is_open("m", now=1.0) is False  # only 1 failure since reset
 
 
 def test_half_open_allows_exactly_one_probe_after_cooldown():
     cb = CircuitBreaker(threshold=1, cooldown=10.0)
     cb.record_failure("m", now=0.0)
-    assert cb.is_open("m", now=11.0) is False  # cooldown elapsed -> probe #1 let through
-    assert cb.is_open("m", now=11.0) is True  # a 2nd concurrent caller sees it still open
+    assert cb._is_open("m", now=11.0) is False  # cooldown elapsed -> probe #1 let through
+    assert cb._is_open("m", now=11.0) is True  # a 2nd concurrent caller sees it still open
     # (the one probe hasn't resolved yet)
 
 
 def test_half_open_probe_success_closes_the_circuit():
     cb = CircuitBreaker(threshold=1, cooldown=10.0)
     cb.record_failure("m", now=0.0)
-    assert cb.is_open("m", now=11.0) is False  # the probe delegation
+    assert cb._is_open("m", now=11.0) is False  # the probe delegation
     cb.record_success("m")  # probe succeeded
-    assert cb.is_open("m", now=11.5) is False  # closed - back to normal operation
-    assert cb.is_open("m", now=999.0) is False  # stays closed, no lingering half-open state
+    assert cb._is_open("m", now=11.5) is False  # closed - back to normal operation
+    assert cb._is_open("m", now=999.0) is False  # stays closed, no lingering half-open state
 
 
 def test_half_open_probe_failure_reopens_for_a_fresh_cooldown():
     cb = CircuitBreaker(threshold=1, cooldown=10.0)
     cb.record_failure("m", now=0.0)
-    assert cb.is_open("m", now=11.0) is False  # the probe delegation
+    assert cb._is_open("m", now=11.0) is False  # the probe delegation
     cb.record_failure("m", now=11.0)  # probe failed
-    assert cb.is_open("m", now=12.0) is True  # re-opened immediately
-    assert cb.is_open("m", now=20.9) is True  # still within the fresh cooldown (11+10=21)
-    assert cb.is_open("m", now=21.5) is False  # fresh cooldown elapsed -> half-open again
+    assert cb._is_open("m", now=12.0) is True  # re-opened immediately
+    assert cb._is_open("m", now=20.9) is True  # still within the fresh cooldown (11+10=21)
+    assert cb._is_open("m", now=21.5) is False  # fresh cooldown elapsed -> half-open again
 
 
 def test_release_probe_after_cancellation_allows_a_later_probe():
@@ -66,19 +66,19 @@ def test_release_probe_after_cancellation_allows_a_later_probe():
     # state so a LATER probe is still admitted once that cooldown elapses.
     cb = CircuitBreaker(threshold=1, cooldown=10.0)
     cb.record_failure("m", now=0.0)
-    assert cb.is_open("m", now=11.0) is False  # probe #1 let through, slot reserved
-    assert cb.is_open("m", now=11.0) is True  # confirms the slot is indeed reserved
+    assert cb._is_open("m", now=11.0) is False  # probe #1 let through, slot reserved
+    assert cb._is_open("m", now=11.0) is True  # confirms the slot is indeed reserved
 
     cb.release_probe("m", now=11.2)  # probe #1 was cancelled, never resolved
-    assert cb.is_open("m", now=11.2) is True  # fresh cooldown just started -> still open
-    assert cb.is_open("m", now=21.3) is False  # fresh cooldown (11.2+10) elapsed -> a later
+    assert cb._is_open("m", now=11.2) is True  # fresh cooldown just started -> still open
+    assert cb._is_open("m", now=21.3) is False  # fresh cooldown (11.2+10) elapsed -> a later
     # probe is admitted (not stuck forever)
 
     # release_probe is a no-op for a model that was never mid-probe (e.g. called
     # defensively/unconditionally by run_batch for every job, not just probes).
     cb2 = CircuitBreaker(threshold=1, cooldown=10.0)
     cb2.release_probe("never-failed", now=5.0)
-    assert cb2.is_open("never-failed", now=5.0) is False
+    assert cb2._is_open("never-failed", now=5.0) is False
 
 
 def test_half_open_probe_slot_race_is_guarded_under_real_thread_concurrency():
@@ -96,7 +96,7 @@ def test_half_open_probe_slot_race_is_guarded_under_real_thread_concurrency():
 
     def probe() -> None:
         barrier.wait()
-        result = cb.is_open("m", now=11.0)
+        result = cb._is_open("m", now=11.0)
         with lock:
             admitted.append(result)
 
@@ -157,14 +157,14 @@ def test_try_enter_is_the_only_method_that_reserves_the_probe():
     assert cb.try_enter("m", now=21.5) == "probe"  # fresh cooldown elapsed -> reserves again
 
 
-def test_is_open_stays_a_backward_compatible_alias_of_try_enter():
-    # DRY: is_open must remain byte-identical in observable behavior to before
-    # this round's refactor -- it is now implemented purely in terms of try_enter
-    # (True iff try_enter(...) != "closed"), never a separately maintained copy of
-    # the check-and-reserve logic.
+def test_private_is_open_is_a_boolean_alias_of_try_enter():
+    # DRY: the private `_is_open` test helper is implemented purely in terms of try_enter
+    # (True iff try_enter(...) == "open"), never a separately maintained copy of the
+    # check-and-reserve logic -- so it reserves the probe exactly like try_enter and stays
+    # in lockstep with it.
     cb = CircuitBreaker(threshold=1, cooldown=10.0)
-    assert cb.is_open("healthy", now=0.0) is False
+    assert cb._is_open("healthy", now=0.0) is False
     cb.record_failure("m", now=0.0)
-    assert cb.is_open("m", now=5.0) is True
-    assert cb.is_open("m", now=11.0) is False  # reserves the probe, same as try_enter
-    assert cb.is_open("m", now=11.0) is True  # a 2nd caller sees it busy
+    assert cb._is_open("m", now=5.0) is True
+    assert cb._is_open("m", now=11.0) is False  # reserves the probe, same as try_enter
+    assert cb._is_open("m", now=11.0) is True  # a 2nd caller sees it busy
