@@ -356,6 +356,30 @@ def test_cleanup_leaves_in_range_slots_to_atomic_reclaim_sweeps_only_out_of_rang
     assert not os.path.exists(out_of_range)  # out-of-range orphan: swept
 
 
+def test_acquire_ephemeral_retries_a_transient_steal_replace_failure(tmp_path, monkeypatch):
+    """The reclaim's STEAL `os.replace(path -> steal)` is retried on a transient OSError (Windows
+    contention), matching the restore/release paths -- a fleeting hiccup must not abandon an
+    otherwise-valid reclaim of a stale lock."""
+    path = str(tmp_path / "eph.lock")
+    _write_ephemeral(path, pid=999_999, bound=60)  # stale (dead) holder
+    monkeypatch.setattr(run_lock, "is_pid_alive", lambda pid: pid == os.getpid())  # stale = dead
+    real_replace = run_lock.os.replace
+    steal = f"{path}.reclaim.{os.getpid()}"
+    state = {"fails": 2}
+
+    def _flaky_steal(src, dst):
+        if dst == steal and state["fails"] > 0:  # first attempts at the STEAL direction fail
+            state["fails"] -= 1
+            raise OSError("transient contention")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(run_lock.os, "replace", _flaky_steal)
+    monkeypatch.setattr(run_lock.time, "sleep", lambda _s: None)
+    assert run_lock._acquire_ephemeral(path, bound=60) is True  # retried the steal, then acquired
+    pid, _a, _b = run_lock._read_lock_fields(path)
+    assert pid == os.getpid()  # we now hold the lock
+
+
 def test_acquire_ephemeral_does_not_evict_a_live_lock_swapped_in_during_reclaim(
     tmp_path, monkeypatch
 ):

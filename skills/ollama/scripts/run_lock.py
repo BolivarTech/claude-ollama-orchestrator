@@ -660,12 +660,26 @@ def _acquire_ephemeral(path: str, bound: int) -> bool:
         # to a private name (`os.replace` moves exactly one file; only one racer can win a
         # given file), then inspect the STOLEN copy in isolation where no competitor can
         # mutate it:
-        try:
-            os.replace(path, steal_path)
-        except FileNotFoundError:
-            continue  # another reclaimer already took it -> retry (path may be free now)
-        except OSError:
-            return False
+        steal_gone = steal_perm_fail = False
+        for _steal_try in range(_RELEASE_RETRY_ATTEMPTS):
+            try:
+                os.replace(path, steal_path)
+                break  # claimed
+            except FileNotFoundError:
+                steal_gone = True  # another reclaimer already took it
+                break
+            except OSError:
+                # Transient Windows PermissionError (a concurrent reader/writer briefly holding
+                # `path`) clears on retry -- bounded, like the restore/release paths -- rather
+                # than immediately abandoning the reclaim on a fleeting contention hiccup.
+                if _steal_try == _RELEASE_RETRY_ATTEMPTS - 1:
+                    steal_perm_fail = True
+                else:
+                    time.sleep(_RELEASE_RETRY_DELAY_SECONDS)
+        if steal_perm_fail:
+            return False  # persistent contention -> give up (caller falls back to a file sink)
+        if steal_gone:
+            continue  # path vanished -> retry the outer reclaim loop (path may be free now)
         if _lockfile_holder_is_live(steal_path):
             # A competitor swapped in a LIVE lock during our window; we must NOT evict it.
             # Restore it (best-effort) and back off. The restore can, in a rare TRIPLE-race
