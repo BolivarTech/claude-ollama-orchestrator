@@ -640,10 +640,15 @@ def _acquire_ephemeral(path: str, bound: int) -> bool:
         # file sink, NEVER propagate and crash the delegation (total/never-raise).
         return False
     if fd is not None:
-        # Fresh create won: write the payload, ALWAYS closing the fd (no leak even if the
-        # write fails). A failed write means we hold an empty/torn file -> return False; its
-        # own mtime grace (rule 0) makes it reclaimable, so nothing is stranded.
-        return _write_close_ephemeral(fd, payload)
+        # Fresh create won: write the payload, ALWAYS closing the fd. On write failure the
+        # (empty/torn) file is OURS -- O_EXCL guarantees no competitor created it -- so REMOVE it
+        # rather than leave it to occupy `path` until its mtime grace expires (Caspar residual:
+        # an empty lockfile briefly blocking the slot/token). Its own mtime grace would self-heal
+        # it, but proactively removing our own failed creation is cleaner and faster.
+        if _write_close_ephemeral(fd, payload):
+            return True
+        _remove_quiet(path)
+        return False
     steal_path = f"{path}.reclaim.{os.getpid()}"
     for _ in range(_EPHEMERAL_RECLAIM_RETRIES):
         if _lockfile_holder_is_live(path):
@@ -696,6 +701,7 @@ def _acquire_ephemeral(path: str, bound: int) -> bool:
         except OSError:
             return False
         if not _write_close_ephemeral(fd, payload):  # ALWAYS closes the fd (no leak)
+            _remove_quiet(path)  # our own O_EXCL-created empty/torn file -> remove, don't strand
             return False
         pid, _age, _bound = _read_lock_fields(path)  # ownership re-verification
         if pid == os.getpid():

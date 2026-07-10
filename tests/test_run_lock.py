@@ -508,6 +508,7 @@ def test_acquire_ephemeral_closes_fd_when_write_fails_no_descriptor_leak(tmp_pat
     result = run_lock._acquire_ephemeral(path, bound=60)
     assert result is False  # write failed -> could not acquire the token
     assert len(closed) == 1  # the opened fd was closed exactly once, not leaked
+    assert not os.path.exists(path)  # our empty/torn creation is removed, not left to block
 
 
 def test_release_slot_is_idempotent(tmp_path):
