@@ -156,3 +156,19 @@ def test_hunk_header_with_trailing_section_heading_is_still_parsed():
     )
     files, ranges = parse_diff(diff)
     assert ranges["src/app.py"] == {11, 12}
+
+
+def test_validate_findings_keeps_a_finding_that_makes_no_file_claim():
+    # R30 grounds findings that CLAIM a file ABSENT from the diff -- it must NOT drop a
+    # legitimate general finding that cites no file at all (file/line are OPTIONAL in the
+    # reviewer schema, MS7 Task 7). A None-path finding falls through the file check and is
+    # kept, unannotated (there is no line to range-check).
+    from diff_guard import validate_findings
+
+    diff = "--- a/f.py\n+++ b/f.py\n@@ -1,1 +1,2 @@\n line\n+added\n"
+    fileless = {"severity": "info", "title": "overall approach is sound", "detail": "..."}
+    real = {"severity": "warning", "title": "x", "detail": "y", "file": "f.py", "line": 2}
+    kept, dropped = validate_findings([fileless, real], diff)
+    assert fileless in kept  # a finding with no `file` key is NOT dropped
+    assert real in kept
+    assert dropped == []

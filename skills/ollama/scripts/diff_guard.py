@@ -16,6 +16,16 @@ use small hand-written diff fixtures (Task 1, Step 1); corpus/property tests aga
 ``git diff`` / ``git diff --binary`` output (varied hunk shapes, mode changes, multi-file
 renames, combined diffs) should be added once the module is actually implemented, to catch
 parser edge cases synthetic fixtures miss.
+
+Known parser limitation (accepted, documented, low-impact): the parser does not track a
+hunk's declared line COUNT, so an ADDED line whose own content starts with ``++ `` (the
+full line reads ``+++ ...``) or a REMOVED line whose content starts with ``-- ``
+(``--- ...``) is misread as a ``+++``/``---`` file-header, registering a phantom file. The
+effect is strictly a FALSE NEGATIVE — the guard may FAIL TO DROP a fabricated-file finding,
+never dropping a real one — and the guard is defense-in-depth over Claude's own review
+(diff-grounding is optional/scope-gated, R30). A fully robust fix tracks the
+``@@ -a,b +c,d @@`` counts to know exactly when a hunk body ends; deferred with the corpus
+tests above as it requires that hunk-length bookkeeping.
 """
 
 from __future__ import annotations
@@ -133,11 +143,20 @@ def validate_findings(
         dropped: list[dict[str, Any]] = []
         for f in findings:
             path = f.get("file")
-            if path not in files:
-                dropped.append(f)  # fabricated file → hard-drop
+            if path is not None and path not in files:
+                # A finding CLAIMING a file that is ABSENT from the diff is a fabrication →
+                # hard-drop. A finding making NO file claim (`file` omitted — it is optional
+                # in the reviewer schema, MS7 Task 7) is a legitimate general observation:
+                # it falls through here and is kept (the line check below is a no-op for it,
+                # since `ranges.get(None)` is empty). R30 grounds CLAIMS, never penalizes the
+                # absence of a claim.
+                dropped.append(f)
                 continue
             line = f.get("line")
-            if isinstance(line, int):
+            # Range-check only a finding that BOTH names a (touched) file and a line — a
+            # fileless finding (`path is None`) has no changed-line range to check against
+            # and is kept as-is (no annotation).
+            if path is not None and isinstance(line, int):
                 changed = ranges.get(path, set())
                 if changed and not any(abs(line - c) <= margin for c in changed):
                     f = {**f, "annotation": "[outside changed range]"}
