@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable, NoReturn
 
-from errors import OllamaBackendError
+from errors import OllamaBackendError, RateLimitError
 from ollama_config import OllamaAgentsConfig
 
 _REDACTED = "***"
@@ -530,10 +530,19 @@ class OllamaBackend(AgentBackend):
                 return self._call_once(req, eff_timeout)
             except _RateLimited as rl:
                 if attempt >= self._max_backoffs:
-                    raise OllamaBackendError(
+                    # MS5 Task 3: raise the RateLimitError SUBTYPE (not the plain base
+                    # class) so a caller (`run_batch` + the per-model circuit breaker,
+                    # Task 5/Task 2) can `except RateLimitError` — an isinstance check,
+                    # not a string match — ahead of the generic `OllamaBackendError`
+                    # branch, and exclude a healthy-but-throttled model from tripping
+                    # its breaker. It IS-A OllamaBackendError, so this is additive and
+                    # backward-compatible: every existing `except OllamaBackendError`
+                    # still catches it unchanged.
+                    raise RateLimitError(
                         self._redact(
-                            "Ollama 429 rate limit: backoffs exhausted; raise your plan "
-                            "or lower max_parallel_agents."
+                            f"Ollama rate-limited (429) after {self._max_backoffs} backoffs; "
+                            "the model is healthy but throttled — retry later or reduce "
+                            "concurrency."
                         )
                     ) from None
                 # DRY (MS4 Task 1): the SAME `retry_after_delay` helper the streaming

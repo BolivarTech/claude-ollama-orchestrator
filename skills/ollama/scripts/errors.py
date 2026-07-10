@@ -29,6 +29,19 @@ class OllamaBackendError(Exception):
     """Raised on transport/backend failures (HTTP, timeout, bad response)."""
 
 
+class RateLimitError(OllamaBackendError):
+    """Raised when a 429 (rate limit) exhausts its backoff budget (R8).
+
+    A subclass of :class:`OllamaBackendError` — deliberately additive and
+    backward-compatible: every MS1 ``except OllamaBackendError`` still catches
+    it unchanged. It exists so callers that need to distinguish "the model is
+    unreachable/erroring" from "the model is healthy but throttling" (R14b: the
+    per-model circuit breaker must NOT trip on 429) can do a clean
+    ``isinstance``/``except RateLimitError`` check instead of a string match on
+    the error message.
+    """
+
+
 class SinkError(OllamaBackendError):
     """A failure WRITING a delta to a streaming output sink (stdout/file), raised by
     `ollama_stream._consume` (MS4). A `BrokenPipeError`/`OSError` from the sink is
