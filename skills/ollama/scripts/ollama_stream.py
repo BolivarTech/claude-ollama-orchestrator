@@ -20,6 +20,7 @@ responsibility stays in ``dispatch``, same as for the transactional core.
 
 from __future__ import annotations
 
+import http.client
 import json
 import random
 import socket
@@ -304,11 +305,14 @@ def _consume(
                 chunk = resp.read(_READ_CHUNK_BYTES)  # bounded read; socket timeout == idle timeout
             except (socket.timeout, TimeoutError):
                 raise TimeoutError("stream idle timeout") from None
-            except OSError as exc:
+            except (OSError, http.client.IncompleteRead) as exc:
                 # A NON-timeout OSError subclass (e.g. ConnectionResetError,
-                # ConnectionAbortedError) reaching mid-stream must not leak as a raw
-                # transport exception — map it to the domain OllamaBackendError,
-                # kept distinct from the idle-timeout branch above.
+                # ConnectionAbortedError) OR an http.client.IncompleteRead — a truncated
+                # read on a mid-stream connection drop, which is NOT an OSError subclass and
+                # so must be named explicitly, exactly as the transactional core's _call_once
+                # already does — reaching mid-stream must not leak as a raw transport
+                # exception; map it to the domain OllamaBackendError, kept distinct from the
+                # idle-timeout branch above.
                 raise OllamaBackendError(redact(f"stream connection failed: {exc}")) from None
             if not chunk:  # EOF — NO [DONE] required here: a clean
                 if buf:  # close without a sentinel is tolerated as

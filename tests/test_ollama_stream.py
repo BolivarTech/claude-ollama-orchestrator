@@ -484,3 +484,29 @@ def test_stream_elapsed_s_spans_the_full_400_downgrade_retry(monkeypatch):
     )
     assert res.content == "ok"
     assert res.elapsed_s == 2.5
+
+
+def test_stream_incomplete_read_mid_stream_maps_to_backend_error():
+    # R7b / hardened transport: an http.client.IncompleteRead (a truncated read on a
+    # mid-stream connection drop) is NOT an OSError subclass — the SSE read loop must map
+    # it to a domain OllamaBackendError, exactly like the transactional core's _call_once,
+    # never leak it as a raw exception across the module boundary.
+    import http.client
+
+    class _Truncated:
+        def read(self, n=-1):
+            raise http.client.IncompleteRead(b"partial")
+
+        def close(self):
+            pass
+
+    with pytest.raises(OllamaBackendError):
+        stream_run(
+            _cfg(),
+            "s",
+            "p",
+            "m",
+            60,
+            sink=lambda _s: None,
+            urlopen=lambda req, timeout=None: _Truncated(),
+        )
