@@ -600,10 +600,19 @@ def _acquire_ephemeral(path: str, bound: int) -> bool:
             return False
         if _lockfile_holder_is_live(steal_path):
             # A competitor swapped in a LIVE lock during our window; we must NOT evict it.
-            # Restore it (best-effort) and back off. The restore can, in a rare triple-race,
-            # overwrite yet another racer's fresh lock -- an ACCEPTED bounded limitation of
-            # portable lockfiles (no OS advisory lock): still self-healing (at most a transient
-            # +1, resolved on the next release/reclaim), never a permanent double-owner.
+            # Restore it (best-effort) and back off. The restore can, in a rare TRIPLE-race
+            # (a THIRD racer created a fresh lock at `path` between our replace-out and this
+            # restore), overwrite that third racer's lock. This is the ONE residual and it is
+            # an ACCEPTED, IRREDUCIBLE limitation of a portable-lockfile design: closing it
+            # fully needs an OS advisory lock (`fcntl.flock`/`msvcrt.locking`), deliberately
+            # rejected for the stdlib-only, cross-platform contract (NR1). It is bounded and
+            # self-healing (at most a transient +1 concurrent agent, resolved on the next
+            # release/reclaim), NEVER a permanent double-owner. It is also UNREACHABLE under
+            # the v0.1 shipping model: the cross-process slot/token machinery (R7d/R21c) is a
+            # v0.2 feature; v0.1 runs a SINGLE orchestrator, and this whole reclaim path only
+            # fires on a stale lock left by a CRASHED prior process, then needs THREE
+            # concurrent same-index reclaimers in overlapping microsecond windows -- a
+            # pattern the single-orchestrator invariant does not produce.
             try:
                 os.replace(steal_path, path)
             except OSError:
