@@ -209,7 +209,15 @@ def _parse_lock(run_dir: str) -> tuple[int | None, float | None, int | None]:
             started = datetime.fromisoformat(lines[1].strip())
             if started.tzinfo is None:
                 started = started.replace(tzinfo=timezone.utc)
-            age = (datetime.now(timezone.utc) - started).total_seconds()
+            # CLAMP to >= 0 (Caspar residual): a wall clock that steps BACKWARD (NTP
+            # correction, manual reset) makes `now - started` negative, which would make a
+            # bound-expiry check (`age >= bound`) impossible to satisfy -> a recycled-PID lock
+            # could appear held indefinitely. Clamping keeps age a sane non-negative duration.
+            # The clock-immune PRIMARY liveness signal is the `is_pid_alive` check in the
+            # caller: a DEAD holder is reclaimed regardless of age, so a truly permanent lock
+            # cannot arise from skew alone; the wall-clock bound is only the PID-RECYCLING
+            # fallback for a live PID that cannot still be the original holder.
+            age = max(0.0, (datetime.now(timezone.utc) - started).total_seconds())
         except ValueError:
             age = None
     if len(lines) > 2:
@@ -388,7 +396,15 @@ def _read_lock_fields(path: str) -> tuple[int | None, float | None, int | None]:
             started = datetime.fromisoformat(lines[1].strip())
             if started.tzinfo is None:
                 started = started.replace(tzinfo=timezone.utc)
-            age = (datetime.now(timezone.utc) - started).total_seconds()
+            # CLAMP to >= 0 (Caspar residual): a wall clock that steps BACKWARD (NTP
+            # correction, manual reset) makes `now - started` negative, which would make a
+            # bound-expiry check (`age >= bound`) impossible to satisfy -> a recycled-PID lock
+            # could appear held indefinitely. Clamping keeps age a sane non-negative duration.
+            # The clock-immune PRIMARY liveness signal is the `is_pid_alive` check in the
+            # caller: a DEAD holder is reclaimed regardless of age, so a truly permanent lock
+            # cannot arise from skew alone; the wall-clock bound is only the PID-RECYCLING
+            # fallback for a live PID that cannot still be the original holder.
+            age = max(0.0, (datetime.now(timezone.utc) - started).total_seconds())
         except ValueError:
             age = None
     if len(lines) > 2:

@@ -387,6 +387,23 @@ def test_acquire_ephemeral_does_not_evict_a_live_lock_swapped_in_during_reclaim(
     assert pid == b_pid  # B's live lock is intact at `path`, not evicted -> no double ownership
 
 
+def test_read_lock_fields_clamps_negative_age_from_a_future_timestamp(tmp_path):
+    """Clock-skew guard (Caspar residual): a lock whose ISO timestamp is in the FUTURE (the
+    wall clock stepped backward after it was written) must not yield a NEGATIVE age -- which
+    would make a bound-expiry check (`age >= bound`) impossible to satisfy and could hold a
+    recycled-PID lock indefinitely. `_read_lock_fields` clamps age to >= 0."""
+    from datetime import datetime, timedelta, timezone
+
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    path = str(tmp_path / "future.lock")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"{os.getpid()}\n{future}\n60\n")
+    pid, age, bound = run_lock._read_lock_fields(path)
+    assert pid == os.getpid()
+    assert age is not None and age >= 0.0  # clamped, never negative despite the future stamp
+    assert bound == 60
+
+
 def test_acquire_ephemeral_writes_full_payload_even_on_a_short_os_write(tmp_path, monkeypatch):
     """os.write may perform a SHORT write (fewer bytes than requested); the lock payload must
     be written in FULL (looped) so the lockfile never lands with a truncated/torn payload that
