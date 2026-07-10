@@ -82,6 +82,14 @@ _CORPUS = {
                 "capability": "reviewer",
                 "findings": [{"severity": "info", "title": "t", "detail": ["x"]}],
             },  # detail not a string
+            {
+                "capability": "reviewer",
+                "findings": [{"severity": "info", "title": "t", "detail": "d", "line": 0}],
+            },  # line below the 1-based minimum (schema minimum: 1)
+            {
+                "capability": "reviewer",
+                "findings": [{"severity": "info", "title": "t", "detail": "d", "line": -3}],
+            },  # negative line number
         ],
     },
     "tester": {

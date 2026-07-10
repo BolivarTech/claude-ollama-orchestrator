@@ -197,6 +197,11 @@ def validate_output(capability: str, obj: dict[str, Any]) -> dict[str, Any]:
                 # string "11" a model might emit instead of the bare integer 11.
                 if isinstance(f["line"], bool) or not isinstance(f["line"], int):
                     raise ValidationError("reviewer: 'line' must be an integer")
+                # Lockstep with the schema's ``"minimum": 1`` (R29): a source line is
+                # 1-based, so reject 0/negative rather than passing a semantically
+                # impossible location downstream to diff_guard.
+                if f["line"] < 1:
+                    raise ValidationError("reviewer: 'line' must be >= 1")
                 cleaned_finding["line"] = f["line"]
             new_findings.append(cleaned_finding)
         cleaned["findings"] = new_findings

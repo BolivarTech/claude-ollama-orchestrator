@@ -31,7 +31,8 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                         # unchanged. Present so a model MAY claim a file:line for
                         # diff_guard.validate_findings to ground against.
                         "file": {"type": "string"},
-                        "line": {"type": "integer"},
+                        # 1-based source line; lockstep with validate.py's ``line >= 1``.
+                        "line": {"type": "integer", "minimum": 1},
                     },
                 },
             },
