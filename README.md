@@ -19,7 +19,7 @@ Edit/Write tools. The goal: **cut Anthropic token cost** and keep bulk generatio
 
 > [!IMPORTANT]
 > ### Project Status
-> **Early development (v0.0.3).** Built under the SBTDD workflow (Spec + Behavior +
+> **Early development (v0.0.4).** Built under the SBTDD workflow (Spec + Behavior +
 > Test-Driven Development). The authoritative description of *what* to build lives in
 > `sbtdd/`; the tree, tables, and commands below describe the **intended design**, and
 > production code lands milestone-by-milestone, test-first.
@@ -27,14 +27,15 @@ Edit/Write tools. The goal: **cut Anthropic token cost** and keep bulk generatio
 > **Implemented so far:** the **transactional delegation core** — layered config, fail-fast
 > preflight, an OpenAI-compatible backend with structured output + downgrade-on-400, a
 > tolerant JSON parser, and the `/ollama` orchestrator (+ `--ollama-init`); **local token
-> accounting** (per-delegation tok/s + token counts from the response `usage`, with a
-> `chars/4` estimated fallback, in a per-capability/model `token_stats.json` kept
-> **separate** from Claude usage); and **output management** — a per-project temp namespace
-> with unique run dirs, a cross-platform process-liveness lock, LRU cleanup that never
-> prunes a live run, per-run artifacts, a live per-agent status display (stdout / stderr /
-> file stream split), and interrupt-safe cleanup. Visible streaming, bounded concurrency,
-> untrusted-I/O hardening, and the vision / transcribe / thinking capabilities are the
-> remaining milestones.
+> accounting** (per-delegation tok/s + token counts, `token_stats.json` kept **separate**
+> from Claude usage); **output management** — a per-project temp namespace, a cross-platform
+> process-liveness lock, LRU cleanup that never prunes a live run, per-run artifacts, a live
+> per-agent status display, and interrupt-safe cleanup; and **visible streaming** — a
+> hardened SSE reader (idle timeout, bounded reassembly buffer, UTF-8-boundary output cap,
+> transport-error-safe) wired per-capability as a **decoupled layer** over the transactional
+> core (toggle `[stream]`), streaming tokens to stdout when a single delegation is in flight
+> while structured capabilities stay transactional. Bounded concurrency, untrusted-I/O
+> hardening, and the vision / transcribe / thinking capabilities are the remaining milestones.
 
 ---
 
