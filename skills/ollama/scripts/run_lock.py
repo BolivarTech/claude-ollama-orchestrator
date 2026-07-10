@@ -491,6 +491,34 @@ def _lockfile_holder_is_live(path: str) -> bool:
     return True
 
 
+def _write_close_ephemeral(fd: int, payload: bytes) -> bool:
+    """Write *payload* to *fd* and ALWAYS close it; return True iff the write succeeded.
+
+    A ``try/finally`` guarantees the descriptor is closed even when ``os.write`` fails --
+    without it, a transient write error after a successful ``os.open`` would leak the fd
+    until GC (and repeated failures could exhaust the descriptor table). ``os.close``'s own
+    (rare) error is swallowed so this helper is total/never-raise, matching the acquire
+    path's fail-to-False contract.
+
+    Args:
+        fd: An open file descriptor owned by the caller (from ``os.open``).
+        payload: The bytes to write.
+
+    Returns:
+        True if the write succeeded, False if it raised ``OSError``.
+    """
+    try:
+        os.write(fd, payload)
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def _acquire_ephemeral(path: str, bound: int) -> bool:
     """Atomically acquire the ephemeral lockfile at *path*, reclaiming a stale holder.
 
@@ -512,17 +540,19 @@ def _acquire_ephemeral(path: str, bound: int) -> bool:
     payload = _ephemeral_payload(bound)
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.write(fd, payload)
-        os.close(fd)
-        return True
     except FileExistsError:
-        pass  # already held -> try to reclaim below
+        fd = None  # already held -> try to reclaim below
     except OSError:
         # Any OTHER transient FS error on the atomic create (a Windows AV/indexer briefly
         # locking the new file, a read-only temp, EMFILE, ...) means we simply couldn't
         # acquire the token -- degrade to False so the caller falls back to a per-agent
         # file sink, NEVER propagate and crash the delegation (total/never-raise).
         return False
+    if fd is not None:
+        # Fresh create won: write the payload, ALWAYS closing the fd (no leak even if the
+        # write fails). A failed write means we hold an empty/torn file -> return False; its
+        # own mtime grace (rule 0) makes it reclaimable, so nothing is stranded.
+        return _write_close_ephemeral(fd, payload)
     for _ in range(_EPHEMERAL_RECLAIM_RETRIES):
         if _lockfile_holder_is_live(path):
             return False  # live holder -> do not steal
@@ -534,11 +564,11 @@ def _acquire_ephemeral(path: str, bound: int) -> bool:
             return False
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            os.write(fd, payload)
-            os.close(fd)
         except FileExistsError:
             continue  # lost the recreate race -> retry
         except OSError:
+            return False
+        if not _write_close_ephemeral(fd, payload):  # ALWAYS closes the fd (no leak)
             return False
         pid, _age, _bound = _read_lock_fields(path)  # ownership re-verification
         return pid == os.getpid()

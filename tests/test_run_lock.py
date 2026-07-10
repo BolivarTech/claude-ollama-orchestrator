@@ -356,6 +356,29 @@ def test_cleanup_leaves_in_range_slots_to_atomic_reclaim_sweeps_only_out_of_rang
     assert not os.path.exists(out_of_range)  # out-of-range orphan: swept
 
 
+def test_acquire_ephemeral_closes_fd_when_write_fails_no_descriptor_leak(tmp_path, monkeypatch):
+    """No FD leak: if `os.write` raises after a successful `O_EXCL` open, `_acquire_ephemeral`
+    must still close the descriptor (try/finally) before returning False -- otherwise the fd
+    leaks until GC, and under repeated transient write failures a process could exhaust its
+    descriptor table. Exercises the first (fresh-create) write path."""
+    path = str(tmp_path / "ephemeral.lock")
+    closed: list[int] = []
+    real_close = run_lock.os.close
+
+    def _raising_write(fd, data):
+        raise OSError("simulated write failure after open")
+
+    def _recording_close(fd):
+        closed.append(fd)
+        return real_close(fd)  # actually close it so the test leaks nothing either
+
+    monkeypatch.setattr(run_lock.os, "write", _raising_write)
+    monkeypatch.setattr(run_lock.os, "close", _recording_close)
+    result = run_lock._acquire_ephemeral(path, bound=60)
+    assert result is False  # write failed -> could not acquire the token
+    assert len(closed) == 1  # the opened fd was closed exactly once, not leaked
+
+
 def test_release_slot_is_idempotent(tmp_path):
     slots = str(tmp_path / SLOTS_DIRNAME)
     acquire_slot(slots, 1, 60)
