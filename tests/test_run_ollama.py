@@ -250,23 +250,23 @@ def test_dispatch_object_mode_sends_generic_json_envelope():
     assert be.calls[0]["response_format"] == {"type": "json_object"}
 
 
-def test_dispatch_rejects_vision_transcribe_in_ms1():
-    # MS1 has no multimodal/binary transport (lands in M7). Dispatching vision/transcribe
-    # must fail actionably with DelegationError, not send a binary as garbled chat text.
+def test_dispatch_rejects_transcribe_in_ms7_task4():
+    # `transcribe`'s audio transport lands in M7 Task 5; until then, dispatching it must
+    # fail actionably with DelegationError, not send a binary as garbled chat text.
+    # `vision` gained its real image_url transport in M7 Task 4 and is no longer guarded.
     from errors import DelegationError
 
     be = _FakeBackend(["unused"])
-    for cap in ("vision", "transcribe"):
-        with pytest.raises(DelegationError):
-            run_ollama.dispatch(
-                cap,
-                "img-or-audio",
-                backend=be,
-                model="m",
-                timeout=10,
-                system_prompt="sys",
-                config=_CFG,
-            )
+    with pytest.raises(DelegationError):
+        run_ollama.dispatch(
+            "transcribe",
+            "audio",
+            backend=be,
+            model="m",
+            timeout=10,
+            system_prompt="sys",
+            config=_CFG,
+        )
     assert be.calls == []  # backend never invoked
 
 
@@ -695,10 +695,12 @@ def test_output_dir_writes_raw_artifact(tmp_path, monkeypatch):
     assert raw["content"] == "hi there"
 
 
-def test_main_rejects_vision_as_actionable_nonzero_not_a_traceback(monkeypatch, capsys):
-    # `dispatch` raises DelegationError for the MS1 vision/transcribe transport guard
-    # (multimodal lands in M7). `main` must catch it — never an uncaught traceback — and
-    # the backend must NEVER be invoked (the guard fires before any backend.run call).
+def test_main_rejects_transcribe_as_actionable_nonzero_not_a_traceback(monkeypatch, capsys):
+    # `dispatch` raises DelegationError for the `transcribe` audio-transport guard (lands
+    # in M7 Task 5). `main` must catch it — never an uncaught traceback — and the backend
+    # must NEVER be invoked (the guard fires before any backend.run call). `vision` gained
+    # its real transport in M7 Task 4 and is no longer guarded (see the `stream_vision`
+    # coverage in test_ollama_vision.py instead).
     class _BackendMustNotBeCalled:
         def run(self, *args, **kwargs):
             raise AssertionError(
@@ -712,7 +714,7 @@ def test_main_rejects_vision_as_actionable_nonzero_not_a_traceback(monkeypatch, 
     monkeypatch.setattr(run_ollama, "preflight", lambda cfg, **kw: None)
     monkeypatch.setattr(run_ollama, "load_system_prompt", lambda cap: "sys")
     monkeypatch.setattr(run_ollama, "_make_backend", lambda cfg: _BackendMustNotBeCalled())
-    rc = run_ollama.main(["vision", "img.png", "--no-status"])
+    rc = run_ollama.main(["transcribe", "audio.wav", "--no-status"])
     assert rc != 0
     assert "delegation failed" in capsys.readouterr().err.lower()
 

@@ -53,8 +53,7 @@ def test_stream_vision_sends_image_url_data_uri_content_part(tmp_path):
     def _open(req, timeout=None):
         seen["content"] = json.loads(req.data)["messages"][1]["content"]
         return io.BytesIO(
-            b'data: {"choices":[{"delta":{"content":"a login form"}}]}\n'
-            b"data: [DONE]\n"
+            b'data: {"choices":[{"delta":{"content":"a login form"}}]}\ndata: [DONE]\n'
         )
 
     res = stream_vision(
@@ -86,9 +85,7 @@ def test_stream_vision_derives_mime_from_magic_bytes_not_the_file_extension(tmp_
 
     def _open(req, timeout=None):
         seen["content"] = json.loads(req.data)["messages"][1]["content"]
-        return io.BytesIO(
-            b'data: {"choices":[{"delta":{"content":"ok"}}]}\ndata: [DONE]\n'
-        )
+        return io.BytesIO(b'data: {"choices":[{"delta":{"content":"ok"}}]}\ndata: [DONE]\n')
 
     stream_vision(
         _cfg(),

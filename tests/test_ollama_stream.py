@@ -568,9 +568,7 @@ def test_stream_run_threads_content_parts_into_the_request():
 
     def _open(req, timeout=None):
         seen["content"] = json.loads(req.data)["messages"][1]["content"]
-        return io.BytesIO(
-            b'data: {"choices":[{"delta":{"content":"ok"}}]}\ndata: [DONE]\n'
-        )
+        return io.BytesIO(b'data: {"choices":[{"delta":{"content":"ok"}}]}\ndata: [DONE]\n')
 
     stream_run(
         _cfg(),

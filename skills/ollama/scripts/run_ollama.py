@@ -407,8 +407,10 @@ def make_file_sink(path: str) -> "_FileSink":
 
 
 # Capabilities whose transport is not in MS1 (multimodal/audio → M7). Guarded in
-# ``dispatch`` so a binary input is never sent as garbled chat text. Removed in M7.
-_MS1_UNSUPPORTED_CAPS = frozenset({"vision", "transcribe"})
+# ``dispatch`` so a binary input is never sent as garbled chat text. `vision` gained its
+# real transport in MS7 Task 4 (`ollama_vision.stream_vision`); `transcribe` is removed
+# in Task 5.
+_MS1_UNSUPPORTED_CAPS = frozenset({"transcribe"})
 
 
 def _capability_streams_to_stdout(config: OllamaAgentsConfig, capability: str) -> bool:
@@ -562,13 +564,15 @@ def dispatch(
     Raises:
         OllamaBackendError: if the composite retry deadline is exceeded.
         ValidationError: if the output is still invalid after the retry.
-        DelegationError: if *capability* is ``vision``/``transcribe`` (their
-            multimodal/audio transport lands in M7 — sending a binary as chat text
-            would garble it, so MS1 fails actionably instead).
+        DelegationError: if *capability* is ``transcribe`` (its audio transport
+            lands in M7 Task 5 — sending a binary as chat text would garble it, so
+            this build fails actionably instead). ``vision`` gained its real
+            ``image_url`` transport in M7 Task 4 and is no longer guarded here.
     """
-    # R28 keeps all 7 capabilities in the CLI surface, but MS1 implements only the
-    # chat/text ones. vision/transcribe need the multimodal/binary transport added in
-    # M7 — guard so a binary input isn't silently garbled. (Removed/replaced in M7.)
+    # R28 keeps all 7 capabilities in the CLI surface. `vision` gained its real
+    # transport in M7 Task 4 (`ollama_vision.stream_vision`); `transcribe` still needs
+    # the audio transport added in Task 5 — guarded so a binary input isn't silently
+    # garbled. (Removed/replaced in Task 5.)
     if capability in _MS1_UNSUPPORTED_CAPS:
         raise DelegationError(
             f"capability {capability!r} requires the multimodal/audio transport added "
