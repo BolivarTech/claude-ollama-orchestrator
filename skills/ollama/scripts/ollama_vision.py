@@ -36,13 +36,17 @@ _MULTIMODAL_VISION_HINTS = ("minimax", "qwen", "gemma", "llava", "vision", "gpt-
 def _default_is_multimodal(model: str) -> bool:
     """Best-effort heuristic: True if *model*'s tag looks image-capable (multimodal).
 
-    A plain substring match against :data:`_MULTIMODAL_VISION_HINTS` — it can reject a
-    non-standard multimodal model name that doesn't contain one of these substrings
-    (accepted, INFO: a false negative surfaces as the actionable `DelegationError` below,
-    never a silent misroute). Two ways to override, cheapest first: (1) extend
-    `_MULTIMODAL_VISION_HINTS` with the deployment's model-name substring; (2) pass a
-    custom `is_multimodal` predicate to :func:`stream_vision` (already the injection point
-    the tests below use) — e.g. an explicit allow-set instead of a substring heuristic.
+    A plain substring match against :data:`_MULTIMODAL_VISION_HINTS`. This is a DELIBERATE
+    v0.1 default whose BOTH failure modes degrade gracefully (never a crash, never a silent
+    misroute): a false NEGATIVE (a non-standard multimodal name missed) surfaces as the
+    actionable `DelegationError` below; a false POSITIVE (a text-only model matched) sends the
+    image content-part, and the server rejects it as a normal backend error routed through the
+    circuit breaker. An exact allow-list (Caspar residual) is a v0.2 refinement, already
+    reachable WITHOUT a code change via the injectable predicate. Two ways to override,
+    cheapest first: (1) extend `_MULTIMODAL_VISION_HINTS` with the deployment's model-name
+    substring; (2) pass a custom `is_multimodal` predicate to :func:`stream_vision` (already
+    the injection point the tests below use) — e.g. an explicit allow-set
+    (`{"my-vision-model:latest"}.__contains__`) instead of the substring heuristic.
     """
     m = model.lower()
     return any(hint in m for hint in _MULTIMODAL_VISION_HINTS)
