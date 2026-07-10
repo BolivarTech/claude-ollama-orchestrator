@@ -599,3 +599,19 @@ def test_live_pid_with_corrupt_bound_and_old_mtime_is_reclaimable_not_immortal(
     os.utime(lock, (old, old))
     monkeypatch.setattr(run_lock, "is_pid_alive", lambda pid: True)  # PID recycled -> "alive"
     assert _lockfile_holder_is_live(lock) is False  # reclaimable, NOT immortal
+
+
+def test_cleanup_removes_dead_pid_reclaim_scratch_but_keeps_live_ones(tmp_path, monkeypatch):
+    """`<lock>.reclaim.<pid>` scratch files stranded by a crashed process are swept when their
+    owning PID is dead; a LIVE owner's file is left (it may be mid-reclaim). Prevents slow disk
+    accumulation across process deaths."""
+    slots = str(tmp_path / SLOTS_DIRNAME)
+    os.makedirs(slots)
+    dead = os.path.join(slots, "slot-2.lock.reclaim.999999")
+    live = os.path.join(slots, "slot-3.lock.reclaim." + str(os.getpid()))
+    open(dead, "w").close()
+    open(live, "w").close()
+    monkeypatch.setattr(run_lock, "is_pid_alive", lambda pid: pid == os.getpid())
+    run_lock._cleanup_orphaned_slots(slots, max_parallel=4)
+    assert not os.path.exists(dead)  # dead owner -> swept
+    assert os.path.exists(live)  # live owner -> kept

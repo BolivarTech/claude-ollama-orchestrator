@@ -309,7 +309,10 @@ _EPHEMERAL_RECLAIM_RETRIES = 3  # bounded reclaim attempts -> no livelock on a h
 # closes that gap without changing the release contract (still best-effort, still never
 # raises).
 _RELEASE_RETRY_ATTEMPTS = 10
-_RELEASE_RETRY_DELAY_SECONDS = 0.005
+# ~20 ms/attempt x 10 = ~200 ms total budget for a transient Windows PermissionError to clear
+# (a concurrent reader/writer, or an AV/indexer briefly holding the file) -- wide enough for
+# real-world Windows contention (Balthasar), still negligible vs. any delegation's own runtime.
+_RELEASE_RETRY_DELAY_SECONDS = 0.02
 # Torn-write grace (MS7 Task 3 fix): the 3-line payload is written by a SINGLE os.write
 # call, but the file is briefly observable as 0 BYTES between a winning `os.open(O_CREAT
 # | O_EXCL)` and that write landing -- a real, non-negligible window under genuine
@@ -861,6 +864,22 @@ def _cleanup_orphaned_slots(slots_dir: str, max_parallel: int) -> None:
     except OSError:
         return
     for name in names:
+        # `<lock>.reclaim.<pid>` scratch files left by a process that crashed mid-steal (the
+        # atomic reclaim's private copy). Normally reused per-PID / removed on success, but a
+        # hard crash can strand one. Remove any whose owning PID (encoded in the name) is dead;
+        # leave a LIVE owner's file (it may be mid-reclaim right now). Prevents slow disk
+        # accumulation across process deaths (Caspar residual).
+        if ".reclaim." in name:
+            try:
+                owner_pid = int(name.rsplit(".reclaim.", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            if not is_pid_alive(owner_pid):
+                try:
+                    os.remove(os.path.join(slots_dir, name))
+                except OSError:
+                    pass
+            continue
         if not (name.startswith("slot-") and name.endswith(".lock")):
             continue
         try:
