@@ -3455,9 +3455,7 @@ def _cfg_disable_fs_locks(
     return replace(base, disable_fs_locks=disable)
 
 
-def test_disable_fs_locks_true_creates_no_slots_dir_and_still_runs_every_job(
-    tmp_path, monkeypatch
-):
+def test_disable_fs_locks_true_creates_no_slots_dir_and_still_runs_every_job(tmp_path, monkeypatch):
     from circuit_breaker import CircuitBreaker
 
     ran = {"n": 0}
@@ -3513,9 +3511,12 @@ def test_disable_fs_locks_true_skips_the_stdout_token_and_creates_no_lock_file(t
     token_path = str(tmp_path / STDOUT_TOKEN_FILENAME)
     cfg = _cfg_disable_fs_locks(True)
     seen = {}
-    result, used = run_ollama._stream_maybe_with_stdout_token(
-        cfg, token_path, 60, lambda used_stdout: seen.setdefault("used", used_stdout) or "ok"
-    )
+
+    def _run(used_stdout):
+        seen["used"] = used_stdout
+        return "ok"
+
+    result, used = run_ollama._stream_maybe_with_stdout_token(cfg, token_path, 60, _run)
     assert result == "ok" and used is True and seen["used"] is True
     assert not os.path.exists(token_path)  # acquire() was never called
 
@@ -3523,8 +3524,16 @@ def test_disable_fs_locks_true_skips_the_stdout_token_and_creates_no_lock_file(t
 def test_disable_fs_locks_false_still_creates_and_arbitrates_the_stdout_token(tmp_path):
     token_path = str(tmp_path / STDOUT_TOKEN_FILENAME)
     cfg = _cfg_disable_fs_locks(False)
-    result, used = run_ollama._stream_maybe_with_stdout_token(
-        cfg, token_path, 60, lambda used_stdout: used_stdout
-    )
+    seen = {}
+
+    def _run(used_stdout):
+        # The real Task 2 acquire() ran (unchanged behavior): the lockfile exists
+        # WHILE the delegation holds it, and is released (removed) once it returns --
+        # asserting existence only DURING the call, not after, matches
+        # `_stream_with_stdout_token`'s own release-in-`finally` semantics.
+        seen["existed_during_call"] = os.path.exists(token_path)
+        return used_stdout
+
+    result, used = run_ollama._stream_maybe_with_stdout_token(cfg, token_path, 60, _run)
     assert used is True and result is True
-    assert os.path.exists(token_path)  # unchanged Task 2 behavior
+    assert seen["existed_during_call"] is True

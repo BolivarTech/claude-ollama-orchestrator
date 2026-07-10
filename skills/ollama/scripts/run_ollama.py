@@ -1158,8 +1158,8 @@ def run_delegation(ns: argparse.Namespace) -> int:
                         ) as fsink:
                             return _do_dispatch(fsink)
 
-                    result, _used_stdout = _stream_with_stdout_token(
-                        token_path, ns.timeout, _run_streamed
+                    result, _used_stdout = _stream_maybe_with_stdout_token(
+                        cfg, token_path, ns.timeout, _run_streamed
                     )
                 else:
                     # Transactional: the backend never calls the sink; the single buffered
@@ -1234,6 +1234,47 @@ def _stream_with_stdout_token(
     finally:
         if used_stdout:
             release(token_path)
+
+
+def _stream_maybe_with_stdout_token(
+    config: OllamaAgentsConfig,
+    token_path: str,
+    timeout: int,
+    run: Callable[[bool], Any],
+    *,
+    acquire: Callable[[str, int], bool] = acquire_token,
+    release: Callable[[str], None] = release_token,
+) -> tuple[Any, bool]:
+    """Stream-role wrapper honoring the ``disable_fs_locks`` kill-switch (MS7 Task 8).
+
+    ``config.disable_fs_locks is False`` (default): delegates to
+    :func:`_stream_with_stdout_token` unchanged -- the cross-process
+    ``.ollama-stdout.lock`` arbitrates which of possibly several processes streams to
+    stdout (R7d).
+
+    ``config.disable_fs_locks is True``: the cross-process arbitration is BYPASSED
+    entirely -- ``acquire``/``release`` are never called (no lock file is ever
+    created), and ``run(True)`` is invoked directly, unconditionally granting the
+    stdout role. This is the v0.1/no-R7d fallback: only the in-process ``Scheduler``
+    semaphore (MS5) and the documented single-orchestrator invariant remain as
+    concurrency guarantees.
+
+    Args:
+        config: The resolved, batch-scoped config (consulted for the kill-switch).
+        token_path: The ``.ollama-stdout.lock`` path (unused when disabled).
+        timeout: Per-delegation timeout (unused when disabled).
+        run: Callback receiving ``used_stdout: bool``; returns the delegation result.
+        acquire: Injectable token acquirer (tests; forwarded to
+            :func:`_stream_with_stdout_token`).
+        release: Injectable token releaser (tests; forwarded to
+            :func:`_stream_with_stdout_token`).
+
+    Returns:
+        ``(result, used_stdout)`` -- ``used_stdout`` is always ``True`` when disabled.
+    """
+    if config.disable_fs_locks:
+        return run(True), True
+    return _stream_with_stdout_token(token_path, timeout, run, acquire=acquire, release=release)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2149,10 +2190,14 @@ async def run_batch(
     # `_one()`). `None` only for an UNMANAGED run (`--output-dir`, R15/R28) -- the caller
     # opted out of every collision protection this runtime offers, cross-process slots
     # included, and is responsible for not sharing that directory between concurrent
-    # delegations.
+    # delegations. Also `None` when `config.disable_fs_locks` is True (MS7 Task 8, the
+    # operator kill-switch): every delegation then routes through the plain, unslotted
+    # `_run_one_delegation` (the SAME code path already used for an unmanaged run) --
+    # no `.ollama-slots/` dir is ever created, and the global cap (R21c) falls back to
+    # the in-process `Scheduler` semaphore + the single-orchestrator invariant.
     slots_dir = (
         os.path.join(os.path.dirname(os.path.realpath(output_dir)), SLOTS_DIRNAME)
-        if managed
+        if managed and not config.disable_fs_locks
         else None
     )
 
