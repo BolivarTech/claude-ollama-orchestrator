@@ -3310,3 +3310,47 @@ def test_run_batch_serial_two_overlapping_processes_cannot_both_hold_the_global_
     )
     assert len(results) == 1
     assert isinstance(results[0], DelegationError)  # rejected, not a silent 2nd concurrent agent
+
+
+# --- Task 6: thinking capability — <think> conclusion recovery (BDD-21) ---
+
+
+class _FakeThinkingBackend:
+    def run(
+        self,
+        cap,
+        system_prompt,
+        prompt,
+        model,
+        timeout,
+        *,
+        response_format=None,
+        deadline=None,
+    ):
+        return DelegationResult(
+            "<think>let me reason through the trade-offs...</think>\nUse a min-heap.",
+            1,
+            1,
+            True,
+            0.1,
+        )
+
+
+def test_thinking_uses_the_thinking_model_not_coder():
+    cfg = resolve_config(global_path=None, repo_path=None, env={})
+    assert cfg.models["thinking"] == "deepseek-v4-pro:cloud"
+    assert cfg.models["thinking"] != cfg.models["coder"]
+
+
+def test_thinking_dispatch_strips_think_to_the_conclusion():
+    cfg = resolve_config(global_path=None, repo_path=None, env={})
+    out = run_ollama.dispatch(
+        "thinking",
+        "hard problem",
+        backend=_FakeThinkingBackend(),
+        model=cfg.models["thinking"],
+        timeout=60,
+        system_prompt="s",
+        config=cfg,
+    )
+    assert out.content == "Use a min-heap."  # <think> scratchpad stripped, conclusion kept
