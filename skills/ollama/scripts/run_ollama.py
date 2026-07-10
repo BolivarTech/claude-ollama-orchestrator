@@ -45,8 +45,11 @@ from ollama_stream import stream_run
 from ollama_vision import stream_vision
 from parse_output import parse_agent_output
 from run_lock import (
+    SLOTS_DIRNAME,
     STDOUT_TOKEN_FILENAME,
+    acquire_slot,
     acquire_token,
+    release_slot,
     release_token,
     remove_lock,
     staleness_bound_for_timeout,
@@ -1568,6 +1571,99 @@ def _run_one_delegation(
     )
 
 
+def _run_one_delegation_slotted(
+    job: _Job,
+    config: OllamaAgentsConfig,
+    sink: Callable[[str], None] | None,
+    *,
+    slots_dir: str,
+    timeout: int,
+    stats: TokenStats | None = None,
+) -> DelegationResult:
+    """Run one fan-out delegation while holding a cross-process slot (R21c).
+
+    Acquires a GLOBAL slot before dispatch so the number of concurrent Ollama agents
+    across ALL processes never exceeds ``config.max_parallel_agents`` -- the in-process
+    ``Scheduler`` semaphore only caps this process. No free slot -> ``DelegationError``
+    (counts as an R21b queue rejection; per-delegation, never a whole-batch raise), so
+    a second overlapping process degrades gracefully instead of over-subscribing the
+    endpoint. The slot is released in a ``finally`` (including on interrupt).
+
+    Args:
+        job: The delegation job (opaque here; forwarded to ``_run_one_delegation``).
+        config: The batch-scoped config (its ``max_parallel_agents`` is the global cap).
+        sink: The per-delegation output sink (file sink in fan-out).
+        slots_dir: ``<project_run_root>/.ollama-slots``.
+        timeout: Per-delegation timeout (short staleness bound for the slot lock).
+        stats: Optional batch-scoped ``TokenStats`` (R12).
+
+    Returns:
+        The delegation result from ``_run_one_delegation``.
+
+    Raises:
+        DelegationError: if no cross-process slot is free.
+    """
+    index = acquire_slot(slots_dir, config.max_parallel_agents, timeout)
+    if index is None:
+        raise DelegationError(
+            "no free cross-process slot: "
+            f"{config.max_parallel_agents} Ollama agents already running across "
+            "processes (raise max_parallel_agents or retry once one finishes)"
+        )
+    try:
+        return _run_one_delegation(job, config, sink, stats=stats)
+    finally:
+        release_slot(slots_dir, index)
+
+
+async def _call_real_worker(
+    job: _Job,
+    config: OllamaAgentsConfig,
+    sink: Callable[[str], None] | None,
+    *,
+    slots_dir: str | None,
+    stats: TokenStats | None,
+) -> DelegationResult:
+    """Dispatch one REAL (non-test-seam) delegation, routed through the cross-process
+    slot wrapper (R21c) when *slots_dir* is set (a MANAGED run), else straight to
+    `_run_one_delegation`.
+
+    Shared by BOTH concurrency shapes -- `_run_batch_serial_fast_path`'s and
+    `run_batch`'s own fan-out `_one()`'s -- `_call_worker` closures, so the
+    slot-wrapping decision lives in exactly ONE place (never duplicated between the
+    two). Only ever reached when the caller's `_worker` test seam is `None` (the
+    production path); a caller-substituted `_worker` bypasses this entirely and
+    therefore never touches the cross-process slot machinery -- appropriate, since it
+    never dispatches a real delegation in the first place.
+
+    Args:
+        job: The `_Job` to run.
+        config: The resolved layered config (`max_parallel_agents` is the global cap
+            `acquire_slot` probes against).
+        sink: The per-delegation output sink, or `None`.
+        slots_dir: The per-project `.ollama-slots` dir, or `None` for an unmanaged run
+            (`--output-dir`, R15/R28) -- no cross-process slot is acquired.
+        stats: Optional shared `TokenStats` (R12).
+
+    Returns:
+        The `DelegationResult` from `_run_one_delegation`/`_run_one_delegation_slotted`.
+
+    Raises:
+        DelegationError: no free cross-process slot (R21c fail-closed).
+    """
+    if slots_dir is not None:
+        return await asyncio.to_thread(
+            _run_one_delegation_slotted,
+            job,
+            config,
+            sink,
+            slots_dir=slots_dir,
+            timeout=int(job.timeout),
+            stats=stats,
+        )
+    return await asyncio.to_thread(_run_one_delegation, job, config, sink, stats)
+
+
 def _reject_if_circuit_open(
     job: _Job, breaker: CircuitBreaker, now: Callable[[], float]
 ) -> DelegationError | None:
@@ -1767,6 +1863,7 @@ async def _run_batch_serial_fast_path(
     breaker: CircuitBreaker,
     output_dir: str,
     managed: bool,
+    slots_dir: str | None,
     _worker: _WorkerFn | None,
     stats: TokenStats,
     now: Callable[[], float],
@@ -1786,7 +1883,11 @@ async def _run_batch_serial_fast_path(
 
     The circuit breaker (R14b) and R27 managed-`output_dir` cleanup still apply in
     full — neither is fan-out-specific; only the concurrency-coordination machinery
-    (Scheduler/proxy/indexed sinks) is skipped.
+    (Scheduler/proxy/indexed sinks) is skipped. The cross-process slot (R21c) is NOT
+    skipped: even this single-delegation path acquires and releases exactly one global
+    slot via `_call_real_worker`/`_run_one_delegation_slotted`, so `max_parallel_agents`
+    stays a GLOBAL cap even at `max_parallel_agents == 1` — see the CRITICAL rationale
+    on `run_batch` for why the single-orchestrator invariant alone cannot be relied on.
 
     Args:
         job: The batch's sole `_Job`.
@@ -1795,6 +1896,8 @@ async def _run_batch_serial_fast_path(
             default, same as the general path).
         output_dir: The run dir for the plain `{cap}.stderr.log`.
         managed: Whether `output_dir` is removed on an interrupt (R27).
+        slots_dir: The per-project `.ollama-slots` dir (R21c), or `None` for an
+            unmanaged run — forwarded to `_call_real_worker`.
         _worker: Test-only seam, same contract as `run_batch`'s.
         stats: The batch-scoped `TokenStats` (R12) to fold this delegation's tokens
             into; written to `token_stats.json` on success via the best-effort
@@ -1804,8 +1907,8 @@ async def _run_batch_serial_fast_path(
 
     Returns:
         A single-element list: a `DelegationResult`, a `DelegationError` (open
-        circuit), or the caught exception — never a raise for anything short of a
-        genuine whole-batch interrupt.
+        circuit, or no free cross-process slot, R21c), or the caught exception —
+        never a raise for anything short of a genuine whole-batch interrupt.
 
     Raises:
         BaseException: a genuine interrupt (`KeyboardInterrupt`/`SystemExit`) — the
@@ -1836,7 +1939,7 @@ async def _run_batch_serial_fast_path(
         async def _call_worker() -> DelegationResult:
             if _worker is not None:
                 return await _worker(job.cap, job.model, sink)
-            return await asyncio.to_thread(_run_one_delegation, job, config, sink, stats)
+            return await _call_real_worker(job, config, sink, slots_dir=slots_dir, stats=stats)
 
         try:
             outcome = await _execute_delegation(
@@ -1980,6 +2083,26 @@ async def run_batch(
     stats = TokenStats()
     loop = asyncio.get_running_loop()
 
+    # R21c: the cross-process slot dir is a SIBLING of this run's own unique
+    # `ollama-run-*` output_dir (never inside it), so it is shared by every concurrent
+    # process of the SAME project -- making `config.max_parallel_agents` a GLOBAL cap,
+    # not merely a per-process one (the in-process `Scheduler` semaphore below only
+    # bounds THIS process). Computed ONCE here, unconditionally on `managed` (NOT on
+    # `config.max_parallel_agents > 1`): the global cap must hold at
+    # `max_parallel_agents == 1` too -- a second overlapping process each running its
+    # own single serial delegation would otherwise each acquire their own in-process
+    # semaphore of 1 and run concurrently, defeating the "1" cap globally. Threaded into
+    # BOTH concurrency shapes below (the serial fast path and the general fan-out path's
+    # `_one()`). `None` only for an UNMANAGED run (`--output-dir`, R15/R28) -- the caller
+    # opted out of every collision protection this runtime offers, cross-process slots
+    # included, and is responsible for not sharing that directory between concurrent
+    # delegations.
+    slots_dir = (
+        os.path.join(os.path.dirname(os.path.realpath(output_dir)), SLOTS_DIRNAME)
+        if managed
+        else None
+    )
+
     def _now() -> float:
         # `loop.time()` is the breaker's OWN monotonic clock domain. It is only ever
         # compared against breaker-internal values recorded with this SAME callable
@@ -2005,6 +2128,7 @@ async def run_batch(
             breaker=breaker,
             output_dir=output_dir,
             managed=managed,
+            slots_dir=slots_dir,
             _worker=_worker,
             stats=stats,
             now=_now,
@@ -2063,14 +2187,15 @@ async def run_batch(
             async def _call_worker() -> DelegationResult:
                 if _worker is not None:
                     return await _worker(job.cap, job.model, sink)
-                # `asyncio.to_thread` — NOT a bare `loop.run_in_executor(executor,
-                # ...)` — copies the calling context, so the
-                # `capture_stderr_for_delegation()` ContextVar this `with` block just
-                # set is still visible from INSIDE the worker thread. It dispatches
-                # onto the loop's DEFAULT executor, sized above by
-                # `_ensure_sized_default_executor` so it is never capped below
-                # `max_parallel_agents`.
-                return await asyncio.to_thread(_run_one_delegation, job, config, sink, stats)
+                # `_call_real_worker` dispatches via `asyncio.to_thread` — NOT a bare
+                # `loop.run_in_executor(executor, ...)` — which copies the calling
+                # context, so the `capture_stderr_for_delegation()` ContextVar this
+                # `with` block just set is still visible from INSIDE the worker
+                # thread. It dispatches onto the loop's DEFAULT executor, sized above
+                # by `_ensure_sized_default_executor` so it is never capped below
+                # `max_parallel_agents`, and threads this delegation through the
+                # cross-process slot wrapper (R21c) whenever `slots_dir` is set.
+                return await _call_real_worker(job, config, sink, slots_dir=slots_dir, stats=stats)
 
             return await _execute_delegation(
                 job.model,

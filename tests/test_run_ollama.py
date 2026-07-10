@@ -3279,7 +3279,12 @@ def test_run_batch_serial_two_overlapping_processes_cannot_both_hold_the_global_
     """Simulate a second overlapping process that already holds the sole global slot
     (`max_parallel_agents = 1`, so there is exactly one slot, `slot-0.lock`): this
     process's serial delegation must be REJECTED, not silently allowed to run a second
-    concurrent Ollama agent against the endpoint."""
+    concurrent Ollama agent against the endpoint.
+
+    `run_batch` never RAISES a per-delegation `DelegationError` (the same contract
+    `_reject_if_circuit_open`'s open-circuit rejection already follows elsewhere in this
+    module, unchanged by this task) -- it is returned as this delegation's own result,
+    so a rejected sibling never aborts a whole batch."""
     from circuit_breaker import CircuitBreaker
     from errors import DelegationError
     from run_lock import acquire_slot
@@ -3290,13 +3295,14 @@ def test_run_batch_serial_two_overlapping_processes_cannot_both_hold_the_global_
     acquire_slot(slots_dir, max_parallel=1, timeout=60)  # "process A" holds the only slot
     cfg = run_ollama._cfg_for_batch(max_parallel_agents=1, max_queued_agents=0)
     job = run_ollama._Job(cap="coder", model="m", prompt="p")
-    with pytest.raises(DelegationError):
-        asyncio.run(
-            run_ollama.run_batch(
-                [job],
-                config=cfg,
-                output_dir=output_dir,
-                managed=True,
-                breaker=CircuitBreaker(),
-            )
+    results = asyncio.run(
+        run_ollama.run_batch(
+            [job],
+            config=cfg,
+            output_dir=output_dir,
+            managed=True,
+            breaker=CircuitBreaker(),
         )
+    )
+    assert len(results) == 1
+    assert isinstance(results[0], DelegationError)  # rejected, not a silent 2nd concurrent agent

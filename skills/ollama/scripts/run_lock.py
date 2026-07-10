@@ -290,6 +290,28 @@ def is_dir_live(run_dir: str) -> bool:
 
 STDOUT_TOKEN_FILENAME = ".ollama-stdout.lock"
 _EPHEMERAL_RECLAIM_RETRIES = 3  # bounded reclaim attempts -> no livelock on a hot race
+# Release retry (MS7 Task 3 fix): on Windows, `os.remove` on an ephemeral lockfile can
+# transiently fail (PermissionError WinError 5/32, "being used by another process") when
+# several REAL OS threads contend on the same handful of tiny lockfiles at once (`run_
+# batch`'s fan-out drives genuinely concurrent `asyncio.to_thread` workers) -- the same
+# class of Windows filesystem contention already documented for `os.replace` elsewhere in
+# this codebase. Swallowing that on the FIRST attempt (the old behavior) silently STRANDS
+# the lockfile on disk for up to its own staleness bound, artificially shrinking the
+# available token/slot pool for everyone else in the meantime. A short, bounded retry
+# closes that gap without changing the release contract (still best-effort, still never
+# raises).
+_RELEASE_RETRY_ATTEMPTS = 10
+_RELEASE_RETRY_DELAY_SECONDS = 0.005
+# Torn-write grace (MS7 Task 3 fix): the 3-line payload is written by a SINGLE os.write
+# call, but the file is briefly observable as 0 BYTES between a winning `os.open(O_CREAT
+# | O_EXCL)` and that write landing -- a real, non-negligible window under genuine
+# multi-threaded contention (`run_batch`'s fan-out drives several concurrent OS threads,
+# via `asyncio.to_thread`, racing to acquire the same handful of slot files). A VERY
+# fresh empty/corrupt lockfile is presumed mid-write (held); only one older than this
+# grace is presumed a genuine abandoned corpse (reclaimable). Generous relative to a
+# single small os.write's real latency, tiny relative to any legitimate holder's own
+# multi-second-to-minutes lifetime.
+_EPHEMERAL_TORN_WRITE_GRACE_SECONDS = 2
 
 
 def _ephemeral_payload(bound: int) -> bytes:
@@ -401,9 +423,17 @@ def _lockfile_holder_is_live(path: str) -> bool:
     permanently coexist with, a reclaimer.
 
     Rules, in priority order:
-      1. PID field unparseable (``pid is None``) -> INDETERMINATE: fall back to the
-         age/bound heuristic -- fresh (``age < bound``) -> treated as held (not yet
-         reclaimable); past the bound, or age/bound themselves unparseable -> reclaimable.
+      0. PID/age/bound ALL unparseable (a totally empty or unreadable file) -> a
+         TORN-WRITE window (a concurrent winner's `os.open(O_CREAT|O_EXCL)` landed but
+         its `os.write` has not yet -- see :data:`_EPHEMERAL_TORN_WRITE_GRACE_SECONDS`)
+         is far more likely, under real thread/process contention, than a genuinely
+         abandoned corpse: the file's own mtime decides -- younger than the grace
+         window -> presumed mid-write (held, not yet reclaimable); older -> presumed
+         abandoned (reclaimable).
+      1. PID field unparseable but SOME field parsed (``pid is None``, not rule 0) ->
+         INDETERMINATE: fall back to the age/bound heuristic -- fresh (``age < bound``)
+         -> treated as held (not yet reclaimable); past the bound, or age/bound
+         themselves unparseable -> reclaimable.
       2. PID parses but the process is dead (``is_pid_alive`` is False) -> reclaimable.
       3. PID parses and the process is alive, but ``age``/``bound`` both parse and
          ``age >= bound`` -> reclaimable (PID-recycling-safe: the bound overrides a live
@@ -416,10 +446,22 @@ def _lockfile_holder_is_live(path: str) -> bool:
     Returns:
         True if a live process holds the lock and its bound has not yet elapsed (do not
         steal it); False if it is reclaimable (dead PID, bound-expired despite a live
-        PID, or an indeterminate/corrupt lock past its fallback bound).
+        PID, a torn-write file past its grace window, or an indeterminate/corrupt lock
+        past its fallback bound).
     """
     pid, age, bound = _read_lock_fields(path)
     if pid is None:
+        if age is None and bound is None:
+            # Rule 0: nothing at all parsed -- a 0-byte (or otherwise unreadable)
+            # lockfile. Use the file's OWN mtime as the freshness signal (mirrors the
+            # run-dir lock's `_dir_is_within_setup_grace` TOCTOU-grace pattern): a file
+            # created moments ago is presumed to be a concurrent winner's write still in
+            # flight, not an abandoned corpse.
+            try:
+                age_on_disk = time.time() - os.path.getmtime(path)
+            except OSError:
+                return False  # vanished mid-check -> nothing left to hold, reclaimable
+            return age_on_disk < _EPHEMERAL_TORN_WRITE_GRACE_SECONDS
         # Corrupt/indeterminate PID: liveness cannot be checked at all, so the bound
         # decides (same fallback role as in is_dir_live's lockless-dir branch, above).
         return age is not None and bound is not None and age < bound
@@ -487,13 +529,28 @@ def _acquire_ephemeral(path: str, bound: int) -> bool:
 def _release_ephemeral(path: str) -> None:
     """Remove the ephemeral lockfile at *path* if present (best-effort, idempotent).
 
+    Retries a bounded number of times on a TRANSIENT ``OSError`` (e.g. Windows
+    ``PermissionError`` WinError 5/32 from a concurrent reader/writer briefly holding
+    the file under real thread/process contention) before giving up silently --
+    without this, a single transient failure would strand the lockfile on disk for up
+    to its own staleness bound, shrinking the available pool for every other
+    contender in the meantime. ``FileNotFoundError`` (already gone -- another
+    reclaimer, or a concurrent release) is the normal idempotent case and returns
+    immediately, never counted as a retryable failure.
+
     Args:
         path: The ephemeral lockfile to remove.
     """
-    try:
-        os.remove(path)
-    except OSError:
-        pass
+    for attempt in range(_RELEASE_RETRY_ATTEMPTS):
+        try:
+            os.remove(path)
+            return
+        except FileNotFoundError:
+            return  # already gone -- nothing left to release (idempotent)
+        except OSError:
+            if attempt == _RELEASE_RETRY_ATTEMPTS - 1:
+                return  # best-effort: exhausted retries, give up silently
+            time.sleep(_RELEASE_RETRY_DELAY_SECONDS)
 
 
 def acquire_token(path: str, timeout: int) -> bool:
@@ -540,3 +597,106 @@ def release_token(path: str) -> None:
         path: The token lockfile to release.
     """
     _release_ephemeral(path)
+
+
+# --- Cross-process concurrency slot-counter (R21c, MS7 Task 3) ---
+#
+# Makes `max_parallel_agents` a GLOBAL cap, not merely a per-process one: the
+# in-process `Scheduler` semaphore (MS5) only bounds concurrency WITHIN one
+# `run_ollama.py`; two independent processes would each run up to `max_parallel_agents`
+# (e.g. 3 + 3 = 6 agents against the endpoint). Reuses the SAME shared ephemeral-lock
+# primitive as the stdout token above (`_acquire_ephemeral`/`_lockfile_holder_is_live`,
+# O_EXCL + 3-line short-bound payload + TOCTOU-safe dead-holder reclaim) -- one on-disk
+# format, one parser, one algorithm for every ephemeral lockfile this runtime creates.
+
+SLOTS_DIRNAME = ".ollama-slots"
+
+
+def _cleanup_orphaned_slots(slots_dir: str) -> None:
+    """Best-effort sweep of reclaimable ``slot-*.lock`` files under *slots_dir*.
+
+    `acquire_slot`'s own probe loop already reclaims (by overwriting) a stale file it
+    happens to land on WITHIN the current ``0..max_parallel-1`` range, but a slot file
+    OUTSIDE that range -- e.g. ``slot-5.lock`` left behind by a previous, larger
+    ``max_parallel_agents`` -- would otherwise never be probed again and accumulate
+    under ``.ollama-slots/`` forever. This sweep runs once per `acquire_slot` call and
+    removes every ``slot-*.lock`` whose holder :func:`_lockfile_holder_is_live` reports
+    reclaimable, regardless of its index. The ``.ollama-slots/`` dir lives under the
+    per-project namespace (alongside the ``ollama-run-*`` dirs, R15) -- its stale files
+    are reclaimed on the next `acquire_slot` from ANY process of that project, never
+    another project's.
+
+    Total: a listing/stat/remove failure is a silent no-op -- this is pure hygiene
+    (disk cleanliness), never load-bearing for the concurrency cap itself (which is
+    enforced solely by `acquire_slot`'s own atomic probe/reclaim).
+
+    Args:
+        slots_dir: The per-project slots dir to sweep.
+    """
+    try:
+        names = os.listdir(slots_dir)
+    except OSError:
+        return
+    for name in names:
+        if not (name.startswith("slot-") and name.endswith(".lock")):
+            continue
+        path = os.path.join(slots_dir, name)
+        try:
+            if not _lockfile_holder_is_live(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def acquire_slot(slots_dir: str, max_parallel: int, timeout: int) -> int | None:
+    """Acquire a cross-process concurrency slot (R21c); return its index or None.
+
+    Bounds concurrent Ollama agents to *max_parallel* GLOBALLY across processes -- the
+    in-process ``Scheduler`` semaphore (MS5) only caps one process. First opportunistically
+    sweeps `.ollama-slots/` for any reclaimable slot file (:func:`_cleanup_orphaned_slots`
+    -- including ones outside the current probe range, so orphans from a previous, larger
+    ``max_parallel_agents`` don't accumulate), then probes indices ``0..max_parallel-1``
+    and acquires the FIRST free one via the shared ephemeral-lock primitive (``O_EXCL``
+    create, 3-line short-bound payload, TOCTOU-safe dead-slot reclaim). All slots held by
+    live processes -> returns None, which the caller treats as an R21b queue/rejection
+    (never a silent over-subscription of the endpoint).
+
+    Accepted, documented (INFO): the probe is ``O(max_parallel)`` filesystem
+    round-trips per acquisition -- trivial at the default ``max_parallel_agents = 3``
+    (and still negligible in the tens), not a hot loop. Correctness also assumes every
+    process sharing this ``slots_dir`` agrees on the SAME ``max_parallel``: the
+    per-project ``./.claude/ollama-agents.toml`` gives this for free (one config, one
+    project), but an env override (``OLLAMA_AGENTS_MAX_PARALLEL``) that differs between
+    two overlapping processes of the SAME project is **unsupported** -- a smaller value
+    in one process only bounds the slots THAT process probes, not the ones the other
+    process already holds beyond it. Keep ``max_parallel_agents`` consistent per project.
+
+    Args:
+        slots_dir: The per-project slots dir (``<project_run_root>/.ollama-slots``).
+        max_parallel: The global concurrency cap (``max_parallel_agents``).
+        timeout: Per-delegation timeout (drives the short staleness bound).
+
+    Returns:
+        The acquired slot index (0-based), or None if every slot is live.
+    """
+    try:
+        os.makedirs(slots_dir, exist_ok=True)
+    except OSError:
+        return None
+    _cleanup_orphaned_slots(slots_dir)
+    bound = staleness_bound_ephemeral(timeout)
+    for index in range(max_parallel):
+        slot_path = os.path.join(slots_dir, f"slot-{index}.lock")
+        if _acquire_ephemeral(slot_path, bound):
+            return index
+    return None
+
+
+def release_slot(slots_dir: str, index: int) -> None:
+    """Release the slot at *index* (best-effort, OSError-guarded, idempotent).
+
+    Args:
+        slots_dir: The per-project slots dir.
+        index: The slot index to release (as returned by `acquire_slot`).
+    """
+    _release_ephemeral(os.path.join(slots_dir, f"slot-{index}.lock"))
