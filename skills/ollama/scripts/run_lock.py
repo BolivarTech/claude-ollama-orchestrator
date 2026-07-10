@@ -666,7 +666,17 @@ def _acquire_ephemeral(path: str, bound: int) -> bool:
         if not _write_close_ephemeral(fd, payload):  # ALWAYS closes the fd (no leak)
             return False
         pid, _age, _bound = _read_lock_fields(path)  # ownership re-verification
-        return pid == os.getpid()
+        if pid == os.getpid():
+            return True
+        # Re-verify did NOT read back our pid. In practice this is a transient read glitch on
+        # our OWN O_EXCL-created lock (a competitor cannot leave a DIFFERENT live pid at `path`:
+        # the atomic steal above RESTORES a live holder's lock rather than overwriting it). When
+        # the file reads unreadable/gone (pid is None), remove OUR stranded creation so it is not
+        # seen as held by later acquirers until the bound expires; a different, non-None
+        # (competitor) pid is LEFT ALONE -- never evict a lock we do not own.
+        if pid is None:
+            _remove_quiet(path)
+        return False
     return False
 
 

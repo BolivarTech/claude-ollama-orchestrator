@@ -443,6 +443,27 @@ def test_acquire_ephemeral_never_deletes_a_stolen_live_lock_when_restore_fails(
     assert pid == b_pid  # B's live-lock content is preserved intact, never destroyed
 
 
+def test_acquire_ephemeral_cleans_up_its_own_lock_when_reverify_reads_none(tmp_path, monkeypatch):
+    """No stranded lock: if the post-create ownership re-verify reads back None (a transient
+    read glitch on our OWN freshly created lock), _acquire_ephemeral must remove that lock
+    before returning False -- otherwise it lingers claiming our PID and is seen as held by
+    later acquirers until the bound expires. A different (competitor) pid is left alone."""
+    path = str(tmp_path / "eph.lock")
+    _write_ephemeral(path, pid=999_999, bound=60)  # stale holder -> drives the reclaim path
+    monkeypatch.setattr(run_lock, "is_pid_alive", lambda pid: pid == os.getpid())  # stale = dead
+    real_read = run_lock._read_lock_fields
+
+    def _glitch_own_verify(p):
+        r = real_read(p)
+        # Only the post-create re-verify reads back OUR pid; return a glitchy None for it.
+        return (None, None, None) if r[0] == os.getpid() else r
+
+    monkeypatch.setattr(run_lock, "_read_lock_fields", _glitch_own_verify)
+    result = run_lock._acquire_ephemeral(path, bound=60)
+    assert result is False  # re-verify failed -> did not acquire
+    assert not os.path.exists(path)  # our stranded lock was cleaned up, not left behind
+
+
 def test_acquire_ephemeral_writes_full_payload_even_on_a_short_os_write(tmp_path, monkeypatch):
     """os.write may perform a SHORT write (fewer bytes than requested); the lock payload must
     be written in FULL (looped) so the lockfile never lands with a truncated/torn payload that
