@@ -331,7 +331,16 @@ def _via_audio_endpoint(
         ) from None
     text = payload.get("text", "") if isinstance(payload, dict) else ""
     elapsed = time.monotonic() - start
-    return DelegationResult(text, 0, estimate_tokens(text), True, elapsed)
+    # Keyword args (self-documenting): the endpoint returns no `usage`, so token counts are
+    # ESTIMATED (`estimated=True`) -- NOT a truncated/short output (`truncated` keeps its
+    # False default). `elapsed_s` is the wall-clock duration; `tok_per_s` derives from it.
+    return DelegationResult(
+        content=text,
+        prompt_tokens=0,
+        completion_tokens=estimate_tokens(text),
+        estimated=True,
+        elapsed_s=elapsed,
+    )
 
 
 def _via_audio_chat(
