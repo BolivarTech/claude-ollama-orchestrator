@@ -387,6 +387,26 @@ def test_acquire_ephemeral_does_not_evict_a_live_lock_swapped_in_during_reclaim(
     assert pid == b_pid  # B's live lock is intact at `path`, not evicted -> no double ownership
 
 
+def test_acquire_ephemeral_writes_full_payload_even_on_a_short_os_write(tmp_path, monkeypatch):
+    """os.write may perform a SHORT write (fewer bytes than requested); the lock payload must
+    be written in FULL (looped) so the lockfile never lands with a truncated/torn payload that
+    would misparse (wrong PID/bound) -- which could wrongly report a live holder as stale."""
+    path = str(tmp_path / "eph.lock")
+    real_write = run_lock.os.write
+    state = {"short_done": False}
+
+    def _short_first_write(fd, data):
+        if not state["short_done"]:
+            state["short_done"] = True
+            return real_write(fd, data[:1])  # only 1 byte on the first call
+        return real_write(fd, data)
+
+    monkeypatch.setattr(run_lock.os, "write", _short_first_write)
+    assert run_lock._acquire_ephemeral(path, bound=60) is True
+    pid, _age, bound = run_lock._read_lock_fields(path)
+    assert pid == os.getpid() and bound == 60  # the whole 3-line payload landed
+
+
 def test_acquire_ephemeral_closes_fd_when_write_fails_no_descriptor_leak(tmp_path, monkeypatch):
     """No FD leak: if `os.write` raises after a successful `O_EXCL` open, `_acquire_ephemeral`
     must still close the descriptor (try/finally) before returning False -- otherwise the fd

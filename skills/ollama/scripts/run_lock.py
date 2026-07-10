@@ -519,7 +519,15 @@ def _write_close_ephemeral(fd: int, payload: bytes) -> bool:
         True if the write succeeded, False if it raised ``OSError``.
     """
     try:
-        os.write(fd, payload)
+        # os.write may perform a SHORT write (return fewer bytes than requested); loop over
+        # the remaining bytes so the whole payload always lands -- a truncated write would
+        # leave a torn lockfile that misparses (wrong PID/bound).
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:  # defensive: a non-positive return can't make progress
+                return False
+            view = view[written:]
         return True
     except OSError:
         return False
