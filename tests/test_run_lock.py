@@ -356,6 +356,37 @@ def test_cleanup_leaves_in_range_slots_to_atomic_reclaim_sweeps_only_out_of_rang
     assert not os.path.exists(out_of_range)  # out-of-range orphan: swept
 
 
+def test_acquire_ephemeral_does_not_evict_a_live_lock_swapped_in_during_reclaim(
+    tmp_path, monkeypatch
+):
+    """R7d/R21c mutual exclusion: if a competing reclaimer swaps a FRESH LIVE lock into the
+    path in the window between this reclaim's liveness check and its claim, _acquire_ephemeral
+    must NOT evict that live holder. It must detect the live lock (by inspecting what it
+    atomically claimed) and back off (return False), leaving the competitor's lock intact --
+    never a plain check-then-remove that deletes the live file and produces two owners."""
+    path = str(tmp_path / "ephemeral.lock")
+    b_pid = 424242  # a distinct "competitor" PID we mark alive
+    _write_ephemeral(path, pid=999_999, bound=60)  # stale holder this caller wants to reclaim
+    monkeypatch.setattr(run_lock, "is_pid_alive", lambda pid: pid == b_pid)  # only B is alive
+    real_is_live = run_lock._lockfile_holder_is_live
+    calls = {"n": 0}
+
+    def _swap_live_lock_then_report_dead(p):
+        calls["n"] += 1
+        if calls["n"] == 1 and p == path:
+            # Simulate competitor B finishing its reclaim: a FRESH LIVE lock now sits at `path`.
+            # Our caller's first check still saw the ORIGINAL stale (dead) holder.
+            _write_ephemeral(path, pid=b_pid, bound=60)
+            return False
+        return real_is_live(p)
+
+    monkeypatch.setattr(run_lock, "_lockfile_holder_is_live", _swap_live_lock_then_report_dead)
+    result = run_lock._acquire_ephemeral(path, bound=60)
+    assert result is False  # backed off; did not steal B's live lock
+    pid, _age, _bound = run_lock._read_lock_fields(path)
+    assert pid == b_pid  # B's live lock is intact at `path`, not evicted -> no double ownership
+
+
 def test_acquire_ephemeral_closes_fd_when_write_fails_no_descriptor_leak(tmp_path, monkeypatch):
     """No FD leak: if `os.write` raises after a successful `O_EXCL` open, `_acquire_ephemeral`
     must still close the descriptor (try/finally) before returning False -- otherwise the fd

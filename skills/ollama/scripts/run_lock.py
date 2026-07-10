@@ -311,7 +311,18 @@ _RELEASE_RETRY_DELAY_SECONDS = 0.005
 # grace is presumed a genuine abandoned corpse (reclaimable). Generous relative to a
 # single small os.write's real latency, tiny relative to any legitimate holder's own
 # multi-second-to-minutes lifetime.
-_EPHEMERAL_TORN_WRITE_GRACE_SECONDS = 2
+#
+# FILESYSTEM mtime GRANULARITY (Caspar residual): rule 0 compares `time.time()` against
+# `os.path.getmtime()`. On a coarse-granularity filesystem (FAT/exFAT store mtime to the
+# nearest 2 s) a just-created file can already report an apparent age near 2 s, which a
+# 2-second grace would treat as reclaimable the instant it is written -- prematurely
+# stealing a mid-write lock. The grace is therefore set ABOVE FAT's 2 s granularity (plus
+# margin) so even the coarsest common filesystem keeps a freshly created empty lock "held"
+# through its whole torn-write window. NTFS/ext4/APFS (sub-second) are unaffected either
+# way; the wider value only lets a genuinely abandoned corpse linger a couple extra seconds
+# (negligible vs. any real holder's lifetime). Defense-in-depth on top of the atomic
+# `os.replace` claim in `_acquire_ephemeral`, which no longer removes blind.
+_EPHEMERAL_TORN_WRITE_GRACE_SECONDS = 5
 
 
 def _ephemeral_payload(bound: int) -> bytes:
@@ -519,16 +530,33 @@ def _write_close_ephemeral(fd: int, payload: bytes) -> bool:
             pass
 
 
+def _remove_quiet(path: str) -> None:
+    """``os.remove`` *path*, swallowing any ``OSError`` (already gone / transient FS error).
+
+    Used for best-effort cleanup of a private reclaim scratch file where a failure to remove
+    is never fatal (the file is PID-scoped and self-heals on the next attempt).
+    """
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def _acquire_ephemeral(path: str, bound: int) -> bool:
     """Atomically acquire the ephemeral lockfile at *path*, reclaiming a stale holder.
 
     Fresh path -> ``O_CREAT|O_EXCL`` create wins outright (we own it, no re-verify needed).
     Path held by a LIVE process -> return False. Path whose holder is DEAD/stale ->
-    TOCTOU-safe bounded reclaim: for at most ``_EPHEMERAL_RECLAIM_RETRIES`` rounds,
-    remove the stale file and ``O_EXCL``-recreate it, then **re-verify ownership** by
-    re-reading the PID on disk -- if a competing reclaimer beat us (the PID isn't ours),
-    back off (return False) rather than assume we hold it. Bounded retries avoid a
-    livelock when two processes race to reclaim the same corpse.
+    TOCTOU-safe bounded reclaim: for at most ``_EPHEMERAL_RECLAIM_RETRIES`` rounds, ATOMICALLY
+    claim the stale file with ``os.replace`` into a private ``<path>.reclaim.<pid>`` (exactly
+    one racer can move a given file), then inspect that STOLEN copy in isolation. If it turns
+    out a competitor swapped a fresh LIVE lock in during the window, RESTORE it and back off --
+    never evict a live holder (R7d/R21c mutual exclusion). If it was genuinely stale, discard
+    it and ``O_EXCL``-create our own lock, then **re-verify ownership** by re-reading the PID.
+    A competing reclaimer that beat us to the ``O_EXCL`` create makes us retry, and bounded
+    retries avoid a livelock when two processes race the same corpse. (The restore path has a
+    rare triple-race that can overwrite a third racer's fresh lock -- an accepted, bounded,
+    self-healing limitation of portable lockfiles without an OS advisory lock.)
 
     Args:
         path: The lockfile path to acquire.
@@ -553,15 +581,37 @@ def _acquire_ephemeral(path: str, bound: int) -> bool:
         # write fails). A failed write means we hold an empty/torn file -> return False; its
         # own mtime grace (rule 0) makes it reclaimable, so nothing is stranded.
         return _write_close_ephemeral(fd, payload)
+    steal_path = f"{path}.reclaim.{os.getpid()}"
     for _ in range(_EPHEMERAL_RECLAIM_RETRIES):
         if _lockfile_holder_is_live(path):
             return False  # live holder -> do not steal
+        # TOCTOU-safe reclaim (R7d/R21c mutual exclusion). A plain check-then-`os.remove`
+        # could delete a FRESH LIVE lock that a competing reclaimer placed in the window
+        # between the liveness check above and the remove -- evicting a live holder and
+        # producing TWO owners. Instead ATOMICALLY claim whatever is at `path` by moving it
+        # to a private name (`os.replace` moves exactly one file; only one racer can win a
+        # given file), then inspect the STOLEN copy in isolation where no competitor can
+        # mutate it:
         try:
-            os.remove(path)
+            os.replace(path, steal_path)
         except FileNotFoundError:
-            pass  # another reclaimer already removed it
+            continue  # another reclaimer already took it -> retry (path may be free now)
         except OSError:
             return False
+        if _lockfile_holder_is_live(steal_path):
+            # A competitor swapped in a LIVE lock during our window; we must NOT evict it.
+            # Restore it (best-effort) and back off. The restore can, in a rare triple-race,
+            # overwrite yet another racer's fresh lock -- an ACCEPTED bounded limitation of
+            # portable lockfiles (no OS advisory lock): still self-healing (at most a transient
+            # +1, resolved on the next release/reclaim), never a permanent double-owner.
+            try:
+                os.replace(steal_path, path)
+            except OSError:
+                _remove_quiet(steal_path)
+            return False
+        # The stolen copy was genuinely stale -> discard it; `path` is now free. Create our
+        # fresh lock atomically; if a competitor created one meanwhile, O_EXCL fails -> retry.
+        _remove_quiet(steal_path)
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
@@ -682,6 +732,15 @@ def _cleanup_orphaned_slots(slots_dir: str, max_parallel: int) -> None:
     race-free. This keeps the sweep pure hygiene, never load-bearing for the cap (enforced
     solely by `acquire_slot`'s atomic probe/reclaim). The ``.ollama-slots/`` dir lives under
     the per-project namespace (alongside the ``ollama-run-*`` dirs, R15).
+
+    MISMATCHED ``max_parallel`` (documented, unsupported -- Caspar residual): "out of range"
+    is relative to THIS caller's *max_parallel*. If two processes shared the dir with
+    DIFFERENT caps (the explicitly unsupported config, see :func:`acquire_slot`), a
+    smaller-cap process would treat a larger-cap holder's higher-index slot as an orphan.
+    Even then a genuinely LIVE holder is safe -- the sweep removes a file ONLY when
+    :func:`_lockfile_holder_is_live` reports it reclaimable, so a live holder within its bound
+    is never swept; only a holder that has already crashed or blown its bound (i.e. was itself
+    reclaimable) can be. Keep ``max_parallel_agents`` consistent per project to avoid it.
 
     Total: a listing/stat/remove failure -- or an unparseable ``slot-<x>.lock`` index -- is
     a silent no-op.
