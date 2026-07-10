@@ -467,7 +467,20 @@ def _lockfile_holder_is_live(path: str) -> bool:
         return age is not None and bound is not None and age < bound
     if not is_pid_alive(pid):
         return False
-    if age is not None and bound is not None and age >= bound:
+    if age is None or bound is None:
+        # Live PID but an INCOMPLETE/corrupt payload -- a torn write that landed the PID line
+        # but not a valid age/bound, or later corruption. The persisted bound can't be
+        # applied, so a purely liveness-based rule would keep this lock IMMORTAL if that PID
+        # number was recycled to an unrelated live process. Fall back to the file's own mtime
+        # (like rule 0): younger than the grace -> presumed a concurrent winner's write still
+        # in flight (held); older -> the writer died mid-write, reclaimable. This guarantees an
+        # ephemeral lock ALWAYS self-heals rather than wedging a slot/token forever.
+        try:
+            age_on_disk = time.time() - os.path.getmtime(path)
+        except OSError:
+            return False  # vanished mid-check -> reclaimable
+        return age_on_disk < _EPHEMERAL_TORN_WRITE_GRACE_SECONDS
+    if age >= bound:
         return False  # bound-expired: reclaimable even though a live process owns this PID
     return True
 

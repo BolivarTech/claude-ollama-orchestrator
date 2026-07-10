@@ -372,3 +372,28 @@ def test_acquire_slot_never_exceeds_max_parallel_under_real_thread_contention(tm
     assert len(acquired) == max_parallel
     assert len(set(acquired)) == max_parallel  # all distinct -- no double-acquire of an index
     assert all(0 <= i < max_parallel for i in acquired)
+
+
+def test_live_pid_with_corrupt_bound_and_old_mtime_is_reclaimable_not_immortal(
+    tmp_path, monkeypatch
+):
+    # An ephemeral lock whose PID line parses (and that PID is ALIVE -- e.g. the OS recycled
+    # it to an unrelated live process) but whose BOUND is corrupt/missing (a torn write that
+    # landed past the first line) must NEVER become IMMORTAL: the persisted bound can't be
+    # applied, so a purely liveness-based rule would report it "held" forever. Fall back to
+    # the file's mtime -- an OLD such lock self-heals to reclaimable.
+    import os
+    import time
+
+    import run_lock
+    from run_lock import _lockfile_holder_is_live
+
+    lock = str(tmp_path / "slot-0.lock")
+    with open(lock, "w", encoding="utf-8") as fh:
+        fh.write(
+            f"{os.getpid()}\n2026-07-10T00:00:00+00:00\nnotanumber\n"
+        )  # PID+ISO ok, bound corrupt
+    old = time.time() - 3600  # 1h old, far past the 2s torn-write grace
+    os.utime(lock, (old, old))
+    monkeypatch.setattr(run_lock, "is_pid_alive", lambda pid: True)  # PID recycled -> "alive"
+    assert _lockfile_holder_is_live(lock) is False  # reclaimable, NOT immortal
