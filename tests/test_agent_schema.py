@@ -222,3 +222,38 @@ def test_validate_output_does_not_mutate_its_input():
     assert src["findings"][0]["title"] == "t" + zwsp  # input UNCHANGED (still has zwsp)
     assert out["findings"][0]["title"] == "t"  # returned object is cleaned
     assert out is not src and out["findings"] is not src["findings"]
+
+
+# --- MS7 Task 7: reviewer findings can optionally carry a location claim (`file`/`line`),
+# so R30's diff_guard has something to ground. Additive, backward-compatible: not added
+# to "required", so MS1's original finding shape (no location claim) keeps validating.
+
+
+def test_reviewer_finding_optional_file_and_line_validate_when_present():
+    obj = {
+        "capability": "reviewer",
+        "findings": [
+            {"severity": "warning", "title": "t", "detail": "d", "file": "src/app.py", "line": 11}
+        ],
+    }
+    out = validate_output("reviewer", obj)
+    assert out["findings"][0]["file"] == "src/app.py"
+    assert out["findings"][0]["line"] == 11
+
+
+def test_reviewer_finding_without_file_or_line_still_validates():
+    # Backward compatibility: MS1's original finding shape (no location claim) is
+    # untouched by this additive schema change.
+    obj = {"capability": "reviewer", "findings": [{"severity": "info", "title": "t", "detail": "d"}]}
+    assert validate_output("reviewer", obj)["findings"][0].get("file") is None
+
+
+def test_reviewer_finding_bad_line_type_fails():
+    obj = {
+        "capability": "reviewer",
+        "findings": [
+            {"severity": "info", "title": "t", "detail": "d", "file": "x.py", "line": "11"}
+        ],
+    }
+    with pytest.raises(ValidationError):
+        validate_output("reviewer", obj)  # line must be an integer, not a string

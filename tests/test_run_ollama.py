@@ -3354,3 +3354,81 @@ def test_thinking_dispatch_strips_think_to_the_conclusion():
         config=cfg,
     )
     assert out.content == "Use a min-heap."  # <think> scratchpad stripped, conclusion kept
+
+
+# --- MS7 Task 7: wire diff_guard into the reviewer dispatch path via CLI `--diff` (R30).
+
+_DIFF = (
+    "diff --git a/src/app.py b/src/app.py\n"
+    "--- a/src/app.py\n"
+    "+++ b/src/app.py\n"
+    "@@ -10,2 +10,3 @@\n"
+    " context\n"
+    "+added line one\n"
+    "+added line two\n"
+)
+
+_REVIEW_WITH_ONE_FABRICATED_FINDING = (
+    '{"capability": "reviewer", "findings": ['
+    '{"severity": "warning", "title": "real", "detail": "d", "file": "src/app.py", "line": 11}, '
+    '{"severity": "critical", "title": "ghost", "detail": "d", '
+    '"file": "does/not/exist.py", "line": 5}]}'
+)
+
+
+class _FakeReviewBackend:
+    """Always returns one grounded finding + one finding on a file absent from `_DIFF`."""
+
+    def run(
+        self,
+        capability,
+        system_prompt,
+        prompt,
+        model,
+        timeout,
+        *,
+        response_format=None,
+        deadline=None,
+    ):
+        return DelegationResult(_REVIEW_WITH_ONE_FABRICATED_FINDING, 0, 0, True, 0.0)
+
+
+def test_dispatch_with_diff_drops_the_finding_on_a_file_absent_from_the_diff():
+    out = run_ollama.dispatch(
+        "reviewer",
+        "review this change",
+        backend=_FakeReviewBackend(),
+        model=_CFG.models["reviewer"],
+        timeout=60,
+        system_prompt="s",
+        config=_CFG,
+        diff=_DIFF,
+    )
+    titles = [f["title"] for f in out.parsed["findings"]]
+    assert titles == ["real"]  # the fabricated-file finding never reaches Claude
+
+
+def test_dispatch_without_diff_passes_every_finding_through_unchanged():
+    out = run_ollama.dispatch(
+        "reviewer",
+        "review this change",
+        backend=_FakeReviewBackend(),
+        model=_CFG.models["reviewer"],
+        timeout=60,
+        system_prompt="s",
+        config=_CFG,
+    )
+    titles = [f["title"] for f in out.parsed["findings"]]
+    assert titles == ["real", "ghost"]  # no --diff given => diff_guard never invoked
+
+
+def test_build_parser_accepts_optional_diff_flag(tmp_path):
+    diff_file = tmp_path / "change.diff"
+    diff_file.write_text(_DIFF, encoding="utf-8")
+    ns = build_parser().parse_args(["reviewer", "in", "--diff", str(diff_file)])
+    assert ns.diff == str(diff_file)  # raw arg; run_delegation loads it via _load_input
+
+
+def test_build_parser_diff_defaults_to_none():
+    ns = build_parser().parse_args(["reviewer", "in"])
+    assert ns.diff is None
