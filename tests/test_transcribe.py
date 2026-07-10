@@ -386,3 +386,34 @@ def test_escape_multipart_filename_strips_every_control_char_not_only_crlf():
     assert _escape_multipart_filename('q"x\\y') == 'q\\"x\\\\y'
     # a legitimate non-ASCII filename is untouched
     assert _escape_multipart_filename("café_日本.wav") == "café_日本.wav"
+
+
+def test_multipart_body_neutralizes_every_header_interpolated_field_not_only_filename():
+    """[SECURITY] Every string interpolated into a multipart HEADER -- the field `name`, the
+    `file_field`, and the `mime` -- must be neutralized, not only the filename. A CR/LF in any
+    of them could otherwise break out of a `Content-Disposition`/`Content-Type` header and
+    inject an arbitrary header or extra part. Round-trip through the real stdlib multipart
+    parser and assert no injected header survives on any part, and no raw injected header line
+    appears in the header region of the body."""
+    import email
+    from email import policy
+
+    from transcribe import _multipart_body
+
+    body, content_type = _multipart_body(
+        {"model\r\nX-Injected: pwned": "v\r\nY-Injected: pwned"},
+        file_field='fi\r\nZ-Injected: pwned"le',
+        filename="ok.wav",
+        file_bytes=_WAV,
+        mime="audio/wav\r\nW-Injected: pwned",
+    )
+    header = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("ascii")
+    msg = email.message_from_bytes(header + body, policy=policy.compat32)
+    assert msg.is_multipart()
+    for part in msg.get_payload():
+        for injected in ("X-Injected", "Y-Injected", "Z-Injected", "W-Injected"):
+            assert part.get(injected) is None  # none became a real MIME header
+    # No raw CR/LF-delimited injected header line survives anywhere in the body.
+    assert b"\r\nX-Injected: pwned" not in body
+    assert b"\r\nZ-Injected: pwned" not in body
+    assert b"\r\nW-Injected: pwned" not in body

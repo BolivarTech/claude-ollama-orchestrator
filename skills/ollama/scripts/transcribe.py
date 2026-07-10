@@ -178,6 +178,19 @@ def transcribe(
     )
 
 
+def _strip_header_controls(value: str) -> str:
+    """Remove every C0 control char, DEL, and the Unicode line/paragraph separators from
+    *value* so no control character can reach an interpolated MIME header (CR/LF split
+    headers; the rest is stripped as cheap defense-in-depth). Printable content -- including
+    non-ASCII -- is preserved verbatim. Unlike :func:`_escape_multipart_filename` this does
+    NOT escape the quote/backslash: use it for header TOKENS (a ``Content-Type`` mime) and
+    form-field part bodies, where a backslash-escape would corrupt the value, not protect it.
+    """
+    return "".join(
+        c for c in value if ord(c) >= 0x20 and c != "\x7f" and c not in "\u0085\u2028\u2029"
+    )
+
+
 def _escape_multipart_filename(filename: str) -> str:
     """Escape *filename* for safe interpolation into a ``Content-Disposition`` header.
 
@@ -208,12 +221,9 @@ def _escape_multipart_filename(filename: str) -> str:
         A filename string safe to interpolate inside a double-quoted header value.
     """
     escaped = filename.replace("\\", "\\\\").replace('"', '\\"')
-    # CR/LF are the ONLY exploitable characters here (MIME headers split solely on them, and
-    # the multipart boundary is an unguessable uuid4), but stripping EVERY C0 control char,
-    # DEL, and the Unicode line/paragraph separators (NEL/LS/PS) as well is cheap
-    # defense-in-depth: no line-terminating or C0 control character reaches the header value.
-    # The escape of `\`/`"` above produces `\\`/`\"` (both printable), so it survives this pass.
-    return "".join(c for c in escaped if ord(c) >= 0x20 and c != "\x7f" and c not in "  ")
+    # Reuse the shared control-strip; the `\`/`"` escape above yields printable `\`/`\"`,
+    # so it survives this pass. CR/LF are the only exploitable chars, the rest defense-in-depth.
+    return _strip_header_controls(escaped)
 
 
 def _multipart_body(
@@ -223,29 +233,39 @@ def _multipart_body(
 
     Returns ``(body, content_type)`` where *content_type* carries the boundary.
 
-    Security: *filename* is escaped via :func:`_escape_multipart_filename` before being
-    interpolated into the ``Content-Disposition`` header — an unescaped filename
-    containing ``"``, ``\\``, or a CR/LF could otherwise inject/break MIME headers
-    (header injection), letting an attacker-controlled filename smuggle extra
-    multipart fields or corrupt the request the server parses.
+    Security: EVERY string interpolated into a header is neutralized, not only *filename*.
+    A ``"``/``\\``/CR/LF in any of the field ``name``, the ``file_field``, the ``filename``,
+    or the ``mime`` could otherwise break out of its ``Content-Disposition``/``Content-Type``
+    header and inject an arbitrary header or extra multipart part (header injection). The
+    quoted-string values (field name, file_field, filename) go through
+    :func:`_escape_multipart_filename` (escape ``"``/``\\`` + strip controls); the
+    ``Content-Type`` token (mime) and the form-field part bodies go through
+    :func:`_strip_header_controls` (strip controls only -- a backslash-escape would corrupt a
+    token or a body value). The current caller passes only trusted constants, so this is
+    defense-in-depth against any future untrusted field data. The multipart boundary is an
+    unguessable ``uuid4``, so a part body can never accidentally contain it.
     """
     boundary = f"----ollama{uuid.uuid4().hex}"
     crlf = b"\r\n"
     safe_filename = _escape_multipart_filename(filename)
     parts: list[bytes] = []
     for name, value in fields.items():
+        safe_name = _escape_multipart_filename(name)  # quoted `name="..."` header value
+        safe_value = _strip_header_controls(value)  # part body: strip CR/LF, keep quotes
         parts += [
             f"--{boundary}".encode(),
-            f'Content-Disposition: form-data; name="{name}"'.encode(),
+            f'Content-Disposition: form-data; name="{safe_name}"'.encode(),
             b"",
-            value.encode("utf-8"),
+            safe_value.encode("utf-8"),
         ]
+    safe_file_field = _escape_multipart_filename(file_field)  # quoted header value
+    safe_mime = _strip_header_controls(mime)  # Content-Type token
     parts += [
         f"--{boundary}".encode(),
         (
-            f'Content-Disposition: form-data; name="{file_field}"; filename="{safe_filename}"'
+            f'Content-Disposition: form-data; name="{safe_file_field}"; filename="{safe_filename}"'
         ).encode(),
-        f"Content-Type: {mime}".encode(),
+        f"Content-Type: {safe_mime}".encode(),
         b"",
         file_bytes,
         f"--{boundary}--".encode(),
