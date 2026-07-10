@@ -357,19 +357,27 @@ def test_429_retry_after_http_date_is_parsed():
 
 def test_oversized_response_body_raises_backend_error():
     # Always-on DoS backstop: a runaway/hostile server response over MAX_RESPONSE_BYTES
-    # must be rejected — never fully decoded/JSON-parsed, never loaded unbounded.
+    # must be rejected — never fully decoded/JSON-parsed, never loaded unbounded. R24c
+    # (MS6) layers a TIGHTER, config-driven bound atop this floor and can only tighten
+    # it, never loosen it — so an explicit `max_output_bytes` override far larger than
+    # MAX_RESPONSE_BYTES must still clamp down to this absolute ceiling.
     class _Oversized:
         def __call__(self, req, timeout=None):
             return io.BytesIO(b"x" * (MAX_RESPONSE_BYTES + 1))
 
+    backend = OllamaBackend(
+        _cfg(), urlopen=_Oversized(), max_output_bytes=MAX_RESPONSE_BYTES * 2
+    )
     with pytest.raises(OllamaBackendError) as exc:
-        OllamaBackend(_cfg(), urlopen=_Oversized()).run("coder", "s", "p", "m", 60)
-    assert "MAX_RESPONSE_BYTES" in str(exc.value)
+        backend.run("coder", "s", "p", "m", 60)
+    assert "max body size" in str(exc.value).lower()
 
 
 def test_response_read_is_called_with_a_bound_never_unbounded():
     # The core backstop only holds if the read itself is bounded (`resp.read(N)`), not a
     # bare `resp.read()`/`resp.read(-1)` that would defeat the whole point of the cap.
+    # An explicit `max_output_bytes` override far larger than MAX_RESPONSE_BYTES proves
+    # R24c's tighter bound never LOOSENS this absolute floor (it can only tighten it).
     seen: dict[str, int] = {}
 
     class _Resp:
@@ -381,7 +389,9 @@ def test_response_read_is_called_with_a_bound_never_unbounded():
         def __call__(self, req, timeout=None):
             return _Resp()
 
-    OllamaBackend(_cfg(), urlopen=_Rec()).run("coder", "s", "p", "m", 60)
+    OllamaBackend(_cfg(), urlopen=_Rec(), max_output_bytes=MAX_RESPONSE_BYTES * 2).run(
+        "coder", "s", "p", "m", 60
+    )
     assert seen["n"] == MAX_RESPONSE_BYTES + 1
 
 
@@ -725,4 +735,92 @@ def test_429_default_rng_draws_independent_jitter_under_real_concurrency():
     # sequences are, with cryptographically negligible probability of collision,
     # NOT identical — if they were somehow lockstepped/serialized around a shared
     # RNG state, they would match exactly on every run.
+
+
+# --- Task 4 (MS6): R24c — transactional output cap (anti-runaway) ---
+
+
+def test_transactional_response_over_cap_is_truncated_and_flagged(capsys):
+    rec = _Recorder(content="a" * 20)
+    res = OllamaBackend(_cfg(), urlopen=rec, max_output_bytes=8).run(
+        "coder", "s", "p", "m", 60)
+    assert res.truncated is True
+    assert len(res.content.encode("utf-8")) == 8
+    assert "truncat" in capsys.readouterr().err.lower()
+
+
+def test_transactional_response_under_cap_is_not_truncated():
+    rec = _Recorder(content="short")
+    res = OllamaBackend(_cfg(), urlopen=rec, max_output_bytes=2_000_000).run(
+        "coder", "s", "p", "m", 60)
+    assert res.truncated is False
+    assert res.content == "short"
+
+
+def test_transactional_cap_is_utf8_byte_accurate_not_code_point_accurate():
+    # Each CJK char below is 3 UTF-8 bytes; a code-point-based cap would let ~3x more
+    # BYTES through than the configured byte budget allows.
+    cjk = "語" * 10                      # 10 code points, 30 UTF-8 bytes
+    rec = _Recorder(content=cjk)
+    res = OllamaBackend(_cfg(), urlopen=rec, max_output_bytes=9).run(
+        "coder", "s", "p", "m", 60)
+    assert res.truncated is True
+    assert len(res.content.encode("utf-8")) <= 9
+    res.content.encode("utf-8")               # must not raise: never split mid-character
+
+
+def test_default_max_output_bytes_matches_streaming_default():
+    from ollama_stream import DEFAULT_MAX_OUTPUT_BYTES as STREAM_DEFAULT
+    from backend import DEFAULT_MAX_OUTPUT_BYTES as BACKEND_DEFAULT
+    assert BACKEND_DEFAULT == STREAM_DEFAULT
+
+
+def test_transactional_body_exceeding_bound_aborts_without_full_read(capsys):
+    # [WARNING → CLOSED] Caspar's condition: the RAW body read must itself be bounded
+    # — reading the full body first and truncating the extracted content afterward
+    # would still exhaust memory on a runaway response. This proves (a) the read call
+    # is bounded to `max_output_bytes + _ENVELOPE_MARGIN_BYTES + 1` (never an unbounded
+    # `-1`), mirroring
+    # test_binary_input.py::test_oversize_read_is_bounded_and_never_reads_the_whole_file
+    # for the same anti-DoS property on the HTTP transactional path, and (b) an
+    # over-bound body ABORTS the transaction (`OllamaBackendError`) rather than trying
+    # to parse a truncated JSON envelope.
+    from backend import _ENVELOPE_MARGIN_BYTES
+    from errors import OllamaBackendError
+    read_sizes: list[int] = []
+    oversized = b'{"choices": [{"message": {"content": "' + b"a" * 200_000 + b'"}}]}'
+
+    class _FakeResponse:
+        def read(self, size=-1):
+            read_sizes.append(size)
+            assert size != -1, "transactional read must never be unbounded"
+            return oversized[:size]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _urlopen(req, timeout=None):
+        return _FakeResponse()
+
+    backend = OllamaBackend(_cfg(), urlopen=_urlopen, max_output_bytes=8)
+    with pytest.raises(OllamaBackendError, match="max body size"):
+        backend.run("coder", "s", "p", "m", 60)
+    assert read_sizes == [8 + _ENVELOPE_MARGIN_BYTES + 1]
+    assert "aborting" in capsys.readouterr().err.lower()
+
+
+def test_transactional_body_within_bound_still_parses_and_caps_content():
+    # Complements the abort test above: a body that FITS within
+    # max_output_bytes + _ENVELOPE_MARGIN_BYTES is parsed normally (never aborted), and
+    # the content-level cap (test_transactional_response_over_cap_is_truncated_and_flagged,
+    # above) still applies as a secondary guard — the bounded-read fix does not disturb
+    # the existing content-truncation behavior for a within-bound response.
+    rec = _Recorder(content="a" * 20)
+    res = OllamaBackend(_cfg(), urlopen=rec, max_output_bytes=8).run(
+        "coder", "s", "p", "m", 60)
+    assert res.truncated is True
+    assert len(res.content.encode("utf-8")) == 8
     assert slept_a != slept_b
