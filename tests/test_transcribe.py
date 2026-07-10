@@ -442,3 +442,31 @@ def test_multipart_body_neutralizes_every_header_interpolated_field_not_only_fil
     assert b"\r\nX-Injected: pwned" not in body
     assert b"\r\nZ-Injected: pwned" not in body
     assert b"\r\nW-Injected: pwned" not in body
+
+
+def test_multipart_body_uses_rfc5987_filename_star_for_non_ascii_names():
+    """A non-ASCII filename gets an ASCII fallback in `filename="..."` PLUS an RFC 5987
+    `filename*=UTF-8''<pct-encoded>` (which conformant servers prefer). The percent-encoding
+    also keeps it injection-safe. An ASCII-only name omits the redundant `filename*`."""
+    from transcribe import _multipart_body
+
+    body, _ct = _multipart_body(
+        {"model": "whisper-1"},
+        file_field="file",
+        filename="café_日本.wav",
+        file_bytes=b"RIFF....WAVE....",
+        mime="audio/wav",
+    )
+    # café_日本.wav -> UTF-8 percent-encoded (é=%C3%A9, 日本 = %E6%97%A5%E6%9C%AC)
+    assert b"filename*=UTF-8''caf%C3%A9_%E6%97%A5%E6%9C%AC.wav" in body
+    assert b'filename="caf' in body  # ASCII fallback present (non-ASCII replaced)
+
+    ascii_body, _ = _multipart_body(
+        {"model": "whisper-1"},
+        file_field="file",
+        filename="plain.wav",
+        file_bytes=b"RIFF....WAVE....",
+        mime="audio/wav",
+    )
+    assert b"filename*=" not in ascii_body  # redundant for an ASCII-only name
+    assert b'filename="plain.wav"' in ascii_body

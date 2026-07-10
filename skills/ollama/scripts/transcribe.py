@@ -19,6 +19,7 @@ import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Callable
@@ -264,11 +265,20 @@ def _multipart_body(
         ]
     safe_file_field = _escape_multipart_filename(file_field)  # quoted header value
     safe_mime = _strip_header_controls(mime)  # Content-Type token
+    # A NON-ASCII filename in the legacy `filename="..."` is not spec-compliant, so emit an
+    # ASCII fallback there plus an RFC 5987 `filename*=UTF-8''<pct-encoded>` for the real name
+    # (which conformant servers prefer). `urllib.parse.quote(safe="")` percent-encodes every
+    # non-unreserved byte -- including CR/LF/quotes -> %0D/%0A/%22 -- so `filename*` is also
+    # injection-safe by construction. ASCII-only filenames skip the redundant `filename*`.
+    ascii_fallback = safe_filename.encode("ascii", "replace").decode("ascii")
+    disposition = (
+        f'Content-Disposition: form-data; name="{safe_file_field}"; filename="{ascii_fallback}"'
+    )
+    if any(ord(c) > 0x7F for c in filename):
+        disposition += f"; filename*=UTF-8''{urllib.parse.quote(filename, safe='')}"
     parts += [
         f"--{boundary}".encode(),
-        (
-            f'Content-Disposition: form-data; name="{safe_file_field}"; filename="{safe_filename}"'
-        ).encode(),
+        disposition.encode(),
         f"Content-Type: {safe_mime}".encode(),
         b"",
         file_bytes,
