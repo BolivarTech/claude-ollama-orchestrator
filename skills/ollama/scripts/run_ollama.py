@@ -1156,8 +1156,11 @@ _DEFAULT_EXECUTOR_MIN_WORKERS = 4
 # loop object itself (never a private attribute written onto the loop) gives "construct
 # once per loop, reuse thereafter" with zero private-attribute coupling: a
 # garbage-collected loop's entry is dropped automatically, so there is nothing to leak.
+# The value pairs the executor with the worker count it was sized to, so a later, LARGER
+# batch on the same loop can detect an under-sized pool and GROW it (R21 "never fewer")
+# without reading `ThreadPoolExecutor`'s private `_max_workers`.
 _SIZED_DEFAULT_EXECUTORS: weakref.WeakKeyDictionary[
-    asyncio.AbstractEventLoop, concurrent.futures.ThreadPoolExecutor
+    asyncio.AbstractEventLoop, tuple[concurrent.futures.ThreadPoolExecutor, int]
 ] = weakref.WeakKeyDictionary()
 
 
@@ -1184,12 +1187,16 @@ def _ensure_sized_default_executor(
     defeating R21's "never more than `max_parallel_agents` at once, and never fewer"
     intent.
 
-    Guarded so it runs exactly ONCE per loop: the sized executor is cached in the
-    module-level `_SIZED_DEFAULT_EXECUTORS` `WeakKeyDictionary` keyed by the loop object
-    itself. A second `run_batch`/`_run_batch_serial_fast_path` call on the SAME loop is a
-    cheap dict lookup returning the SAME executor instance, never a new
-    `ThreadPoolExecutor` construction. A NEW loop has no entry yet, so it gets its own
-    freshly-sized executor — no cross-loop/cross-process leakage.
+    Constructs at most once per (loop, high-water size): the sized executor is cached in
+    the module-level `_SIZED_DEFAULT_EXECUTORS` `WeakKeyDictionary` keyed by the loop
+    object itself, paired with the worker count it was sized to. A later
+    `run_batch`/`_run_batch_serial_fast_path` call on the SAME loop whose `max_parallel`
+    fits the cached size is a cheap dict lookup returning the SAME executor instance; a
+    call needing MORE workers GROWS the pool (shuts the old one down non-blocking and
+    installs a larger replacement) so a small first batch can never permanently cap a
+    larger later batch below its own semaphore (R21 "never fewer"). A NEW loop has no
+    entry yet, so it gets its own freshly-sized executor — no cross-loop/cross-process
+    leakage.
 
     Args:
         loop: The currently-running event loop (`asyncio.get_running_loop()`).
@@ -1200,15 +1207,25 @@ def _ensure_sized_default_executor(
         The (possibly newly-constructed, possibly cached) `ThreadPoolExecutor` now
         installed as `loop`'s default executor.
     """
-    existing = _SIZED_DEFAULT_EXECUTORS.get(loop)
-    if existing is not None:
-        return existing
+    needed = max(max_parallel, _DEFAULT_EXECUTOR_MIN_WORKERS)
+    cached = _SIZED_DEFAULT_EXECUTORS.get(loop)
+    if cached is not None:
+        existing_executor, existing_size = cached
+        if existing_size >= needed:
+            return existing_executor
+        # The cached pool was sized by an earlier, SMALLER batch on this loop and would
+        # silently cap this larger batch below its `max_parallel` semaphore (breaking
+        # R21's "never fewer"). Grow it: shut the old one down non-blocking (its idle
+        # threads are reclaimed; any still-running future from a prior batch keeps its own
+        # thread until it finishes — batches are sequential under the single-orchestrator
+        # model, so normally there are none) and install a larger replacement.
+        existing_executor.shutdown(wait=False, cancel_futures=False)
     executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=max(max_parallel, _DEFAULT_EXECUTOR_MIN_WORKERS),
+        max_workers=needed,
         thread_name_prefix="ollama-worker",
     )
     loop.set_default_executor(executor)
-    _SIZED_DEFAULT_EXECUTORS[loop] = executor
+    _SIZED_DEFAULT_EXECUTORS[loop] = (executor, needed)
     return executor
 
 

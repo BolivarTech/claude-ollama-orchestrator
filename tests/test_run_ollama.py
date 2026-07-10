@@ -2508,6 +2508,79 @@ def test_run_batch_thread_pool_sized_to_max_parallel_not_capped_by_default_execu
         assert all(getattr(r, "content", None) == "ok" for r in results)
 
 
+def test_run_batch_grows_sized_executor_for_a_larger_later_batch_on_same_loop(tmp_path):
+    # R21 "never FEWER than max_parallel": the loop's DEFAULT executor is sized once per
+    # loop and cached (`_ensure_sized_default_executor`). A FIRST batch with a SMALL
+    # max_parallel must not permanently cap a later, LARGER batch on the SAME loop -- the
+    # cached executor must GROW so the second batch's semaphore (not a stale small pool)
+    # stays the true concurrency limit. Two `run_batch` calls within ONE `asyncio.run`
+    # (one loop) with an increasing max_parallel: with the sized-ONCE bug, the big batch
+    # inherits the small batch's pool and plateaus below N; grown, all N run at once.
+    import threading
+
+    import run_ollama
+    from backend import DelegationResult
+
+    SMALL = 2
+    N = 40
+    release = threading.Event()
+    entered = {"count": 0}
+    lock = threading.Lock()
+
+    def _blocking_job(cap, model, sink):
+        with lock:
+            entered["count"] += 1
+        release.wait(timeout=5.0)  # blocks a REAL OS thread until released
+        return DelegationResult("ok", 1, 1, True, 0.1)
+
+    def _fake_dispatch(
+        capability, prompt, *, backend, model, timeout, system_prompt, config, sink=None, stats=None
+    ):
+        return _blocking_job(capability, model, sink)
+
+    import unittest.mock
+
+    with (
+        unittest.mock.patch.object(run_ollama, "dispatch", _fake_dispatch),
+        unittest.mock.patch.object(run_ollama, "load_system_prompt", lambda cap: "sys"),
+        unittest.mock.patch.object(run_ollama, "_make_backend", lambda cfg: object()),
+    ):
+        small_cfg = run_ollama._cfg_for_batch(max_parallel_agents=SMALL, max_queued_agents=0)
+        big_cfg = run_ollama._cfg_for_batch(max_parallel_agents=N, max_queued_agents=0)
+        small_jobs = [run_ollama._Job(cap="coder", model="m", prompt="p") for _ in range(SMALL)]
+        big_jobs = [run_ollama._Job(cap="coder", model="m", prompt="p") for _ in range(N)]
+
+        async def _drive():
+            # First (small) batch: sizes THIS loop's default executor to max(SMALL, floor).
+            # `release` is set so its jobs run straight through and the batch completes.
+            release.set()
+            await run_ollama.run_batch(small_jobs, config=small_cfg, output_dir=str(tmp_path))
+            release.clear()
+            with lock:
+                entered["count"] = 0
+            # Second (larger) batch on the SAME loop: must grow the executor to N.
+            task = asyncio.create_task(
+                run_ollama.run_batch(big_jobs, config=big_cfg, output_dir=str(tmp_path))
+            )
+            for _ in range(100):
+                with lock:
+                    if entered["count"] >= N:
+                        break
+                await asyncio.sleep(0.05)
+            with lock:
+                stalled_at = entered["count"]  # captured BEFORE release, at the decision point
+                reached_all = stalled_at >= N
+            release.set()
+            return await task, reached_all, stalled_at
+
+        results, reached_all, stalled_at = asyncio.run(_drive())
+        assert reached_all, (
+            f"only {stalled_at}/{N} jobs entered concurrently — the loop's executor kept "
+            "the first (small) batch's size instead of growing for the larger batch"
+        )
+        assert all(getattr(r, "content", None) == "ok" for r in results)
+
+
 def test_run_batch_stderr_contextvar_propagates_to_worker_thread(tmp_path, capsys):
     # [CRITICAL, seventh round -- the actual regression test for this round's
     # fix] `_run_one_delegation` runs on a REAL OS worker thread (dispatched
