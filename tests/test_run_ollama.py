@@ -2040,6 +2040,66 @@ def test_run_batch_outer_interrupt_releases_probe_for_a_job_never_reached_by_one
     assert breaker.is_open("flaky:cloud", now=1e15) is False
 
 
+def test_run_batch_interrupt_evicts_the_dead_executor_from_the_loop_cache(tmp_path):
+    # WARNING fix: run_batch's BaseException cleanup shuts the loop's cached default
+    # executor DOWN; it must ALSO evict it from `_SIZED_DEFAULT_EXECUTORS`. Otherwise a
+    # LATER batch on the SAME loop retrieves the now-dead executor and every
+    # `asyncio.to_thread` submit raises `RuntimeError: cannot schedule new futures after
+    # shutdown`. The first batch is interrupted at the Scheduler level (the outer
+    # `except BaseException` handler); the second batch on the same loop must then run on
+    # a FRESH executor and succeed.
+    import run_ollama
+    from backend import DelegationResult
+    from scheduler import Scheduler
+
+    state = {"boom": True}
+    real_run_all = Scheduler.run_all
+
+    async def _maybe_boom(self, thunks):
+        if state["boom"]:
+            raise KeyboardInterrupt  # a genuine whole-batch interrupt (R27), pre-worker
+        return await real_run_all(self, thunks)
+
+    def _dispatch(
+        capability, prompt, *, backend, model, timeout, system_prompt, config, sink=None, stats=None
+    ):
+        # Real dispatch path (not the `_job=` seam) so the SECOND batch actually submits
+        # through `asyncio.to_thread` -> the loop's sized default executor, exercising the
+        # dead-executor bug if the first batch's cleanup left it cached.
+        return DelegationResult("ok", 1, 1, True, 0.1)
+
+    import unittest.mock
+
+    with (
+        unittest.mock.patch.object(Scheduler, "run_all", _maybe_boom),
+        unittest.mock.patch.object(run_ollama, "dispatch", _dispatch),
+        unittest.mock.patch.object(run_ollama, "load_system_prompt", lambda cap: "sys"),
+        unittest.mock.patch.object(run_ollama, "_make_backend", lambda cfg: object()),
+    ):
+        cfg = run_ollama._cfg_for_batch(max_parallel_agents=2, max_queued_agents=0)
+        jobs = [run_ollama._Job(cap="coder", model="m", prompt="p") for _ in range(2)]
+
+        async def _drive():
+            # managed=False on both: the executor shutdown+eviction on interrupt is
+            # independent of the R27 rmtree, and keeping the shared dir intact isolates the
+            # dead-executor concern (a managed=True first batch would rmtree the dir the
+            # second batch then needs, masking it with a FileNotFoundError instead).
+            with pytest.raises(KeyboardInterrupt):
+                await run_ollama.run_batch(
+                    jobs, config=cfg, output_dir=str(tmp_path), managed=False
+                )
+            # Second batch on the SAME loop must NOT reuse the shut-down executor.
+            state["boom"] = False
+            return await run_ollama.run_batch(
+                jobs, config=cfg, output_dir=str(tmp_path), managed=False
+            )
+
+        results = asyncio.run(_drive())
+        assert all(getattr(r, "content", None) == "ok" for r in results), (
+            f"second batch did not run cleanly on a fresh executor: {results}"
+        )
+
+
 def test_run_batch_cancelled_error_is_captured_per_delegation_not_fatal_to_siblings(tmp_path):
     # Post-approval fix #1 (Caspar spec gap, R27): asyncio.CancelledError is a
     # BaseException (Python 3.8+), so Scheduler.run_all's

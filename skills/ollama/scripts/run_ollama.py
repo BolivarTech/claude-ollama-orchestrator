@@ -1699,6 +1699,12 @@ async def _run_batch_serial_fast_path(
             # calls on the same loop). A worker thread already running is bounded by its
             # own socket timeout regardless.
             executor.shutdown(wait=False, cancel_futures=True)
+            # ...and EVICT it from the loop cache: a shut-down executor left cached would
+            # make a LATER batch on this same loop retrieve it and fail every
+            # `asyncio.to_thread` submit with `RuntimeError: cannot schedule new futures
+            # after shutdown`. The next `_ensure_sized_default_executor` on this loop then
+            # builds and installs a fresh one (a cache miss), so the loop self-heals.
+            _SIZED_DEFAULT_EXECUTORS.pop(loop, None)
             if managed:
                 shutil.rmtree(output_dir, ignore_errors=True)
             raise
@@ -1948,6 +1954,11 @@ async def run_batch(
         # sized default executor across calls on the same loop). A worker thread
         # already running is bounded by its own socket timeout regardless.
         executor.shutdown(wait=False, cancel_futures=True)
+        # Evict the now-dead executor from the loop cache so a later batch on this loop
+        # does not retrieve it and fail every `asyncio.to_thread` submit with
+        # `RuntimeError: cannot schedule new futures after shutdown` — same self-healing
+        # eviction as the serial fast path's interrupt handler.
+        _SIZED_DEFAULT_EXECUTORS.pop(loop, None)
         if managed:
             shutil.rmtree(output_dir, ignore_errors=True)
         raise
