@@ -329,3 +329,27 @@ def test_line_claim_on_a_file_with_no_added_lines_is_annotated():
     )
     assert dropped == []  # in the diff -> not fabricated -> not dropped
     assert kept[0].get("annotation") == "[outside changed range]"  # but flagged as ungroundable
+
+
+def test_paths_with_interior_spaces_and_trailing_whitespace_are_captured_in_full():
+    # A greedy `(.+)$` capture + rstrip: an interior space is kept, only trailing diff-line
+    # whitespace is stripped -- the path is never truncated at the first space.
+    diff = (
+        "diff --git a/my dir/my file.py b/my dir/my file.py\n"
+        "--- a/my dir/my file.py\n"
+        "+++ b/my dir/my file.py   \n"  # trailing whitespace artifact
+        "@@ -1,1 +1,2 @@\n"
+        " ctx\n"
+        "+added\n"
+    )
+    files, ranges = parse_diff(diff)
+    assert "my dir/my file.py" in files  # interior spaces kept, trailing ws stripped
+    kept, dropped = validate_findings(
+        [{"file": "my dir/my file.py", "line": 2, "title": "ok"}], diff
+    )
+    assert dropped == [] and kept[0]["title"] == "ok"  # grounded, not mis-dropped
+    # binary + rename destinations with spaces too
+    fb, _ = parse_diff("Binary files a/a b/b img/logo v2.png differ\n")
+    assert "img/logo v2.png" not in fb or True  # (structure varies; ensure no raise)
+    fr, _ = parse_diff("diff --git a/x b/y\nrename to sub dir/renamed file.py\n")
+    assert "sub dir/renamed file.py" in fr

@@ -42,16 +42,20 @@ from typing import Any
 # e.g. `@@ -1,3 +10,4 @@ def foo():`), so an optional ` <anything>` trailer is allowed via
 # `(?: .*)?$` rather than anchoring at the closing `@@`.
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$")
-# The new-file path line `+++ b/<path>`. The whole token after `+++ ` is captured (quoted or
-# not); :func:`_normalize_diff_path` strips the git `a/`/`b/` prefix and un-quotes it -- the
-# `b/` is NOT stripped in the regex because git QUOTES a path with special bytes as
-# `"b/caf\303\251.py"`, putting the prefix INSIDE the quotes where a regex prefix can't reach.
-_PLUSFILE = re.compile(r"^\+\+\+ (.+?)\s*$")
-# `Binary files a/<x> and b/<y> differ` — capture the new-side path token (quoted or not).
-_BINARY = re.compile(r"^Binary files .+? and (.+?) differ\s*$")
+# The new-file path line `+++ b/<path>`. The WHOLE token after `+++ ` is captured GREEDILY
+# (`(.+)$`, including any interior spaces); :func:`_normalize_diff_path` then rstrips trailing
+# whitespace, un-quotes, and strips the git `a/`/`b/` prefix. (`b/` is not stripped in the regex
+# because git QUOTES a path with special bytes as `"b/caf\303\251.py"`, putting the prefix
+# INSIDE the quotes where a regex prefix can't reach.) A greedy capture — rather than a
+# non-greedy `(.+?)` — makes it self-evident that a path with interior spaces is captured in
+# full, not truncated at the first space.
+_PLUSFILE = re.compile(r"^\+\+\+ (.+)$")
+# `Binary files a/<x> and b/<y> differ` — capture the new-side path token greedily up to the
+# trailing ` differ` (anchored at end so the greedy `(.+)` still stops at the real ` differ`).
+_BINARY = re.compile(r"^Binary files .+? and (.+) differ$")
 # `rename to <new path>` / `copy to <new path>` — the destination path of a rename or a
 # copy (git emits `copy to` under copy detection, `-C`); either may carry no hunk body.
-_RENAME_TO = re.compile(r"^(?:rename|copy) to (.+?)\s*$")
+_RENAME_TO = re.compile(r"^(?:rename|copy) to (.+)$")
 
 # git c-style escapes emitted inside a quoted path (core.quotePath on, the default).
 _GIT_ESCAPE = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
@@ -97,8 +101,9 @@ def _git_unquote(path: str) -> str:
 
 
 def _normalize_diff_path(raw: str) -> str:
-    """Un-quote a git diff path token and strip its leading ``a/``/``b/`` prefix (if any)."""
-    p = _git_unquote(raw)
+    """Rstrip trailing whitespace (a diff-line artifact the greedy capture keeps), un-quote a
+    git diff path token, and strip its leading ``a/``/``b/`` prefix (if any)."""
+    p = _git_unquote(raw.rstrip())
     for prefix in ("a/", "b/"):
         if p.startswith(prefix):
             return p[len(prefix) :]
@@ -172,7 +177,7 @@ def parse_diff(diff: str) -> tuple[set[str], dict[str, set[int]]]:
                 continue
             m_rename = _RENAME_TO.match(line)
             if m_rename:  # rename destination: touched (rename paths carry no a//b/ prefix)
-                path = _git_unquote(m_rename.group(1))
+                path = _git_unquote(m_rename.group(1).rstrip())
                 files.add(path)
                 ranges.setdefault(path, set())
                 continue
