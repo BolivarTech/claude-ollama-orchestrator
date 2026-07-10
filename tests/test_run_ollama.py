@@ -882,6 +882,52 @@ def _delegate(argv):
     return run_ollama.run_delegation(ns)
 
 
+def test_run_delegation_acquires_and_releases_a_cross_process_slot(tmp_path, monkeypatch):
+    """R21c: the single-delegation CLI path (`main` -> `run_delegation`) must acquire a
+    GLOBAL cross-process slot, not only the fan-out batch path. Otherwise two concurrent
+    `/ollama` invocations each dispatch without a slot and exceed max_parallel_agents,
+    over-subscribing the endpoint against the documented global cap. A managed run dir with
+    fs-locks enabled acquires exactly one slot for the one delegation and releases it."""
+    _wire(monkeypatch, tmp_path, DelegationResult("hi", 3, 2, False, 0.1))
+    calls: dict[str, list] = {"acquire": [], "release": []}
+
+    def _spy_acquire(slots_dir, max_parallel, timeout):
+        calls["acquire"].append((slots_dir, max_parallel, timeout))
+        return 0
+
+    monkeypatch.setattr(run_ollama, "acquire_slot", _spy_acquire)
+    monkeypatch.setattr(
+        run_ollama,
+        "release_slot",
+        lambda slots_dir, index: calls["release"].append((slots_dir, index)),
+    )
+    assert run_ollama.main(["coder", "write hi", "--no-status"]) == 0
+    assert len(calls["acquire"]) == 1  # exactly one slot for the one delegation
+    slots_dir = calls["acquire"][0][0]
+    assert slots_dir.endswith(SLOTS_DIRNAME)
+    assert calls["release"] == [(slots_dir, 0)]  # released the acquired index
+
+
+def test_run_delegation_rejects_when_no_cross_process_slot_is_free(tmp_path, monkeypatch):
+    """R21c fail-closed: if every global slot is live (acquire_slot -> None), the single
+    delegation is rejected with DelegationError BEFORE any backend call -- never a silent
+    over-subscription; and since nothing was acquired, nothing is released."""
+    from errors import DelegationError
+
+    _wire(monkeypatch, tmp_path, DelegationResult("hi", 3, 2, False, 0.1))
+    monkeypatch.setattr(
+        run_ollama,
+        "_make_backend",
+        lambda cfg: (_ for _ in ()).throw(AssertionError("must not delegate when no slot")),
+    )
+    monkeypatch.setattr(run_ollama, "acquire_slot", lambda *a, **k: None)
+    released: list = []
+    monkeypatch.setattr(run_ollama, "release_slot", lambda *a, **k: released.append(a))
+    with pytest.raises(DelegationError):
+        _delegate(["coder", "write hi", "--no-status"])
+    assert released == []  # nothing acquired -> nothing released
+
+
 def test_managed_run_writes_full_artifacts_and_removes_lock(tmp_path, monkeypatch):
     container = _wire(monkeypatch, tmp_path, DelegationResult("hi", 3, 2, False, 0.1))
     assert run_ollama.main(["coder", "write hi", "--no-status"]) == 0

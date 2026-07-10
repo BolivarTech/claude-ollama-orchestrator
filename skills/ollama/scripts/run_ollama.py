@@ -1098,6 +1098,10 @@ def run_delegation(ns: argparse.Namespace) -> int:
         # StatusDisplay captures the REAL sys.stderr at construction (before the shim
         # below), so it still renders live while the shim buffers everyone else's stderr.
         display = None if not ns.show_status else StatusDisplay([ns.capability])
+        # R21c cross-process slot state, initialized BEFORE the try so the `finally` can
+        # release it on ANY exit path (transcribe early-return, normal return, exception).
+        slot_index: int | None = None
+        slots_dir: str | None = None
         try:
             # `active` = a live StatusDisplay owns the terminal -> buffer only (protects
             # the ANSI redraw, flush once on exit). `--no-status` -> display is None ->
@@ -1133,6 +1137,30 @@ def run_delegation(ns: argparse.Namespace) -> int:
                 stats = TokenStats()
                 if display is not None:
                     display.update(ns.capability, "running")
+                # R21c: this single delegation counts against the GLOBAL cross-process cap
+                # too, not only the fan-out batch path -- acquire one slot so two concurrent
+                # `/ollama` invocations can never exceed `max_parallel_agents` Ollama agents
+                # against the endpoint. Gated EXACTLY like the batch path (`_call_real_worker`):
+                # only a MANAGED run dir (`--output-dir` opts out of every collision protection,
+                # R15/R28) with the `disable_fs_locks` kill-switch OFF (MS7 Task 8) -> a slots
+                # dir alongside the `ollama-run-*` dirs; otherwise `None` (no slot). No free
+                # slot -> fail-closed `DelegationError` (an R21b rejection) BEFORE dispatching,
+                # so a second overlapping process degrades gracefully instead of
+                # over-subscribing. Released in this function's `finally` (covers the transcribe
+                # early-return, the normal return, and every interrupt/exception path).
+                slots_dir = (
+                    os.path.join(os.path.dirname(os.path.realpath(output_dir)), SLOTS_DIRNAME)
+                    if ns.output_dir is None and not cfg.disable_fs_locks
+                    else None
+                )
+                if slots_dir is not None:
+                    slot_index = acquire_slot(slots_dir, cfg.max_parallel_agents, ns.timeout)
+                    if slot_index is None:
+                        raise DelegationError(
+                            "no free cross-process slot: "
+                            f"{cfg.max_parallel_agents} Ollama agents already running across "
+                            "processes (raise max_parallel_agents or retry once one finishes)"
+                        )
                 # R2 transcribe (experimental, gated): the audio path goes to its OWN
                 # probe/endpoint/chat transport (MS7 Task 5), never the stream/dispatch path
                 # (which would wrongly route it to `stream_run` as text). `load_binary`
@@ -1256,6 +1284,12 @@ def run_delegation(ns: argparse.Namespace) -> int:
             _safe_display_update(display, ns.capability, "failed")
             raise
         finally:
+            # R21c: release the cross-process slot on EVERY exit path (success, transcribe
+            # early-return, timeout/failure, or interrupt). `release_slot` is total (never
+            # raises), so it cannot replace an in-flight exception; `slot_index is None`
+            # whenever no slot was acquired (unmanaged run, kill-switch, or acquire miss).
+            if slot_index is not None and slots_dir is not None:
+                release_slot(slots_dir, slot_index)
             # R20: flush/restore the live display even on interrupt or a mid-run
             # exception. Guarded (R27): a raising stop() must never REPLACE the exception
             # in flight (esp. KeyboardInterrupt), or managed_run_dir's rmtree path is missed.
