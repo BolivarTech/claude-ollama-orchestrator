@@ -6,26 +6,32 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import concurrent.futures
 import contextlib
 import io
 import json
+import logging
 import os
 import shutil
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator
-from dataclasses import replace
+import weakref
+from collections.abc import Awaitable, Callable, Iterator
+from dataclasses import dataclass, replace
 from typing import Any, TextIO
 
 from agent_schema import DISCRIMINATOR_KEYS, SCHEMAS
 from backend import AgentBackend, DelegationResult, OllamaBackend
+from circuit_breaker import CircuitBreaker
 from errors import (
     DelegationError,
     InvalidInputError,
     OllamaBackendError,
     OllamaConfigError,
     OllamaPreflightError,
+    RateLimitError,
     SinkError,
     ValidationError,
 )
@@ -39,8 +45,13 @@ from ollama_stream import stream_run
 from ollama_vision import stream_vision
 from parse_output import parse_agent_output
 from run_lock import remove_lock, staleness_bound_for_timeout, write_lock
+from scheduler import Scheduler
 from status_display import StatusDisplay
-from stderr_shim import buffered_stderr_while
+from stderr_shim import (
+    buffered_stderr_while,
+    capture_stderr_for_delegation,
+    install_dispatching_stderr,
+)
 from temp_dirs import (
     cleanup_old_runs,
     create_output_dir,
@@ -1116,6 +1127,840 @@ def main(argv: list[str] | None = None) -> int:
     ) as exc:
         print(f"Delegation failed: {exc}", file=sys.stderr)
         return 1
+
+
+# --- MS5: run_batch — bounded-concurrency fan-out (scheduler + per-model circuit
+# breaker + per-delegation stderr capture + R7c sink routing). Additive: the
+# single-delegation CLI path above (`run_delegation`, `main`) is entirely unchanged;
+# `run_batch` is the fan-out entry point Claude calls when delegating several tasks
+# at once. ---
+
+DEFAULT_BATCH_TIMEOUT_SECONDS = 60.0  # per-delegation HTTP timeout inside a fan-out batch
+
+# WARNING fix #1 (R14b): a SINGLE, process-wide `CircuitBreaker`, constructed once at
+# import time. R14b's "K consecutive failures" is a per-process invariant — it must span
+# separate `run_batch` calls (e.g. two separate `/ollama` delegations in one Claude Code
+# session), not reset every batch. `run_batch`'s `breaker=None` default resolves to THIS
+# instance; a caller that passes `breaker=` explicitly (tests, or a deliberately isolated
+# run) overrides it for that call only. Do NOT construct a fresh `CircuitBreaker()` inside
+# `run_batch` itself — that would silently make every batch start with a clean slate and
+# the circuit could never open under real, repeated usage.
+_PROCESS_CIRCUIT_BREAKER = CircuitBreaker()
+
+# Small floor for the sized default executor (below) so a tiny `max_parallel_agents`
+# (e.g. 1, on the serial fast path) still gets some headroom, rather than a degenerate
+# 1-worker pool.
+_DEFAULT_EXECUTOR_MIN_WORKERS = 4
+
+# Loop-keyed cache for the sized default executor. A `WeakKeyDictionary` keyed by the
+# loop object itself (never a private attribute written onto the loop) gives "construct
+# once per loop, reuse thereafter" with zero private-attribute coupling: a
+# garbage-collected loop's entry is dropped automatically, so there is nothing to leak.
+_SIZED_DEFAULT_EXECUTORS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, concurrent.futures.ThreadPoolExecutor
+] = weakref.WeakKeyDictionary()
+
+
+def _ensure_sized_default_executor(
+    loop: asyncio.AbstractEventLoop, max_parallel: int
+) -> concurrent.futures.ThreadPoolExecutor:
+    """Size *loop*'s DEFAULT executor to >= `max_parallel` workers, exactly ONCE per loop.
+
+    `asyncio.to_thread` always dispatches onto the loop's own DEFAULT executor
+    (`loop.run_in_executor(None, ...)` under the hood) — the ONLY reason
+    `run_batch`/`_run_batch_serial_fast_path` keep using `asyncio.to_thread` (rather than
+    an explicit, separately-passed executor) is that it ALSO copies the calling context
+    (`contextvars.copy_context().run(func, ...)`), which is what makes the per-delegation
+    `capture_stderr_for_delegation()` ContextVar still visible from INSIDE the worker
+    thread. A bare `loop.run_in_executor(executor, func)` call does NOT copy context, so
+    that alternative would silently break the stderr capture under real fan-out (every
+    worker-thread write would fall through to the real stderr instead of this
+    delegation's own buffer). This function fixes the scaling cliff a different way, by
+    sizing the DEFAULT executor itself instead of bypassing `asyncio.to_thread`.
+
+    Without this, `asyncio.to_thread`'s implicit default executor is sized to
+    ``min(32, os.cpu_count() + 4)`` workers — a `max_parallel_agents` configured above
+    that count would be silently capped by the pool, not by `Scheduler`'s semaphore,
+    defeating R21's "never more than `max_parallel_agents` at once, and never fewer"
+    intent.
+
+    Guarded so it runs exactly ONCE per loop: the sized executor is cached in the
+    module-level `_SIZED_DEFAULT_EXECUTORS` `WeakKeyDictionary` keyed by the loop object
+    itself. A second `run_batch`/`_run_batch_serial_fast_path` call on the SAME loop is a
+    cheap dict lookup returning the SAME executor instance, never a new
+    `ThreadPoolExecutor` construction. A NEW loop has no entry yet, so it gets its own
+    freshly-sized executor — no cross-loop/cross-process leakage.
+
+    Args:
+        loop: The currently-running event loop (`asyncio.get_running_loop()`).
+        max_parallel: `config.max_parallel_agents` for the batch requesting this sizing;
+            the executor is sized to `max(max_parallel, _DEFAULT_EXECUTOR_MIN_WORKERS)`.
+
+    Returns:
+        The (possibly newly-constructed, possibly cached) `ThreadPoolExecutor` now
+        installed as `loop`'s default executor.
+    """
+    existing = _SIZED_DEFAULT_EXECUTORS.get(loop)
+    if existing is not None:
+        return existing
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(max_parallel, _DEFAULT_EXECUTOR_MIN_WORKERS),
+        thread_name_prefix="ollama-worker",
+    )
+    loop.set_default_executor(executor)
+    _SIZED_DEFAULT_EXECUTORS[loop] = executor
+    return executor
+
+
+@dataclass
+class _Job:
+    """One delegation in a fan-out batch."""
+
+    cap: str
+    model: str
+    prompt: str
+    timeout: float = DEFAULT_BATCH_TIMEOUT_SECONDS
+
+
+# A batch worker: `(capability, model, sink) -> DelegationResult`. `sink` is always a
+# concrete callable (stdout's write wrapper, or this delegation's own indexed file sink)
+# — never `None` — decided once, at dispatch (R7c), by the caller.
+_WorkerFn = Callable[[str, str, Callable[[str], None]], Awaitable[DelegationResult]]
+
+
+def _dispatch_sink(
+    output_dir: str,
+    capability: str,
+    *,
+    index: int,
+    parallel: bool,
+    stack: contextlib.ExitStack,
+) -> Callable[[str], None]:
+    """Return the sink callable for a delegation (R7c).
+
+    Fan-out (*parallel* True) → a context-managed per-delegation
+    ``{cap}_{index}.stream.log`` file sink (registered on *stack* for close); serial
+    (``max_parallel_agents == 1``, *parallel* False) → stdout. Decided at dispatch, never
+    mid-stream.
+
+    *index* is this delegation's position in the ORIGINAL batch (not a per-capability
+    counter): two delegations of the SAME capability in one batch (e.g. two ``coder``
+    jobs) would otherwise both target the bare ``coder.stream.log`` and silently
+    collide/overwrite each other. Suffixing the batch index makes the filename unique
+    across the WHOLE batch.
+
+    Args:
+        output_dir: The run dir for this delegation's artifacts.
+        capability: This delegation's capability (used in the filename).
+        index: This delegation's position in the original batch.
+        parallel: Whether the batch's effective concurrency is > 1 (R7c).
+        stack: An `ExitStack` that owns the file sink's lifetime (closed when the
+            delegation's own artifact-wiring context manager exits).
+
+    Returns:
+        `stdout_sink` (serial) or a context-managed per-delegation file sink (fan-out).
+    """
+    if parallel:
+        path = os.path.join(output_dir, f"{capability}_{index}.stream.log")
+        fsink = stack.enter_context(make_file_sink(path))
+        return fsink
+    return stdout_sink
+
+
+def _persist_stderr(
+    output_dir: str, capability: str, errbuf: io.StringIO, *, index: int | None = None
+) -> None:
+    """Best-effort stderr artifact write (never raises into the caller, per MS3).
+
+    Args:
+        output_dir: The run dir to write into.
+        capability: This delegation's capability (used in the filename).
+        errbuf: The capture buffer (`io.StringIO`) whose contents to flush.
+        index: `None` for the plain, single-delegation name (`{cap}.stderr.log`,
+            matching MS3's single-delegation naming exactly); an int for the fan-out,
+            index-suffixed name (`{cap}_{index}.stderr.log`) so two same-capability jobs
+            in one batch never collide.
+    """
+    try:
+        name = f"{capability}.stderr.log" if index is None else f"{capability}_{index}.stderr.log"
+        path = os.path.join(output_dir, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(errbuf.getvalue())
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def _delegation_artifacts(
+    output_dir: str,
+    capability: str,
+    *,
+    index: int | None,
+    parallel: bool,
+    tee: bool,
+) -> Iterator[tuple[Callable[[str], None], Callable[[], None]]]:
+    """Shared per-delegation artifact wiring: sink + stderr capture + naming.
+
+    Both concurrency shapes (the fan-out `_one()` and the serial
+    `_run_batch_serial_fast_path`) build a sink and a stderr-capture buffer for one
+    delegation; this context manager is the ONE implementation both use.
+
+    Args:
+        output_dir: The run dir for this delegation's artifacts.
+        capability: This delegation's capability (used in artifact names).
+        index: `None` selects the plain, single-delegation naming (the serial fast
+            path, `{cap}.stderr.log`); an int selects the fan-out, index-suffixed naming
+            (`{cap}_{index}.stderr.log` / `{cap}_{index}.stream.log`) so two
+            same-capability jobs in one batch never collide.
+        parallel: Sink routing (R7c): `True` streams to this delegation's own indexed
+            file sink (closed when this context manager exits); `False` streams to
+            stdout.
+        tee: Whether the stderr capture ALSO tees live to the real stderr
+            (`capture_stderr_for_delegation(tee=...)`). The serial fast path passes
+            `True` (mirrors MS3's `run_delegation` — no live `StatusDisplay` at this
+            layer to protect, so diagnostics stay live); the fan-out path passes `False`
+            (concurrent delegations must NEVER tee to a shared stderr — that would
+            interleave raw output from multiple threads).
+
+    Yields:
+        `(sink, persist_stderr)`: `sink` is the per-delegation output callable (stdout's
+        write, or this delegation's own file sink). `persist_stderr` is a zero-arg,
+        never-raising callable that flushes the capture buffer to this delegation's own
+        stderr artifact — the caller invokes it itself, after the worker call completes.
+    """
+    with contextlib.ExitStack() as stack, capture_stderr_for_delegation(tee=tee) as errbuf:
+        sink = _dispatch_sink(
+            output_dir,
+            capability,
+            index=index if index is not None else 0,
+            parallel=parallel,
+            stack=stack,
+        )
+
+        def persist_stderr() -> None:
+            _persist_stderr(output_dir, capability, errbuf, index=index)
+
+        yield sink, persist_stderr
+
+
+def _run_one_delegation(
+    job: _Job,
+    config: OllamaAgentsConfig,
+    sink: Callable[[str], None] | None,
+    stats: TokenStats | None = None,
+) -> DelegationResult:
+    """Synchronous per-delegation worker — the real body `run_batch` (the
+    `_worker=None` production path) hands to `asyncio.to_thread(...)`.
+
+    Builds the same two pieces `run_delegation` (MS3's single-delegation CLI path)
+    builds for ONE capability — a backend (`_make_backend`) and its system prompt
+    (`load_system_prompt`) — then drives the already-finalized `dispatch()`, which
+    itself decides between the transactional and streaming paths per
+    `config.stream[job.cap]` and routes `sink` accordingly (MS4).
+
+    Neither the circuit breaker nor the scheduler are consulted here: the breaker's
+    fail-fast check and the semaphore/queue admission both already happened in
+    `run_batch`, on the event loop, BEFORE this thread was ever started — this function
+    only does the HTTP-bound work.
+
+    Args:
+        job: The `_Job` to run (capability, model, prompt, per-delegation timeout).
+        config: The resolved layered config (drives `backend`/`stream`/`structured`).
+        sink: The per-delegation output sink, or `None`.
+        stats: Optional shared, thread-safe `TokenStats` (R12) to fold this
+            delegation's token metrics into.
+
+    Returns:
+        The `DelegationResult` `dispatch()` produced.
+
+    Raises:
+        OllamaBackendError, TimeoutError, RateLimitError, ValidationError,
+        DelegationError: propagated as-is from `dispatch()`/the backend — the caller
+        (`_execute_delegation`) classifies these.
+    """
+    backend = _make_backend(config)
+    return dispatch(
+        job.cap,
+        job.prompt,
+        backend=backend,
+        model=job.model,
+        timeout=int(job.timeout),
+        system_prompt=load_system_prompt(job.cap),
+        config=config,
+        sink=sink,
+        stats=stats,
+    )
+
+
+def _reject_if_circuit_open(
+    job: _Job, breaker: CircuitBreaker, now: Callable[[], float]
+) -> DelegationError | None:
+    """Return the circuit-open rejection for `job`, or `None` if it may proceed.
+
+    Shared by BOTH concurrency shapes. `run_batch`'s general path calls this for EVERY
+    job in a PRE-SCHEDULING filter loop — before any of them ever reaches the
+    `Scheduler` — so an open-circuit job never occupies a semaphore/queue slot.
+    `_run_batch_serial_fast_path` calls it once for its single job.
+
+    This is a READ-ONLY check — it calls `breaker.is_definitively_open(...)`, NEVER
+    `breaker.is_open(...)`/`try_enter(...)`. A job this check lets through (returns
+    `None`) is NOT guaranteed to ever actually execute — the general path's caller may
+    still overflow-reject it in the `Scheduler` (R21b) before it ever reaches
+    `_execute_delegation`. Because `is_definitively_open` never reserves anything, a job
+    filtered through here and then discarded for any OTHER reason downstream can never
+    leak a half-open probe reservation.
+
+    Args:
+        job: The `_Job` to check (keyed by `job.model`).
+        breaker: The per-model `CircuitBreaker` (R14b).
+        now: Zero-arg callable returning the current monotonic time.
+
+    Returns:
+        A `DelegationError` (never raised) if the circuit is definitively open; `None`
+        if the delegation may proceed to scheduling.
+    """
+    if not breaker.is_definitively_open(job.model, now()):
+        return None
+    return DelegationError(
+        f"circuit open for model {job.model!r} (recent failures or a probe "
+        f"already in flight); skipping delegation {job.cap!r} until cooldown "
+        "— retry later or switch model"
+    )
+
+
+def _write_stats_best_effort(stats: TokenStats, output_dir: str) -> None:
+    """Best-effort ``token_stats.json`` write (R12).
+
+    Never raises on a disk-full/permission/read-only-temp-root failure while persisting
+    the AGGREGATE accounting artifact — that must not crash an otherwise-successful
+    batch, nor orphan a managed `output_dir` that already holds real delegation results.
+    The ONE place either concurrency shape writes `token_stats.json`.
+
+    Unlike `_persist_stderr`'s swallow-and-continue for one delegation's own diagnostic
+    log (a self-contained, minor loss), silently swallowing a `token_stats.json` write
+    failure would make the WHOLE batch's aggregate token accounting (R12) vanish with no
+    signal anywhere — so this also logs an actionable warning before swallowing.
+
+    Args:
+        stats: The batch-scoped token accumulator.
+        output_dir: The run dir to write ``token_stats.json`` into.
+    """
+    try:
+        stats.write(output_dir)
+    except OSError as exc:
+        logging.getLogger(__name__).warning(
+            "failed to persist token_stats.json to %s: %s: %s — this batch's "
+            "delegation results are unaffected, but its aggregate token "
+            "accounting (R12) for this run is lost",
+            output_dir,
+            type(exc).__name__,
+            exc,
+        )
+
+
+async def _execute_delegation(
+    model: str,
+    *,
+    call_worker: Callable[[], Awaitable[DelegationResult]],
+    breaker: CircuitBreaker,
+    persist_stderr: Callable[[], None],
+    now: Callable[[], float],
+) -> DelegationResult | BaseException:
+    """Shared per-delegation execution core: worker call + breaker classification +
+    stderr persistence, used by BOTH `_one()` (parallel fan-out) and
+    `_run_batch_serial_fast_path` (serial) — they differ only in HOW `call_worker` and
+    `persist_stderr` are built (indexed file sink vs. stdout; indexed vs. plain stderr
+    log).
+
+    The breaker is consulted, and the half-open probe slot reserved, EXCLUSIVELY here —
+    via `breaker.try_enter(model, now())`, immediately before `call_worker()` ever runs
+    — never in a pre-scheduling filter a delegation might not survive to reach.
+    `_reject_if_circuit_open` (both call sites) only ever performs the READ-ONLY
+    `is_definitively_open` peek — it can never reserve a probe for a job that then gets
+    overflow-rejected by the `Scheduler` and never executes. The reservation this
+    function DOES make is released UNCONDITIONALLY in a `finally`, for every possible
+    outcome, so it can never leak regardless of how this call ends.
+
+    Args:
+        model: The delegation's model (used to key the breaker).
+        call_worker: Zero-arg async callable that performs the actual delegation — the
+            caller closes it over its own job/sink/config/stats.
+        breaker: The per-model `CircuitBreaker` (R14b) to consult/record/release
+            against.
+        persist_stderr: Zero-arg callable that best-effort flushes this delegation's own
+            stderr capture buffer to its own artifact path (never raises).
+        now: Zero-arg callable returning the current monotonic time.
+
+    Returns:
+        A `DelegationError` immediately, WITHOUT ever calling `call_worker` or
+        `persist_stderr`, if `breaker.try_enter(model, now())` returns ``"open"``.
+        Otherwise, the successful `DelegationResult`, or the caught exception instance —
+        `RateLimitError` (breaker untouched — throttling, not a dead model),
+        `OllamaBackendError`/`TimeoutError` (breaker recorded as a failure — the ONLY
+        case that trips it), `ValidationError`/`DelegationError` (breaker untouched —
+        parse/schema failure or a scheduling rejection, not a backend failure),
+        `asyncio.CancelledError` (breaker untouched directly, but the probe is still
+        released below), or any other `Exception` (breaker untouched). NEVER re-raised
+        for any of these.
+
+    Raises:
+        BaseException: a genuine whole-batch interrupt (`KeyboardInterrupt`/
+            `SystemExit` — NOT this delegation's own `asyncio.CancelledError`, classified
+            above) — the probe release and stderr persistence in the `finally` still run
+            first, then the interrupt propagates unmodified so the caller's own R27
+            cleanup runs.
+    """
+    verdict = breaker.try_enter(model, now())
+    if verdict == "open":
+        # Fail-fast: still within cooldown, or another probe for this model is already
+        # in flight. NOTHING was reserved by this call — there is nothing to release, and
+        # no worker ever ran, so there is nothing to persist to stderr either.
+        return DelegationError(
+            f"circuit open for model {model!r} (recent failures, or a probe "
+            "already in flight); skipping — retry later or switch model"
+        )
+    is_probe = verdict == "probe"
+
+    outcome: DelegationResult | BaseException
+    try:
+        try:
+            result = await call_worker()
+        except RateLimitError as exc:
+            # Throttling, not a dead model (R14b) — the breaker's failure count is
+            # deliberately left untouched; the `finally` below still releases the probe
+            # reservation if this call held one.
+            outcome = exc
+        except (OllamaBackendError, TimeoutError) as exc:
+            # Real backend/transport failure (connection refused / 5xx / socket timeout)
+            # — the ONLY case that trips the per-model breaker. `record_failure` itself
+            # resolves a held probe reservation (reopens for a fresh cooldown); the
+            # `finally`'s `release_probe` afterward is then a documented no-op.
+            breaker.record_failure(model, now())
+            outcome = exc
+        except (ValidationError, DelegationError) as exc:
+            # Parse/schema failure (R25) or a scheduling rejection — NOT a backend
+            # failure; the breaker's failure count stays untouched, but a held probe
+            # reservation is still released by the `finally`.
+            outcome = exc
+        except asyncio.CancelledError as exc:
+            # asyncio.CancelledError is a BaseException (Python 3.8+) but must be
+            # treated as THIS delegation's own failure, never as a whole-batch interrupt
+            # (R27) — returned as data, never re-raised, so every sibling delegation runs
+            # to completion undisturbed. The probe (if held) is released by the `finally`
+            # below.
+            outcome = exc
+        except Exception as exc:  # noqa: BLE001 — classify+return as data, never crash siblings
+            # Unclassified error: never assume it means the model is unreachable.
+            # Debug-log the exception so an unexpected programming bug is observable
+            # during development, instead of surfacing ONLY as an ordinary
+            # per-delegation failure result. Never raises, preserving the
+            # never-raise-to-sibling contract.
+            logging.getLogger(__name__).debug(
+                "delegation for model %r raised an unclassified exception: %s: %s",
+                model,
+                type(exc).__name__,
+                exc,
+            )
+            outcome = exc
+        else:
+            breaker.record_success(model)
+            outcome = result
+        return outcome
+    finally:
+        # Runs for EVERY outcome above, and for a genuine BaseException
+        # (KeyboardInterrupt/SystemExit) still propagating out — stderr is always
+        # persisted, and, if this call held the probe reservation, it is ALWAYS released
+        # here: `release_probe` is a documented no-op once
+        # `record_success`/`record_failure` already resolved it, and is the ONLY thing
+        # that resolves it for every other outcome.
+        persist_stderr()
+        if is_probe:
+            breaker.release_probe(model, now())
+
+
+async def _run_batch_serial_fast_path(
+    job: _Job,
+    *,
+    config: OllamaAgentsConfig,
+    breaker: CircuitBreaker,
+    output_dir: str,
+    managed: bool,
+    _worker: _WorkerFn | None,
+    stats: TokenStats,
+    now: Callable[[], float],
+) -> list[Any]:
+    """`run_batch`'s single-delegation fast path: taken exactly when the batch is one
+    job AND `config.max_parallel_agents == 1`. Bypasses the `Scheduler` (nothing to
+    bound — there is only one job) and the fan-out per-delegation indexed-file-sink
+    routing entirely.
+
+    This path bypasses the GUARANTEED-RESTORE `install_dispatching_stderr()`
+    context-manager WRAPPER only (no whole-batch install/restore, since there is no
+    sibling delegation to isolate from) — it does NOT avoid the underlying
+    dispatching-stderr proxy itself (`_delegation_artifacts` still lazily installs it via
+    `capture_stderr_for_delegation`). Mirrors `run_delegation`'s shape instead: a stdout
+    sink, tee-live stderr capture (`tee=True` — no live `StatusDisplay` at this layer to
+    protect), and a PLAIN, unindexed `{cap}.stderr.log`.
+
+    The circuit breaker (R14b) and R27 managed-`output_dir` cleanup still apply in
+    full — neither is fan-out-specific; only the concurrency-coordination machinery
+    (Scheduler/proxy/indexed sinks) is skipped.
+
+    Args:
+        job: The batch's sole `_Job`.
+        config: Resolved layered config.
+        breaker: The `CircuitBreaker` to consult/update (the process-wide singleton by
+            default, same as the general path).
+        output_dir: The run dir for the plain `{cap}.stderr.log`.
+        managed: Whether `output_dir` is removed on an interrupt (R27).
+        _worker: Test-only seam, same contract as `run_batch`'s.
+        stats: The batch-scoped `TokenStats` (R12) to fold this delegation's tokens
+            into; written to `token_stats.json` on success via the best-effort
+            `_write_stats_best_effort`.
+        now: Zero-arg callable returning the current monotonic time (`run_batch`'s own
+            clock, shared so both paths use the same one).
+
+    Returns:
+        A single-element list: a `DelegationResult`, a `DelegationError` (open
+        circuit), or the caught exception — never a raise for anything short of a
+        genuine whole-batch interrupt.
+
+    Raises:
+        BaseException: a genuine interrupt (`KeyboardInterrupt`/`SystemExit`) — the
+            managed `output_dir` is removed first (R27) before re-raising, exactly like
+            the general path's outer handler.
+    """
+    rejection = _reject_if_circuit_open(job, breaker, now)
+    if rejection is not None:
+        return [rejection]
+
+    loop = asyncio.get_running_loop()
+    # Size the loop's DEFAULT executor once (never a dedicated per-call one) and
+    # dispatch via `asyncio.to_thread` — see `_ensure_sized_default_executor`'s own
+    # docstring for the full rationale (context propagation vs. the scaling cliff).
+    # `config.max_parallel_agents == 1` by construction on this path, so
+    # `_DEFAULT_EXECUTOR_MIN_WORKERS` is the effective floor.
+    executor = _ensure_sized_default_executor(loop, config.max_parallel_agents)
+    # Sink + stderr-capture wiring is the SAME shared `_delegation_artifacts` helper
+    # `_one()` uses — `index=None` (plain `{cap}.stderr.log`, nothing to disambiguate
+    # against with only one delegation), `parallel=False` (stdout sink), `tee=True`
+    # (mirrors MS3's `run_delegation`: no live `StatusDisplay` at this layer to protect,
+    # so diagnostics stay live).
+    with _delegation_artifacts(output_dir, job.cap, index=None, parallel=False, tee=True) as (
+        sink,
+        persist_stderr,
+    ):
+
+        async def _call_worker() -> DelegationResult:
+            if _worker is not None:
+                return await _worker(job.cap, job.model, sink)
+            return await asyncio.to_thread(_run_one_delegation, job, config, sink, stats)
+
+        try:
+            outcome = await _execute_delegation(
+                job.model,
+                call_worker=_call_worker,
+                breaker=breaker,
+                persist_stderr=persist_stderr,
+                now=now,
+            )
+        except BaseException:
+            # A genuine interrupt already released the probe and persisted stderr
+            # inside `_execute_delegation` — this path's OWN R27 step (there is no outer
+            # `run_batch` handler here, since this path never enters the
+            # Scheduler/eligible-list machinery that handler wraps) removes a MANAGED
+            # output_dir before re-raising.
+            #
+            # Bound worker-thread exit latency (R27): shut the loop-scoped executor down
+            # here too (never on a normal return, which would defeat reusing it across
+            # calls on the same loop). A worker thread already running is bounded by its
+            # own socket timeout regardless.
+            executor.shutdown(wait=False, cancel_futures=True)
+            if managed:
+                shutil.rmtree(output_dir, ignore_errors=True)
+            raise
+
+    if isinstance(outcome, BaseException):
+        # Any classified exception `_execute_delegation` returned as data (including
+        # `asyncio.CancelledError`, a BaseException, not an Exception) — nothing
+        # succeeded, so no stats to persist.
+        return [outcome]
+    _write_stats_best_effort(stats, output_dir)  # R12: same aggregate artifact as the general path
+    return [outcome]
+
+
+def _cfg_for_batch(*, max_parallel_agents: int, max_queued_agents: int) -> OllamaAgentsConfig:
+    """Build a resolved config with only the concurrency caps overridden.
+
+    Test-only helper (kept in the production module, not the test file, per MS5's
+    design decision: it is a thin, injection-only wrapper mirroring MS1-MS3's own
+    test-seam pattern, and moving it elsewhere would duplicate the construction logic).
+    """
+    base = resolve_config(global_path=None, repo_path=None, env={})
+    return replace(
+        base, max_parallel_agents=max_parallel_agents, max_queued_agents=max_queued_agents
+    )
+
+
+async def run_batch(
+    jobs: list[_Job],
+    *,
+    config: OllamaAgentsConfig,
+    breaker: CircuitBreaker | None = None,
+    output_dir: str,
+    managed: bool = True,
+    _worker: _WorkerFn | None = None,
+) -> list[Any]:
+    """Run a fan-out batch bounded by ``config.max_parallel_agents`` with per-model
+    circuit-breaking, per-delegation stderr capture, and dispatch-time sink routing.
+
+    **PER-PROCESS breaker invariant:** when ``breaker`` is omitted, this defaults to the
+    module-level ``_PROCESS_CIRCUIT_BREAKER`` singleton — the SAME shared instance
+    across every ``run_batch`` call in this process — never a fresh ``CircuitBreaker()``
+    constructed here. R14b's "K consecutive failures" is defined at the process level
+    (it must span separate batches); a fresh per-call breaker would silently reset the
+    failure count to 0 every batch and the circuit could never open under real usage.
+    Pass an explicit ``breaker=`` to opt out of the shared singleton (tests, or a caller
+    that deliberately wants an isolated breaker for one call).
+
+    Args:
+        jobs: The batch, in submission order. An EMPTY list returns ``[]`` immediately
+            — before the `Scheduler`, the stderr-dispatching proxy, or even a
+            `TokenStats()` are constructed; there is nothing to bound, dispatch, or
+            capture.
+        config: Resolved layered config (drives the semaphore/queue caps and sink
+            routing).
+        breaker: Optional `CircuitBreaker`; defaults to the process-wide
+            `_PROCESS_CIRCUIT_BREAKER` singleton (see above), NOT a fresh instance.
+        output_dir: The run dir for `{cap}_{index}.stream.log` / `{cap}_{index}.stderr.log`.
+        managed: True (default) if `output_dir` is a temp dir OWNED by this batch (mirrors
+            `managed_run_dir`'s `output_dir=None` case) — on an interrupt it is removed
+            (R27). False for a caller-supplied `--output-dir` (R15/R28): never removed.
+        _worker: Test-only seam — an async `(cap, model, sink) -> DelegationResult`
+            substituted for the real dispatch/stream HTTP path. `None` (default) in
+            production, which uses `_run_one_delegation` via `asyncio.to_thread(...)`.
+
+    Returns:
+        One entry per job, IN ORDER: a `DelegationResult`, a `DelegationError`
+        (overflow-rejected or open-circuit — neither ever occupies a slot), or the
+        raised exception (siblings unaffected). ``[]`` for an empty `jobs` list.
+
+    Raises:
+        BaseException: an interrupt (`KeyboardInterrupt`/`SystemExit`) escaping the
+            batch — a *managed* `output_dir` is removed first (R27), every ELIGIBLE
+            job's model has its half-open probe slot released (belt-and-suspenders), and
+            `sys.stderr` is restored to its pre-batch object (via
+            `install_dispatching_stderr`), then re-raised.
+
+    Note (R12, fail-open persistence, explicit trade-off): `token_stats.json` is written
+    ONLY at SUCCESSFUL batch completion — partial stats from a mid-batch hard failure
+    are NOT persisted (mirrors how a managed `output_dir` itself is `rmtree`'d wholesale
+    on that same path, R27: there is nothing meaningful left to write stats INTO). The
+    write itself is best-effort (`_write_stats_best_effort`).
+
+    Note (thread-pool sizing): the real dispatch path runs via `asyncio.to_thread(...)`,
+    dispatched onto the event loop's own DEFAULT executor, sized exactly once per loop
+    by `_ensure_sized_default_executor` — see that function's docstring for the full
+    rationale (a dedicated per-batch executor + `loop.run_in_executor(...)` would break
+    the per-delegation stderr ContextVar's propagation into the worker thread).
+
+    Note (single-job fast path): a single-job batch under `max_parallel_agents == 1`
+    skips straight to `_run_batch_serial_fast_path`, bypassing the `Scheduler` and the
+    fan-out indexed-file-sink routing entirely — neither is needed for the single most
+    common call shape.
+
+    Note ([doc] pre-scheduling breaker TOCTOU, accepted trade-off): the circuit-breaker
+    eligibility check (`_reject_if_circuit_open`, run for every job BEFORE any of them
+    ever reaches the `Scheduler`) is a PRE-SCHEDULING SNAPSHOT of
+    `breaker.is_definitively_open(...)`. If a model's circuit opens MID-BATCH, those
+    already-admitted siblings are NOT retroactively rejected within THIS batch; they run
+    to completion regardless. The breaker protects delegations ACROSS batches, not every
+    same-model delegation WITHIN one batch — bounded exposure (at most
+    `max_parallel_agents + max_queued_agents` same-model delegations in flight before
+    the breaker had a chance to open), an accepted design trade-off, not a defect.
+    """
+    if not jobs:
+        # Nothing to bound/dispatch/capture — return before the Scheduler, the
+        # stderr-dispatching proxy, or a TokenStats() are ever touched.
+        return []
+
+    breaker = breaker if breaker is not None else _PROCESS_CIRCUIT_BREAKER
+    # ONE shared, thread-safe accumulator for the whole batch. TokenStats.record is
+    # itself lock-guarded (MS2), so every concurrent fan-out delegation's
+    # dispatch(..., stats=stats) call folds in safely; written once, aggregated, at
+    # batch end (below and in the serial fast path).
+    stats = TokenStats()
+    loop = asyncio.get_running_loop()
+
+    def _now() -> float:
+        return loop.time()
+
+    # The common single-delegation case needs neither the Scheduler (nothing to bound
+    # — one job), the ContextVars stderr-dispatching proxy (only one delegation ever
+    # runs — no cross-task isolation to buy), nor the fan-out per-delegation
+    # indexed-file-sink routing (`_dispatch_sink` would resolve to stdout anyway when
+    # not parallel). Delegate straight to the same shape MS3's `run_delegation` uses for
+    # one delegation. The breaker and R27 managed-dir cleanup still apply in full inside
+    # the fast path — neither is fan-out-specific.
+    if len(jobs) == 1 and config.max_parallel_agents == 1:
+        return await _run_batch_serial_fast_path(
+            jobs[0],
+            config=config,
+            breaker=breaker,
+            output_dir=output_dir,
+            managed=managed,
+            _worker=_worker,
+            stats=stats,
+            now=_now,
+        )
+
+    sched = Scheduler(config.max_parallel_agents, config.max_queued_agents)
+    parallel = config.max_parallel_agents > 1
+    # Size the loop's DEFAULT executor once (never a dedicated per-batch one) so
+    # `asyncio.to_thread` — used below by `_call_worker`, kept specifically because it
+    # copies the calling context into the worker thread — is never capped by the
+    # default executor's own `min(32, os.cpu_count() + 4)` pool. Cheap no-op on every
+    # call after the first on a given loop.
+    executor = _ensure_sized_default_executor(loop, config.max_parallel_agents)
+
+    # R14b fail-fast, BEFORE scheduling: an open-circuit job is rejected here, so it
+    # NEVER occupies a semaphore/queue slot — it cannot crowd out a healthy sibling's
+    # spot against the max_parallel_agents + max_queued_agents ceiling (R21/R21b). This
+    # is a READ-ONLY check (`_reject_if_circuit_open` uses `is_definitively_open`, never
+    # the reserving `is_open`/`try_enter`) — a job that passes here and is later
+    # overflow-rejected by the `Scheduler` below (never reaching `_execute_delegation`)
+    # can no longer have leaked a half-open probe reservation.
+    results: list[Any] = [None] * len(jobs)
+    eligible: list[tuple[int, _Job]] = []
+    for i, job in enumerate(jobs):
+        rejection = _reject_if_circuit_open(job, breaker, _now)
+        if rejection is not None:
+            results[i] = rejection
+        else:
+            eligible.append((i, job))
+
+    async def _one(index: int, job: _Job) -> DelegationResult | BaseException:
+        """Thin wrapper around the shared `_execute_delegation` core: builds this
+        delegation's OWN indexed file sink (or stdout, if not parallel) and its OWN
+        stderr capture buffer via `_delegation_artifacts`, then delegates the worker
+        call + breaker classification + stderr persistence entirely to
+        `_execute_delegation`, returning whatever it produces. `_execute_delegation`
+        never re-raises a classified `Exception`/`asyncio.CancelledError` — it returns
+        it as data — which `Scheduler.run_all`'s `asyncio.gather(...,
+        return_exceptions=True)` records identically to a raised one; only a genuine
+        `BaseException` interrupt still propagates through, unhandled here.
+        """
+        with _delegation_artifacts(
+            output_dir, job.cap, index=index, parallel=parallel, tee=False
+        ) as (sink, persist_stderr):
+
+            async def _call_worker() -> DelegationResult:
+                if _worker is not None:
+                    return await _worker(job.cap, job.model, sink)
+                # `asyncio.to_thread` — NOT a bare `loop.run_in_executor(executor,
+                # ...)` — copies the calling context, so the
+                # `capture_stderr_for_delegation()` ContextVar this `with` block just
+                # set is still visible from INSIDE the worker thread. It dispatches
+                # onto the loop's DEFAULT executor, sized above by
+                # `_ensure_sized_default_executor` so it is never capped below
+                # `max_parallel_agents`.
+                return await asyncio.to_thread(_run_one_delegation, job, config, sink, stats)
+
+            return await _execute_delegation(
+                job.model,
+                call_worker=_call_worker,
+                breaker=breaker,
+                persist_stderr=persist_stderr,
+                now=_now,
+            )
+
+    try:
+        with install_dispatching_stderr():
+            # The dispatching proxy is installed ONCE for the WHOLE batch here, not
+            # per-delegation — tearing it down around each individual delegation would
+            # pull it out from under sibling delegations still relying on it mid-flight.
+            # `install_dispatching_stderr()` GUARANTEES `sys.stderr` is restored to the
+            # exact object it was before this line, whether this block returns
+            # normally or raises.
+            def _mk_thunk(
+                i: int, j: _Job
+            ) -> Callable[[], Awaitable[DelegationResult | BaseException]]:
+                # Bind i/j as parameters (correct closure — avoids the late-binding
+                # loop-variable bug) AND give mypy an inferable zero-arg thunk type for
+                # Scheduler.run_all (a bare ``lambda i=i, j=j: ...`` is uninferable).
+                return lambda: _one(i, j)
+
+            scheduled = await sched.run_all([_mk_thunk(i, j) for i, j in eligible])
+    except BaseException:
+        # R27, mirrored from managed_run_dir/run_delegation (MS3): asyncio.gather's
+        # return_exceptions=True (inside Scheduler.run_all) only catches Exception
+        # subclasses, so a genuine interrupt (KeyboardInterrupt/SystemExit) — which is
+        # NOT an Exception — propagates out here rather than being captured per-job. A
+        # MANAGED output_dir must not survive as an orphan with partial artifacts; a
+        # caller-supplied (unmanaged) one is left untouched.
+        #
+        # Belt-and-suspenders probe release: an event-loop-level interrupt can escape
+        # `sched.run_all` BEFORE some or all `_one()` bodies ever started running (e.g.
+        # a job still waiting on the Scheduler's semaphore) — their own per-delegation
+        # release (inside `_execute_delegation`) never gets a chance to fire for those.
+        # Releasing the probe for every ELIGIBLE job's model here too closes that gap:
+        # `release_probe` is a documented no-op for any model that was NOT actually the
+        # in-flight probe, so calling it unconditionally for the whole `eligible` list
+        # is safe. This is IN ADDITION TO, not instead of, `_execute_delegation`'s own
+        # release.
+        for _i, _eligible_job in eligible:
+            breaker.release_probe(_eligible_job.model, _now())
+        # Bound worker-thread exit latency (R27): shut the loop-scoped executor down
+        # here too (never on a normal return below, which would defeat reusing the
+        # sized default executor across calls on the same loop). A worker thread
+        # already running is bounded by its own socket timeout regardless.
+        executor.shutdown(wait=False, cancel_futures=True)
+        if managed:
+            shutil.rmtree(output_dir, ignore_errors=True)
+        raise
+
+    for (i, _job_obj), outcome in zip(eligible, scheduled):
+        results[i] = outcome
+    _write_stats_best_effort(stats, output_dir)  # R12: aggregate token_stats.json, best-effort
+    return results
+
+
+def _run_batch_for_test(
+    jobs: list[_Job],
+    *,
+    _job: _WorkerFn,
+    max_parallel: int,
+    max_queued: int,
+    output_dir: str,
+    breaker: CircuitBreaker | None = None,
+) -> list[Any]:
+    """Test seam for `run_batch`: drives the REAL scheduler + breaker + per-delegation
+    stderr + sink-routing logic with an injected fake async worker (`_job(cap, model,
+    sink) -> DelegationResult`) instead of real HTTP — so concurrency bounds, breaker
+    isolation/half-open, sink routing, and R27 cleanup are all exercised without
+    touching the network. A synchronous wrapper (drives `run_batch` via `asyncio.run`)
+    so plain (non-async) test functions can call it directly.
+
+    Args:
+        jobs: The batch of `_Job`s to run.
+        _job: Async callable `(cap, model, sink) -> DelegationResult`, substituted for
+            the real dispatch/stream HTTP path.
+        max_parallel: `max_parallel_agents` for this run.
+        max_queued: `max_queued_agents` for this run.
+        output_dir: Managed run dir for `{cap}_{index}.stream.log` / `{cap}_{index}.stderr.log`.
+        breaker: Optional pre-seeded `CircuitBreaker`. If omitted, forwarded as `None`
+            to `run_batch`, which then falls back to the process-wide
+            `_PROCESS_CIRCUIT_BREAKER` singleton — NOT a fresh, isolated instance. Tests
+            that need isolation from other tests' breaker state must pass an explicit
+            `breaker=CircuitBreaker(...)`.
+
+    Returns:
+        One entry per job, exactly as `run_batch` returns them.
+    """
+    config = _cfg_for_batch(max_parallel_agents=max_parallel, max_queued_agents=max_queued)
+    return asyncio.run(
+        run_batch(jobs, config=config, breaker=breaker, output_dir=output_dir, _worker=_job)
+    )
 
 
 if __name__ == "__main__":

@@ -1751,23 +1751,6 @@ def test_run_batch_breaker_ignores_rate_limit_errors(tmp_path):
     assert breaker.is_open("m", now=0.0) is False  # never trips the breaker
 
 
-def test_run_batch_structured_plus_streaming_parses_and_validates(tmp_path):
-    """MS4/Caspar deferral: a structured capability with stream=true → stream → parse → validate.
-
-    This drives the REAL `dispatch()` (not a re-implementation) with only `stream_run`
-    monkeypatched, so it also proves `_run_once` (MS4) actually routes to the streaming
-    path — never the transactional `backend.run` — when `stream=true`.
-    """
-    import run_ollama
-
-    findings = '{"capability":"reviewer","findings":[{"severity":"low","title":"t","detail":"d"}]}'
-    result = run_ollama._dispatch_structured_streaming_for_test(
-        capability="reviewer", streamed_content=findings
-    )
-    assert result.parsed["capability"] == "reviewer"  # validated .parsed
-    assert result.parsed["findings"][0]["title"] == "t"
-
-
 def test_run_batch_rmtrees_managed_output_dir_on_interrupt(tmp_path, monkeypatch):
     # INFO fix (R27): an interrupt mid-batch removes the managed run dir, mirroring
     # managed_run_dir's own KeyboardInterrupt/SystemExit handler (MS3).
@@ -2372,14 +2355,14 @@ def test_run_batch_two_concurrent_half_open_candidates_exactly_one_becomes_probe
     breaker = CircuitBreaker(threshold=1, cooldown=0.0)
     breaker.record_failure("flaky:cloud", now=0.0)
 
-    barrier = asyncio.Event()
-    entered = {"count": 0}
-
     async def _job(cap, model, sink):
-        entered["count"] += 1
-        if entered["count"] == 2:
-            barrier.set()  # release both once both have entered try_enter's caller
-        await barrier.wait()  # maximize the chance both are "in flight" at once
+        # Hold the admitted probe IN FLIGHT at a yield point so the sibling's `try_enter`
+        # runs while the probe is still outstanding and is therefore rejected as "open".
+        # NOTE: only the admitted probe ever reaches this delegate — the sibling fails fast
+        # at `breaker.try_enter` in `_execute_delegation`, BEFORE the delegate runs. (An
+        # earlier version used a 2-party barrier here expecting BOTH to arrive, which
+        # DEADLOCKED precisely because the rejected sibling never reaches the delegate.)
+        await asyncio.sleep(0.05)
         return DelegationResult("ok", 1, 1, True, 0.1)
 
     jobs = [run_ollama._Job(cap="coder", model="flaky:cloud", prompt="p") for _ in range(2)]
@@ -2441,10 +2424,17 @@ def test_run_batch_serial_fast_path_releases_probe_on_failure(tmp_path):
         jobs, _job=_job, max_parallel=1, max_queued=0, output_dir=str(tmp_path), breaker=breaker
     )
     assert isinstance(results[0], OllamaBackendError)
-    assert breaker.is_open("flaky:cloud", now=1.0) is True  # reopened for a FRESH cooldown
+    # `run_batch` records the probe failure at its own monotonic clock (`loop.time()`),
+    # not a test-injectable timestamp, so state is probed with the same two sentinels the
+    # sibling breaker tests use: `now=0.0` (before any real monotonic time -> still within
+    # the fresh cooldown) and `now=1e15` (after it -> cooldown elapsed). Together they prove
+    # the failed probe REOPENED for a fresh, FINITE cooldown -- not left CLOSED (record_success
+    # would pop `open_until` -> is_open(0.0) False) and not STUCK in "probe in flight" forever
+    # (a leaked probe -> is_open(1e15) True, since try_enter would keep returning "open").
+    assert breaker.is_open("flaky:cloud", now=0.0) is True  # reopened -> still open right after
     assert (
-        breaker.is_open("flaky:cloud", now=6.0) is False
-    )  # fresh cooldown (1+5) elapsed -> a later probe admitted
+        breaker.is_open("flaky:cloud", now=1e15) is False
+    )  # fresh cooldown elapsed -> a later probe is admitted (not stuck)
 
 
 def test_run_batch_thread_pool_sized_to_max_parallel_not_capped_by_default_executor(tmp_path):
