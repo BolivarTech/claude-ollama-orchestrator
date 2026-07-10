@@ -2437,6 +2437,27 @@ def test_run_batch_serial_fast_path_releases_probe_on_failure(tmp_path):
     )  # fresh cooldown elapsed -> a later probe is admitted (not stuck)
 
 
+def test_run_batch_serial_fast_path_writes_stats_even_on_failure(tmp_path):
+    # Parity with the general (fan-out) path, which writes the aggregate token_stats.json
+    # (R12) unconditionally after `gather`. A FAILED single delegation on the serial fast
+    # path must likewise leave the accounting artifact -- not silently skip it -- so a run's
+    # token_stats.json presence does not depend on which concurrency shape ran it.
+    import os
+
+    import run_ollama
+    from errors import OllamaBackendError
+
+    async def _job(cap, model, sink):
+        raise OllamaBackendError("boom")
+
+    jobs = [run_ollama._Job(cap="coder", model="m", prompt="p")]
+    results = run_ollama._run_batch_for_test(
+        jobs, _job=_job, max_parallel=1, max_queued=0, output_dir=str(tmp_path)
+    )
+    assert isinstance(results[0], OllamaBackendError)
+    assert os.path.exists(os.path.join(str(tmp_path), "token_stats.json"))
+
+
 def test_run_batch_thread_pool_sized_to_max_parallel_not_capped_by_default_executor(tmp_path):
     # Thread-pool sizing fix, re-verified under the seventh-round design:
     # `max_parallel_agents` set to 40 -- above the DEFAULT executor's

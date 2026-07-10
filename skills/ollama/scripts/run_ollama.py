@@ -1697,12 +1697,12 @@ async def _run_batch_serial_fast_path(
                 shutil.rmtree(output_dir, ignore_errors=True)
             raise
 
-    if isinstance(outcome, BaseException):
-        # Any classified exception `_execute_delegation` returned as data (including
-        # `asyncio.CancelledError`, a BaseException, not an Exception) — nothing
-        # succeeded, so no stats to persist.
-        return [outcome]
-    _write_stats_best_effort(stats, output_dir)  # R12: same aggregate artifact as the general path
+    # R12: persist the aggregate token_stats.json UNCONDITIONALLY, exactly as the general
+    # (fan-out) path does after `gather` — so a run's accounting artifact never depends on
+    # which concurrency shape ran it, nor on whether the single delegation succeeded. A
+    # failed delegation simply folds an empty/partial accumulator; `_write_stats_best_effort`
+    # is itself best-effort and never raises.
+    _write_stats_best_effort(stats, output_dir)
     return [outcome]
 
 
