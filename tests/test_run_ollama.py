@@ -3152,3 +3152,47 @@ def test_stream_with_stdout_token_releases_on_interrupt(tmp_path):
         run_ollama._stream_with_stdout_token(tok, 60, _boom)
     # The finally released the token \u2192 the next process can take it immediately.
     assert acquire_token(tok, 60) is True
+
+
+def test_streaming_goes_file_only_when_stdout_token_is_held(capsys, monkeypatch, tmp_path):
+    # R7d: when the cross-process stdout token is already held (another run_ollama process is
+    # streaming to the terminal), a streaming delegation must NOT stream to stdout (that
+    # would interleave across processes) -- it goes file-only to its own {cap}.stream.log,
+    # writing nothing (no content, no nonce frame) to stdout.
+    monkeypatch.chdir(tmp_path)
+    import run_lock
+
+    import run_ollama
+    from backend import DelegationResult
+
+    # Simulate the token being held by another live process: acquire fails.
+    monkeypatch.setattr(run_lock, "_acquire_ephemeral", lambda path, bound: False)
+
+    def _fake_stream_run(
+        config,
+        system_prompt,
+        prompt,
+        model,
+        timeout,
+        *,
+        sink,
+        response_format=None,
+        max_output_bytes=None,
+    ):
+        sink("STREAMED-CONTENT")
+        return DelegationResult("STREAMED-CONTENT", 1, 1, True, 0.1)
+
+    cfg = _cfg_with_structured()  # coder: streaming path
+    monkeypatch.setattr(run_ollama, "resolve_config", lambda **kw: cfg)
+    monkeypatch.setattr(run_ollama, "preflight", lambda cfg, **kw: None)
+    monkeypatch.setattr(run_ollama, "load_system_prompt", lambda cap: "sys")
+    monkeypatch.setattr(run_ollama, "_make_backend", lambda cfg: object())
+    monkeypatch.setattr(run_ollama, "stream_run", _fake_stream_run)
+    out_dir = tmp_path / "out"
+    rc = run_ollama.main(["coder", "write it", "--no-status", "--output-dir", str(out_dir)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "STREAMED-CONTENT" not in out  # file-only: nothing streamed to stdout
+    assert "BEGIN UNTRUSTED MODEL OUTPUT" not in out  # no stdout frame when file-only
+    log = (out_dir / "coder.stream.log").read_text(encoding="utf-8")
+    assert "STREAMED-CONTENT" in log  # the stream landed in the per-agent file instead

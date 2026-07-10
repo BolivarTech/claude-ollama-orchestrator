@@ -45,7 +45,7 @@ from ollama_stream import stream_run
 from ollama_vision import stream_vision
 from parse_output import parse_agent_output
 from run_lock import (
-    STDOUT_TOKEN_FILENAME,  # noqa: F401 -- consumed at the R7d integration call site (MS7)
+    STDOUT_TOKEN_FILENAME,
     acquire_token,
     release_token,
     remove_lock,
@@ -1052,48 +1052,64 @@ def run_delegation(ns: argparse.Namespace) -> int:
                 # streaming choice (per-capability `[stream]` true AND not a schema
                 # capability — schema never streams).
                 is_streaming = _capability_streams_to_stdout(cfg, ns.capability)
-                frame_footer = ""
-                if is_streaming:
-                    frame_header, frame_footer = open_output_frame()
-                    sys.stdout.write(frame_header)
-                    sys.stdout.flush()
-                try:
-                    result = dispatch(
+                backend = _make_backend(cfg)
+
+                def _do_dispatch(sink: Callable[[str], None]) -> DelegationResult:
+                    """Run the single delegation with *sink* (one backend, one attempt path)."""
+                    return dispatch(
                         ns.capability,
                         prompt,
-                        backend=_make_backend(cfg),
+                        backend=backend,
                         model=model,
                         timeout=ns.timeout,
                         system_prompt=system_prompt,
                         config=cfg,
                         stats=stats,
-                        # R7c: this CLI drives exactly ONE delegation at a time (concurrency
-                        # is MS5) -- the single-in-flight case always gets the stdout sink.
-                        # R22b: the streaming sink strips invisibles from each delta (parity
-                        # with wrap_output on the transactional path). No-op for a
-                        # transactional capability, whose backend never calls the sink.
-                        sink=_streaming_stdout_sink,
+                        sink=sink,
                     )
-                finally:
-                    if is_streaming:
-                        # ALWAYS close the R22b nonce frame around the (possibly partial)
-                        # streamed deltas -- even if `dispatch` raised. An unterminated BEGIN
-                        # marker left on stdout would keep the untrusted-output frame open
-                        # around whatever the error handler prints next, breaking R22b's
-                        # framing integrity on the error path (the frame's whole point is
-                        # that Claude can trust the BEGIN..END bounds).
-                        #
-                        # Best-effort: if stdout itself is broken (e.g. BrokenPipeError)
-                        # WHILE a `dispatch` exception is already in flight, swallow this
-                        # write's OSError -- a `finally` that raised here would MASK the
-                        # original delegation exception the outer handlers below need to see
-                        # (and a broken stdout means no reader is left to care about the
-                        # closing marker anyway).
+
+                def _stream_to_stdout_framed() -> DelegationResult:
+                    """Stream live to stdout, nonce-framed (R22b) + invisible-stripped; close
+                    the frame even if dispatch raises (best-effort, never masks the error)."""
+                    frame_header, frame_footer = open_output_frame()
+                    sys.stdout.write(frame_header)
+                    sys.stdout.flush()
+                    try:
+                        return _do_dispatch(_streaming_stdout_sink)
+                    finally:
                         try:
                             sys.stdout.write(frame_footer + "\n")
                             sys.stdout.flush()
                         except OSError:
                             pass
+
+                if is_streaming:
+                    # R7d: stdout is a serial resource ACROSS processes. Acquire the
+                    # project-level `.ollama-stdout.lock`; the winner streams live to stdout
+                    # (nonce-framed), any concurrent process goes file-only to its own
+                    # `{cap}.stream.log` (no stdout, no interleaving). The token is released
+                    # on any BaseException (SIGINT/R27) inside `_stream_with_stdout_token`.
+                    token_path = os.path.join(
+                        project_run_root(resolve_project_root()), STDOUT_TOKEN_FILENAME
+                    )
+
+                    def _run_streamed(used_stdout: bool) -> DelegationResult:
+                        if used_stdout:
+                            return _stream_to_stdout_framed()
+                        # Another process holds the terminal -> file-only, nothing to stdout.
+                        with make_file_sink(
+                            os.path.join(output_dir, f"{ns.capability}.stream.log")
+                        ) as fsink:
+                            return _do_dispatch(fsink)
+
+                    result, _used_stdout = _stream_with_stdout_token(
+                        token_path, ns.timeout, _run_streamed
+                    )
+                else:
+                    # Transactional: the backend never calls the sink; the single buffered
+                    # result is nonce-wrapped once for Claude below.
+                    result = _do_dispatch(_streaming_stdout_sink)
+
                 _write_artifacts(output_dir, ns.capability, prompt, result, stats, errbuf)
                 if display is not None:
                     display.update(ns.capability, "success", tok_per_s=result.tok_per_s)
