@@ -228,7 +228,11 @@ def validate_findings(
             # and is kept as-is (no annotation).
             if path is not None and isinstance(line, int):
                 changed = ranges.get(path, set())
-                if changed and not any(abs(line - c) <= margin for c in changed):
+                # Annotate when the claimed line is not near ANY added line -- INCLUDING a file
+                # that has NO added lines at all (a binary/rename-only touch: empty `changed`).
+                # A specific line number on such a file cannot be grounded, so flag it rather
+                # than pass it through unmarked (Caspar residual).
+                if not changed or not any(abs(line - c) <= margin for c in changed):
                     f = {**f, "annotation": "[outside changed range]"}
             kept.append(f)
         return kept, dropped

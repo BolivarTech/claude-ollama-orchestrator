@@ -314,3 +314,18 @@ def test_copy_to_directive_registers_the_new_path_like_rename():
     assert "src/copy.py" in files
     kept, dropped = validate_findings([{"file": "src/copy.py", "line": 1, "title": "ok"}], diff)
     assert dropped == []  # a finding on the copy destination is grounded, not dropped
+
+
+def test_line_claim_on_a_file_with_no_added_lines_is_annotated():
+    # A binary/rename-only file has NO added lines (empty range). A model finding that still
+    # claims a specific LINE there cannot be grounded -> annotate it (not hard-drop: the file
+    # IS in the diff), so Claude sees the claim is unsupported.
+    diff = (
+        "diff --git a/assets/logo.png b/assets/logo.png\n"
+        "Binary files a/assets/logo.png and b/assets/logo.png differ\n"
+    )
+    kept, dropped = validate_findings(
+        [{"file": "assets/logo.png", "line": 7, "title": "suspect line claim"}], diff
+    )
+    assert dropped == []  # in the diff -> not fabricated -> not dropped
+    assert kept[0].get("annotation") == "[outside changed range]"  # but flagged as ungroundable
