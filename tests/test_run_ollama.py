@@ -3123,8 +3123,12 @@ def test_streaming_output_strips_invisibles_for_defense_in_depth(capsys, monkeyp
 def test_stream_with_stdout_token_holder_uses_stdout(tmp_path):
     tok = str(tmp_path / ".ollama-stdout.lock")
     seen = {}
-    result, used = run_ollama._stream_with_stdout_token(
-        tok, 60, lambda used_stdout: seen.setdefault("used", used_stdout) or "ok")
+
+    def _run(used_stdout):
+        seen["used"] = used_stdout
+        return "ok"
+
+    result, used = run_ollama._stream_with_stdout_token(tok, 60, _run)
     assert result == "ok" and used is True and seen["used"] is True
 
 
