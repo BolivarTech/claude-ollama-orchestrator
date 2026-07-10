@@ -1822,6 +1822,14 @@ async def run_batch(
     loop = asyncio.get_running_loop()
 
     def _now() -> float:
+        # `loop.time()` is the breaker's OWN monotonic clock domain. It is only ever
+        # compared against breaker-internal values recorded with this SAME callable
+        # (`open_until`, set by `record_failure`/`release_probe`), never against the R25
+        # per-delegation deadline (which lives entirely inside `backend.py` on
+        # `time.monotonic()` and is compared only to `time.monotonic()` there). The two
+        # clocks are therefore never cross-compared, so a hypothetical custom event loop
+        # whose `loop.time()` differs from `time.monotonic()` cannot skew any comparison —
+        # each clock is self-consistent within its own domain.
         return loop.time()
 
     # The common single-delegation case needs neither the Scheduler (nothing to bound
