@@ -49,8 +49,9 @@ _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$")
 _PLUSFILE = re.compile(r"^\+\+\+ (.+?)\s*$")
 # `Binary files a/<x> and b/<y> differ` — capture the new-side path token (quoted or not).
 _BINARY = re.compile(r"^Binary files .+? and (.+?) differ\s*$")
-# `rename to <new path>` — the destination path of a rename (may carry no hunk body).
-_RENAME_TO = re.compile(r"^rename to (.+?)\s*$")
+# `rename to <new path>` / `copy to <new path>` — the destination path of a rename or a
+# copy (git emits `copy to` under copy detection, `-C`); either may carry no hunk body.
+_RENAME_TO = re.compile(r"^(?:rename|copy) to (.+?)\s*$")
 
 # git c-style escapes emitted inside a quoted path (core.quotePath on, the default).
 _GIT_ESCAPE = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}

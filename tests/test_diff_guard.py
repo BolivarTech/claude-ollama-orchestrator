@@ -300,3 +300,17 @@ def test_corpus_out_of_range_finding_on_a_real_file_is_soft_annotated_not_droppe
     )
     assert dropped == []  # real file -> never hard-dropped
     assert kept[0].get("annotation") == "[outside changed range]"
+
+
+def test_copy_to_directive_registers_the_new_path_like_rename():
+    # git emits `copy to <path>` under copy detection (-C); the destination is a touched file.
+    diff = (
+        "diff --git a/src/orig.py b/src/copy.py\n"
+        "similarity index 100%\n"
+        "copy from src/orig.py\n"
+        "copy to src/copy.py\n"
+    )
+    files, _ = parse_diff(diff)
+    assert "src/copy.py" in files
+    kept, dropped = validate_findings([{"file": "src/copy.py", "line": 1, "title": "ok"}], diff)
+    assert dropped == []  # a finding on the copy destination is grounded, not dropped
