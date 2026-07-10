@@ -188,15 +188,23 @@ def _stream_once(
             resp = urlopen(req, timeout=eff_timeout)
             break  # got the response; consume below
         except urllib.error.HTTPError as exc:
-            if exc.code == 429 and attempt < max_backoffs:
-                delay = retry_after_delay(exc, attempt, rng)
-                if time.monotonic() + delay > deadline:
-                    raise OllamaBackendError(redact("stream 429: deadline exceeded")) from None
-                sleep(delay)
-                continue
-            map_http_error(exc, redact=redact)  # NoReturn: last attempt (or non-429) →
-            # always raises (400→ResponseFormatRejected,
-            # 429-exhausted/5xx→OllamaBackendError)
+            # Close the HTTPError's response body (`exc.fp`) on EVERY path out of this
+            # handler — the 429-backoff `continue`, the deadline-exceeded raise, AND the
+            # terminal `map_http_error` — or the error body leaks a file descriptor on every
+            # HTTP error (`map_http_error` reads it but does not own its lifetime). This
+            # mirrors the transactional core's finally-guarded close. `_safe_close` is
+            # best-effort and never masks the exception in flight.
+            try:
+                if exc.code == 429 and attempt < max_backoffs:
+                    delay = retry_after_delay(exc, attempt, rng)
+                    if time.monotonic() + delay > deadline:
+                        raise OllamaBackendError(redact("stream 429: deadline exceeded")) from None
+                    sleep(delay)
+                    continue
+                map_http_error(exc, redact=redact)  # NoReturn: 400→ResponseFormatRejected,
+                # 429-exhausted/5xx→OllamaBackendError
+            finally:
+                _safe_close(exc)
         except (TimeoutError, OSError, http.client.IncompleteRead) as exc:
             # socket timeout / URLError / (defensively) a truncated read at connect time →
             # domain error. IncompleteRead is not an OSError subclass, so it is named here

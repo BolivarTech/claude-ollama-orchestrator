@@ -537,3 +537,19 @@ def test_stream_response_close_failure_never_masks_the_real_result():
         urlopen=lambda req, timeout=None: _ClosingRaises(body),
     )
     assert res.content == "ok"  # close() failure swallowed by _safe_close, result intact
+
+
+def test_stream_http_error_body_is_closed_no_fd_leak():
+    # Caspar/Balthasar WARNING: the streaming path must close the HTTPError's response body
+    # (exc.fp) on every HTTP-error path — map_http_error reads it but does not own its
+    # lifetime — or it leaks a file descriptor on every HTTP error, unlike the guarded
+    # transactional core.
+    fp = io.BytesIO(b"error detail")
+    err = urllib.error.HTTPError("u", 500, "Server Error", {}, fp)
+
+    def _urlopen(req, timeout=None):
+        raise err
+
+    with pytest.raises(OllamaBackendError):
+        stream_run(_cfg(), "s", "p", "m", 60, sink=lambda _s: None, urlopen=_urlopen)
+    assert fp.closed  # the error body was closed after being mapped
