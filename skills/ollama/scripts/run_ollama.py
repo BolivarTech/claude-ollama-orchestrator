@@ -70,6 +70,7 @@ from stderr_shim import (
     capture_stderr_for_delegation,
     install_dispatching_stderr,
 )
+from transcribe import transcribe
 from temp_dirs import (
     cleanup_old_runs,
     create_output_dir,
@@ -426,6 +427,15 @@ _MS1_UNSUPPORTED_CAPS: frozenset[str] = frozenset()  # was {"transcribe"} after 
 # a reasoning model (e.g. deepseek-v4-pro, thinking's default) emits ahead of it.
 _THINK_RECOVERY_CAPS: frozenset[str] = frozenset({"thinking"})
 
+# The `<input>` positional for `vision`/`transcribe` is a MEDIA FILE PATH, not text — the
+# transport's `load_binary` (R24b) validates/loads it, so it is never read+sanitized as
+# text. `vision` still needs a user prompt (the analysis instruction) alongside the image;
+# `transcribe` needs none (it is pure transcription via its own transport).
+_MEDIA_INPUT_CAPS: frozenset[str] = frozenset({"vision", "transcribe"})
+_DEFAULT_VISION_PROMPT = (
+    "Describe and analyze this image in detail, including any UI, layout, text, or notable content."
+)
+
 
 def _capability_streams_to_stdout(config: OllamaAgentsConfig, capability: str) -> bool:
     """Return True iff *capability* streams live deltas (R7b/R7c) rather than running
@@ -454,6 +464,7 @@ def _run_once(
     sink: Callable[[str], None] | None,
     response_format: dict[str, Any] | None,
     deadline: float | None = None,
+    image_path: str | None = None,
 ) -> DelegationResult:
     """Pick the streaming or transactional path for one delegation attempt (R7b/R7c).
 
@@ -495,8 +506,22 @@ def _run_once(
     # is "structured/corto → transactional"; making it a code invariant (not just the
     # reviewer/tester [stream]=false default a user could override) closes that gap.
     if _capability_streams_to_stdout(config, capability) and sink is not None:
-        fn = stream_vision if capability == "vision" else stream_run
-        return fn(
+        if capability == "vision":
+            # R2 vision: forward the CLI image path so the multimodal transport (MS7 Task 4)
+            # attaches it as an `image_url` content-part; `image_path=None` still streams
+            # text-only, identical to the pre-wiring behavior.
+            return stream_vision(
+                config,
+                system_prompt,
+                prompt,
+                model,
+                timeout,
+                sink=sink,
+                response_format=response_format,
+                max_output_bytes=config.max_output_bytes,
+                image_path=image_path,
+            )
+        return stream_run(
             config,
             system_prompt,
             prompt,
@@ -529,6 +554,7 @@ def dispatch(
     stats: TokenStats | None = None,
     sink: Callable[[str], None] | None = None,
     diff: str | None = None,
+    image_path: str | None = None,
 ) -> DelegationResult:
     """Run one delegation; for the ``schema`` mode parse+validate with one retry.
 
@@ -632,6 +658,7 @@ def dispatch(
             sink=sink,
             response_format=response_format,
             deadline=deadline,
+            image_path=image_path,
         )
         if capability in _THINK_RECOVERY_CAPS:
             # Post-process the free-text content only (BDD-21): yield the conclusion,
@@ -1085,9 +1112,19 @@ def run_delegation(ns: argparse.Namespace) -> int:
                 # with the stderr.log diagnostic.
                 preflight(cfg, capability=ns.capability, effective_model=model)
                 system_prompt = load_system_prompt(ns.capability)
-                raw_input = _load_input(ns.input)
-                warn_if_oversize(raw_input, ns.warn_input_tokens)  # R24
-                prompt = build_user_prompt(raw_input)  # R22: sanitize + nonce-wrap
+                # vision/transcribe take a MEDIA PATH as `<input>` (validated by the
+                # transport's `load_binary`, R24b), NOT text to read+sanitize. `transcribe`
+                # is fully handled by its own transport branch below; `vision` threads the
+                # image path to `stream_vision` (below) alongside a default analysis prompt.
+                image_path: str | None
+                if ns.capability in _MEDIA_INPUT_CAPS:
+                    image_path = ns.input
+                    prompt = build_user_prompt(_DEFAULT_VISION_PROMPT)
+                else:
+                    image_path = None
+                    raw_input = _load_input(ns.input)
+                    warn_if_oversize(raw_input, ns.warn_input_tokens)  # R24
+                    prompt = build_user_prompt(raw_input)  # R22: sanitize + nonce-wrap
                 # R30: `--diff` is loaded through the SAME file-or-inline-text helper as
                 # `input` (same MAX_INPUT_FILE_SIZE guard, same errors="replace" decode) —
                 # no bespoke size/encoding path for the diff. `None` (the default) is a
@@ -1096,6 +1133,22 @@ def run_delegation(ns: argparse.Namespace) -> int:
                 stats = TokenStats()
                 if display is not None:
                     display.update(ns.capability, "running")
+                # R2 transcribe (experimental, gated): the audio path goes to its OWN
+                # probe/endpoint/chat transport (MS7 Task 5), never the stream/dispatch path
+                # (which would wrongly route it to `stream_run` as text). `load_binary`
+                # (R24b) validates the audio inside `transcribe()`; an endpoint without audio
+                # support yields an actionable `OllamaBackendError`, never a crash. Returns
+                # here after presenting — the `finally` (display.stop) and the surrounding
+                # `with` cleanups still run on this early return.
+                if ns.capability == "transcribe":
+                    result = transcribe(cfg, ns.input, model, ns.timeout)
+                    stats.record(ns.capability, model, result)
+                    _write_artifacts(output_dir, ns.capability, ns.input, result, stats, errbuf)
+                    if display is not None:
+                        display.update(ns.capability, "success", tok_per_s=result.tok_per_s)
+                    # R22b: wrap the transcript as untrusted data for Claude (never auto-applied).
+                    print(wrap_output(result.content))
+                    return 0
                 # R22b sink strategy: a STREAMING capability writes RAW deltas to stdout
                 # live inside `dispatch` (stdout_sink), so we bracket that live stream with
                 # nonce BEGIN/END markers (`open_output_frame`) — the streamed output reaches
@@ -1122,6 +1175,7 @@ def run_delegation(ns: argparse.Namespace) -> int:
                         stats=stats,
                         sink=sink,
                         diff=diff,
+                        image_path=image_path,
                     )
 
                 def _stream_to_stdout_framed() -> DelegationResult:

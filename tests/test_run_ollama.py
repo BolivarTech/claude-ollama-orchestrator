@@ -697,28 +697,66 @@ def test_output_dir_writes_raw_artifact(tmp_path, monkeypatch):
     assert raw["content"] == "hi there"
 
 
-def test_main_treats_transcribe_as_an_ordinary_text_capability_after_ms7_task5(
+def test_main_routes_transcribe_to_the_audio_transport_with_the_input_path(
     monkeypatch, capsys, tmp_path
 ):
-    # M7 Task 5 empties `_MS1_UNSUPPORTED_CAPS` (transcribe now has a real, gated audio
-    # transport: `transcribe.transcribe`). `main`'s CLI pipeline is still TEXT-only — it
-    # does not route "transcribe" to that new module — so the previous MS1-era guard
-    # (DelegationError before any backend call) is gone, and the capability now succeeds
-    # like any other free-text capability through the stubbed `_FakeBackend`. `[stream]`
-    # is forced False (mirrors `_cfg_no_stream`, MS4 Task 4): "transcribe" defaults to
-    # `stream=True`, which would otherwise route this delegation to the REAL
-    # `ollama_stream.stream_run` (an actual network call) instead of the stubbed backend.
-    cfg = _cfg_no_stream("transcribe")
+    # MS7 CLI wiring: `/ollama transcribe <audio>` routes the `<input>` positional (an AUDIO
+    # PATH, not text) to the gated `transcribe.transcribe` transport -- NOT the text
+    # stream/dispatch path (which would wrongly stream it as text via stream_run) -- and
+    # presents the transcript nonce-wrapped (R22b) for Claude. `_make_backend` is never
+    # even constructed on this path (the transcribe branch returns first).
+    from backend import DelegationResult
+
+    seen: dict[str, object] = {}
+
+    def _fake_transcribe(config, audio_path, model, timeout, **kw):
+        seen["audio_path"] = audio_path
+        seen["model"] = model
+        return DelegationResult("a transcript", 1, 1, True, 0.1)
+
+    cfg = _cfg_with_structured()  # transcribe defaults [stream]=True -- irrelevant, own transport
     monkeypatch.setattr(run_ollama, "resolve_config", lambda **kw: cfg)
-    # **kw absorbs preflight's capability=/effective_model= kwargs (R10/R28 fix) — the
-    # stub only needs to no-op regardless of what run_delegation now threads through.
     monkeypatch.setattr(run_ollama, "preflight", lambda cfg, **kw: None)
     monkeypatch.setattr(run_ollama, "load_system_prompt", lambda cap: "sys")
-    monkeypatch.setattr(run_ollama, "_make_backend", lambda cfg: _FakeBackend(["a transcript"]))
-    rc = run_ollama.main(["transcribe", "audio.wav", "--no-status", "--output-dir", str(tmp_path)])
+    monkeypatch.setattr(run_ollama, "transcribe", _fake_transcribe)
+    rc = run_ollama.main(
+        ["transcribe", "my-audio.wav", "--no-status", "--output-dir", str(tmp_path)]
+    )
     assert rc == 0
+    assert seen["audio_path"] == "my-audio.wav"  # the CLI input path reached the audio transport
+    out = capsys.readouterr().out
+    assert "a transcript" in out
+    assert "BEGIN UNTRUSTED MODEL OUTPUT" in out  # R22b: the transcript is wrapped for Claude
     raw = json.loads((tmp_path / "transcribe.raw.json").read_text(encoding="utf-8"))
     assert raw["content"] == "a transcript"
+
+
+def test_main_routes_vision_input_path_to_stream_vision_as_the_image(monkeypatch, tmp_path):
+    # MS7 CLI wiring: `/ollama vision <image>` threads the `<input>` positional (an IMAGE
+    # PATH) through dispatch -> _run_once -> stream_vision as `image_path=` (so the image is
+    # actually attached), with a default analysis prompt -- not read+sanitized as text.
+    from backend import DelegationResult
+
+    seen: dict[str, object] = {}
+
+    def _fake_stream_vision(
+        config, system_prompt, prompt, model, timeout, *, sink, image_path=None, **kw
+    ):
+        seen["image_path"] = image_path
+        seen["prompt"] = prompt
+        sink("a description")
+        return DelegationResult("a description", 1, 1, True, 0.1)
+
+    cfg = _cfg_with_structured()  # vision: [stream]=True, [structured]=off -> streaming path
+    monkeypatch.setattr(run_ollama, "resolve_config", lambda **kw: cfg)
+    monkeypatch.setattr(run_ollama, "preflight", lambda cfg, **kw: None)
+    monkeypatch.setattr(run_ollama, "load_system_prompt", lambda cap: "sys")
+    monkeypatch.setattr(run_ollama, "_make_backend", lambda cfg: object())
+    monkeypatch.setattr(run_ollama, "stream_vision", _fake_stream_vision)
+    rc = run_ollama.main(["vision", "screenshot.png", "--no-status", "--output-dir", str(tmp_path)])
+    assert rc == 0
+    assert seen["image_path"] == "screenshot.png"  # the CLI input path reached stream_vision
+    assert "screenshot.png" not in str(seen["prompt"])  # the path is NOT read as the text prompt
 
 
 def test_main_handles_missing_agent_prompt_as_actionable_nonzero_not_a_traceback(
