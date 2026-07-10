@@ -372,6 +372,31 @@ def test_multipart_body_escapes_a_filename_with_quotes_backslashes_and_a_newline
     assert recovered != hostile_filename  # never passed through unescaped
 
 
+def test_multipart_body_regenerates_a_boundary_that_collides_with_the_file_content():
+    """[SECURITY/defense-in-depth] The random uuid4 boundary makes a content collision
+    cryptographically negligible, but if the boundary somehow occurred in file_bytes a crafted
+    file could smuggle a premature part terminator. The builder scans and regenerates until the
+    boundary is absent from the content."""
+    from transcribe import _multipart_body
+
+    colliding = "----ollamaCOLLIDES"
+    clean = "----ollamaSAFEBOUNDARY"
+    # File content that CONTAINS the first (colliding) boundary's delimiter form `--<boundary>`.
+    file_bytes = b"audio...--" + colliding.encode() + b"...more"
+    boundaries = iter([colliding, clean])
+
+    body, content_type = _multipart_body(
+        {"model": "whisper-1"},
+        file_field="file",
+        filename="a.wav",
+        file_bytes=file_bytes,
+        mime="audio/wav",
+        _boundary_factory=lambda: next(boundaries),
+    )
+    assert clean in content_type  # regenerated to the non-colliding boundary
+    assert colliding not in content_type  # never used the colliding one as the delimiter
+
+
 def test_escape_multipart_filename_strips_every_control_char_not_only_crlf():
     """[SECURITY/defense-in-depth] CR/LF are the only *exploitable* chars (MIME headers
     split solely on them), but the escape strips EVERY C0 control char, DEL, and the

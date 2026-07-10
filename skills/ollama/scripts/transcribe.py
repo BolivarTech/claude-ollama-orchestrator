@@ -37,6 +37,10 @@ _MULTIMODAL_AUDIO_HINTS = ("gemma", "qwen2-audio", "whisper", "audio")
 # PROBE_TIMEOUT_SECONDS)` wiring below.
 PROBE_TIMEOUT_SECONDS = 5
 
+# Bounded regenerations if a random uuid4 multipart boundary somehow occurs in the file content
+# (cryptographically negligible for 128 bits, but the scan-and-regenerate closes it entirely).
+_MAX_BOUNDARY_ATTEMPTS = 8
+
 
 def _default_probe(
     url: str,
@@ -211,7 +215,13 @@ def _escape_multipart_filename(filename: str) -> str:
 
 
 def _multipart_body(
-    fields: dict[str, str], *, file_field: str, filename: str, file_bytes: bytes, mime: str
+    fields: dict[str, str],
+    *,
+    file_field: str,
+    filename: str,
+    file_bytes: bytes,
+    mime: str,
+    _boundary_factory: Callable[[], str] | None = None,
 ) -> tuple[bytes, str]:
     """Build a ``multipart/form-data`` body by hand (stdlib-only, no `requests`).
 
@@ -226,10 +236,20 @@ def _multipart_body(
     ``Content-Type`` token (mime) and the form-field part bodies go through
     :func:`_strip_header_controls` (strip controls only -- a backslash-escape would corrupt a
     token or a body value). The current caller passes only trusted constants, so this is
-    defense-in-depth against any future untrusted field data. The multipart boundary is an
-    unguessable ``uuid4``, so a part body can never accidentally contain it.
+    defense-in-depth against any future untrusted field data. The multipart boundary is a
+    128-bit random ``uuid4`` (collision with the file content is cryptographically negligible)
+    AND is verified NOT to occur in *file_bytes*, regenerating if it somehow does -- so no
+    crafted file can ever smuggle a premature part terminator.
+
+    Args:
+        _boundary_factory: Injectable boundary generator (tests only); defaults to a uuid4.
     """
-    boundary = f"----ollama{uuid.uuid4().hex}"
+    make_boundary = _boundary_factory or (lambda: f"----ollama{uuid.uuid4().hex}")
+    boundary = make_boundary()
+    for _ in range(_MAX_BOUNDARY_ATTEMPTS):
+        if f"--{boundary}".encode() not in file_bytes:
+            break  # the boundary does not occur in the content (the practically-certain case)
+        boundary = make_boundary()  # regenerate on the negligible chance of a collision
     crlf = b"\r\n"
     safe_filename = _escape_multipart_filename(filename)
     parts: list[bytes] = []
