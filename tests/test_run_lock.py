@@ -407,10 +407,10 @@ def test_read_lock_fields_clamps_negative_age_from_a_future_timestamp(tmp_path):
 def test_acquire_ephemeral_never_deletes_a_stolen_live_lock_when_restore_fails(
     tmp_path, monkeypatch
 ):
-    """[CRITICAL] If restoring a stolen LIVE lock fails, `_acquire_ephemeral` must NOT delete
-    it -- destroying a live holder's lock is an eviction, the exact bug the atomic reclaim
-    exists to prevent. On restore failure the stolen copy is retried and, if it ultimately
-    cannot be restored, LEFT intact (self-heals), never removed."""
+    """[CRITICAL] If restoring a stolen LIVE lock's atomic rename fails, `_acquire_ephemeral`
+    must NOT delete it (eviction) and must NOT leave `path` free (which would let a new acquirer
+    become a SECOND owner). It RE-CREATES the holder's lock at `path` from the stolen payload,
+    so mutual exclusion is preserved and the holder stays the single owner."""
     path = str(tmp_path / "eph.lock")
     b_pid = 424242
     _write_ephemeral(path, pid=999_999, bound=60)  # stale holder to reclaim
@@ -438,9 +438,12 @@ def test_acquire_ephemeral_never_deletes_a_stolen_live_lock_when_restore_fails(
     monkeypatch.setattr(run_lock.time, "sleep", lambda _s: None)  # don't actually wait
     result = run_lock._acquire_ephemeral(path, bound=60)
     assert result is False  # backed off; did not acquire
-    assert os.path.exists(steal)  # the stolen LIVE lock was NOT deleted on restore failure
-    pid, _age, _bound = run_lock._read_lock_fields(steal)
-    assert pid == b_pid  # B's live-lock content is preserved intact, never destroyed
+    # The holder's lock is RE-CREATED at `path` (mutual exclusion preserved), not left free;
+    # the stolen scratch copy is cleaned up once the holder's lock is safely back at `path`.
+    assert os.path.exists(path)
+    pid, _age, _bound = run_lock._read_lock_fields(path)
+    assert pid == b_pid  # B's live-lock content restored at `path` -> B stays the single owner
+    assert not os.path.exists(steal)  # scratch copy removed after successful re-create
 
 
 def test_acquire_ephemeral_cleans_up_its_own_lock_when_reverify_reads_none(tmp_path, monkeypatch):

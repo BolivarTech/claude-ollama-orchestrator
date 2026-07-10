@@ -566,6 +566,45 @@ def _remove_quiet(path: str) -> None:
         pass
 
 
+def _restore_stolen_lock(steal_path: str, path: str) -> None:
+    """Put a stolen LIVE lock back at *path*; never delete it, never leave *path* unclaimed.
+
+    First retries an atomic ``os.replace(steal_path, path)`` -- a same-dir rename that virtually
+    always succeeds (a transient Windows ``PermissionError`` under contention clears on retry).
+    If every retry fails, RE-CREATES the holder's lock at *path* from the stolen payload so the
+    slot/token is never left free (which would let a new acquirer become a SECOND owner while
+    the original holder still believes it holds the lock). The holder is the rightful owner, so
+    re-writing ITS payload preserves mutual exclusion. Only if that re-create also fails because
+    *path* was already taken by a new acquirer (``O_EXCL`` -> that acquirer is the single owner,
+    no worse) is the stolen copy left to self-heal on the holder's own bound. Total: never
+    raises; never deletes a live holder's lock.
+
+    Args:
+        steal_path: The private path holding the stolen live lock.
+        path: The lock path to restore it to.
+    """
+    for attempt in range(_RELEASE_RETRY_ATTEMPTS):
+        try:
+            os.replace(steal_path, path)
+            return  # restored in place
+        except OSError:
+            if attempt < _RELEASE_RETRY_ATTEMPTS - 1:
+                time.sleep(_RELEASE_RETRY_DELAY_SECONDS)
+    # Rename exhausted -> re-create the holder's lock at `path` from the stolen payload so the
+    # resource is never left unclaimed (Caspar residual: a free `path` here -> double-owner).
+    try:
+        with open(steal_path, "rb") as fh:
+            payload = fh.read()
+    except OSError:
+        return  # stolen copy vanished -> nothing to re-create (path presumably reclaimed)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except OSError:
+        return  # `path` already taken by a new acquirer (single owner) -> leave the steal copy
+    if _write_close_ephemeral(fd, payload):
+        _remove_quiet(steal_path)  # holder's lock safely re-created at `path`; drop the copy
+
+
 def _acquire_ephemeral(path: str, bound: int) -> bool:
     """Atomically acquire the ephemeral lockfile at *path*, reclaiming a stale holder.
 
@@ -638,21 +677,14 @@ def _acquire_ephemeral(path: str, bound: int) -> bool:
             # concurrent same-index reclaimers in overlapping microsecond windows -- a
             # pattern the single-orchestrator invariant does not produce.
             #
-            # CRITICAL: on a restore failure we must NEVER delete the stolen live lock --
-            # deleting it evicts the live holder, the exact bug this reclaim exists to prevent.
-            # Retry the restore (a same-dir rename virtually always succeeds; transient Windows
-            # PermissionError under contention clears on retry). If it ultimately fails
-            # (extraordinarily rare), LEAVE the stolen copy in place: it is a bounded ephemeral
-            # lock that self-heals on the holder's own bound/liveness, whereas destroying it is
-            # an immediate, unbounded eviction.
-            for _restore_try in range(_RELEASE_RETRY_ATTEMPTS):
-                try:
-                    os.replace(steal_path, path)
-                    break
-                except OSError:
-                    if _restore_try < _RELEASE_RETRY_ATTEMPTS - 1:
-                        time.sleep(_RELEASE_RETRY_DELAY_SECONDS)
-                    # else: give up -- leave steal_path, NEVER delete a live lock
+            # CRITICAL: never delete the stolen live lock (that evicts the live holder, the
+            # exact bug this reclaim prevents) and never leave `path` unclaimed (a free `path`
+            # lets a new acquirer become a SECOND owner). `_restore_stolen_lock` retries the
+            # atomic rename, then re-creates the holder's lock at `path` from the stolen payload
+            # if the rename can't succeed -- preserving mutual exclusion in every case a portable
+            # lockfile can (the only residual, a new acquirer racing into `path` in the tiny
+            # re-create window, is the accepted, bounded, self-healing triple-race below).
+            _restore_stolen_lock(steal_path, path)
             return False
         # The stolen copy was genuinely stale -> discard it; `path` is now free. Create our
         # fresh lock atomically; if a competitor created one meanwhile, O_EXCL fails -> retry.
