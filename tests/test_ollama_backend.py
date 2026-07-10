@@ -506,6 +506,20 @@ def test_safe_close_ignores_non_callable_close_attribute():
     _safe_close(object())  # no close attribute at all → also a no-op
 
 
+def test_safe_close_swallows_a_non_oserror_close_failure():
+    # _safe_close's contract is that cleanup NEVER masks the real exception in flight.
+    # close() can raise a NON-OSError (e.g. ValueError "I/O operation on closed file", or a
+    # driver-specific error); a narrow `except OSError` would let it escape from a
+    # `finally` and replace the real exception. _safe_close must swallow ANY close failure.
+    from backend import _safe_close
+
+    class _RaisesValueError:
+        def close(self):
+            raise ValueError("I/O operation on closed file")
+
+    _safe_close(_RaisesValueError())  # must not raise
+
+
 # --- Task 1 (MS4): shared HTTP-plumbing helpers extracted for reuse by ollama_stream.py ---
 
 

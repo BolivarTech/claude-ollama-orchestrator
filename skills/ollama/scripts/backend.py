@@ -57,7 +57,13 @@ def _safe_close(closable: Any) -> None:
         return
     try:
         close()
-    except OSError:
+    except Exception:  # noqa: BLE001
+        # Resource cleanup must NEVER mask the real result/exception in flight. `close()`
+        # most commonly raises `OSError`, but a stream can also raise a non-OSError (e.g.
+        # a `ValueError` "I/O operation on closed file", or a driver-specific error), which
+        # a narrow `except OSError` would let escape from a `finally` and REPLACE the real
+        # exception. Swallow ANY close failure — this is best-effort teardown, not a
+        # correctness path.
         pass
 
 
