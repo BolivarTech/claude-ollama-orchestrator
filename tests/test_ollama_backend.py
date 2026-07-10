@@ -365,9 +365,7 @@ def test_oversized_response_body_raises_backend_error():
         def __call__(self, req, timeout=None):
             return io.BytesIO(b"x" * (MAX_RESPONSE_BYTES + 1))
 
-    backend = OllamaBackend(
-        _cfg(), urlopen=_Oversized(), max_output_bytes=MAX_RESPONSE_BYTES * 2
-    )
+    backend = OllamaBackend(_cfg(), urlopen=_Oversized(), max_output_bytes=MAX_RESPONSE_BYTES * 2)
     with pytest.raises(OllamaBackendError) as exc:
         backend.run("coder", "s", "p", "m", 60)
     assert "max body size" in str(exc.value).lower()
@@ -735,6 +733,7 @@ def test_429_default_rng_draws_independent_jitter_under_real_concurrency():
     # sequences are, with cryptographically negligible probability of collision,
     # NOT identical — if they were somehow lockstepped/serialized around a shared
     # RNG state, they would match exactly on every run.
+    assert slept_a != slept_b
 
 
 # --- Task 4 (MS6): R24c — transactional output cap (anti-runaway) ---
@@ -742,8 +741,7 @@ def test_429_default_rng_draws_independent_jitter_under_real_concurrency():
 
 def test_transactional_response_over_cap_is_truncated_and_flagged(capsys):
     rec = _Recorder(content="a" * 20)
-    res = OllamaBackend(_cfg(), urlopen=rec, max_output_bytes=8).run(
-        "coder", "s", "p", "m", 60)
+    res = OllamaBackend(_cfg(), urlopen=rec, max_output_bytes=8).run("coder", "s", "p", "m", 60)
     assert res.truncated is True
     assert len(res.content.encode("utf-8")) == 8
     assert "truncat" in capsys.readouterr().err.lower()
@@ -752,7 +750,8 @@ def test_transactional_response_over_cap_is_truncated_and_flagged(capsys):
 def test_transactional_response_under_cap_is_not_truncated():
     rec = _Recorder(content="short")
     res = OllamaBackend(_cfg(), urlopen=rec, max_output_bytes=2_000_000).run(
-        "coder", "s", "p", "m", 60)
+        "coder", "s", "p", "m", 60
+    )
     assert res.truncated is False
     assert res.content == "short"
 
@@ -760,18 +759,18 @@ def test_transactional_response_under_cap_is_not_truncated():
 def test_transactional_cap_is_utf8_byte_accurate_not_code_point_accurate():
     # Each CJK char below is 3 UTF-8 bytes; a code-point-based cap would let ~3x more
     # BYTES through than the configured byte budget allows.
-    cjk = "語" * 10                      # 10 code points, 30 UTF-8 bytes
+    cjk = "語" * 10  # 10 code points, 30 UTF-8 bytes
     rec = _Recorder(content=cjk)
-    res = OllamaBackend(_cfg(), urlopen=rec, max_output_bytes=9).run(
-        "coder", "s", "p", "m", 60)
+    res = OllamaBackend(_cfg(), urlopen=rec, max_output_bytes=9).run("coder", "s", "p", "m", 60)
     assert res.truncated is True
     assert len(res.content.encode("utf-8")) <= 9
-    res.content.encode("utf-8")               # must not raise: never split mid-character
+    res.content.encode("utf-8")  # must not raise: never split mid-character
 
 
 def test_default_max_output_bytes_matches_streaming_default():
     from ollama_stream import DEFAULT_MAX_OUTPUT_BYTES as STREAM_DEFAULT
     from backend import DEFAULT_MAX_OUTPUT_BYTES as BACKEND_DEFAULT
+
     assert BACKEND_DEFAULT == STREAM_DEFAULT
 
 
@@ -787,8 +786,15 @@ def test_transactional_body_exceeding_bound_aborts_without_full_read(capsys):
     # to parse a truncated JSON envelope.
     from backend import _ENVELOPE_MARGIN_BYTES
     from errors import OllamaBackendError
+
     read_sizes: list[int] = []
-    oversized = b'{"choices": [{"message": {"content": "' + b"a" * 200_000 + b'"}}]}'
+    # Comfortably bigger than max_output_bytes (8) + the 256 KiB envelope margin, so the
+    # raw body genuinely exceeds the bound (not just the content-level cap).
+    oversized = (
+        b'{"choices": [{"message": {"content": "'
+        + b"a" * (_ENVELOPE_MARGIN_BYTES + 50_000)
+        + b'"}}]}'
+    )
 
     class _FakeResponse:
         def read(self, size=-1):
@@ -819,8 +825,6 @@ def test_transactional_body_within_bound_still_parses_and_caps_content():
     # above) still applies as a secondary guard — the bounded-read fix does not disturb
     # the existing content-truncation behavior for a within-bound response.
     rec = _Recorder(content="a" * 20)
-    res = OllamaBackend(_cfg(), urlopen=rec, max_output_bytes=8).run(
-        "coder", "s", "p", "m", 60)
+    res = OllamaBackend(_cfg(), urlopen=rec, max_output_bytes=8).run("coder", "s", "p", "m", 60)
     assert res.truncated is True
     assert len(res.content.encode("utf-8")) == 8
-    assert slept_a != slept_b

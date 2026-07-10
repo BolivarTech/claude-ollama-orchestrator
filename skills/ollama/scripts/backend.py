@@ -10,6 +10,7 @@ import json
 import math
 import random
 import socket
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -21,6 +22,7 @@ from typing import Any, Callable, NoReturn
 
 from errors import OllamaBackendError, RateLimitError
 from ollama_config import OllamaAgentsConfig
+from validate import _truncate_utf8_bytes
 
 _REDACTED = "***"
 _BACKOFF_CAP_SECONDS = 30
@@ -36,6 +38,25 @@ MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 # independently and much tighter than MAX_RESPONSE_BYTES so a malicious/broken endpoint
 # cannot force a large in-memory read via its *error* path either.
 MAX_ERROR_BODY_BYTES = 64 * 1024
+
+# R24c anti-runaway output cap (MS6): the content-level byte budget for a transactional
+# delegation's extracted `content`. Matches `ollama_stream.DEFAULT_MAX_OUTPUT_BYTES` (MS4)
+# so both the transactional and streaming paths share the SAME default budget unless
+# overridden, and is the same default the layered config resolver falls back to when
+# `max_output_bytes` is not overridden (Task 8).
+DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
+
+# R24c: named, CALIBRATED headroom for the JSON envelope wrapping `content` — everything
+# in the raw body OTHER than `content` itself: object/array punctuation, `id`/`model`/
+# `object` string fields, `finish_reason`, an optional `usage` block, a `system_fingerprint`,
+# an optional `logprobs` block, and (defensively) more than one `choices` entry if a server
+# ignores this project's implicit `n=1`. This is NOT a second content-size cap — it only
+# widens the RAW BODY bound so a well-formed, within-cap response is never falsely aborted
+# just because the envelope around it costs a few extra bytes. 256 KiB is deliberately
+# generous relative to a typical envelope's real overhead (usually well under a few KiB)
+# while staying a small, fixed fraction of DEFAULT_MAX_OUTPUT_BYTES — not unbounded, and
+# NOT itself user-configurable (only the content-level max_output_bytes is, Task 8).
+_ENVELOPE_MARGIN_BYTES = 256 * 1024  # 256 KiB (recalibrated from an uncalibrated 64 KiB)
 
 
 def _safe_close(closable: Any) -> None:
@@ -442,6 +463,7 @@ class OllamaBackend(AgentBackend):
         sleep: Callable[[float], None] | None = None,
         rng: Callable[[], float] | None = None,
         max_backoffs: int = 3,
+        max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
     ) -> None:
         """Initialize the backend.
 
@@ -453,12 +475,23 @@ class OllamaBackend(AgentBackend):
             sleep: Injectable sleep function for deterministic 429-backoff tests.
             rng: Injectable random source (``[0, 1)``) for deterministic jitter tests.
             max_backoffs: Maximum number of 429 backoff attempts before giving up (R8).
+            max_output_bytes: R24c anti-runaway output cap (MS6) — the content-level UTF-8
+                byte budget for the extracted ``content``. Derives
+                ``self._max_transactional_body_bytes``, the bound applied to the RAW body
+                read (the JSON envelope wrapping ``content``, hence the added envelope
+                margin) — clamped to never EXCEED the absolute, always-on
+                ``MAX_RESPONSE_BYTES`` backstop, so a huge/misconfigured override can only
+                tighten this bound, never loosen the floor.
         """
         self._config = config
         self._urlopen = urlopen
         self._sleep = sleep or time.sleep
         self._rng = rng or random.random
         self._max_backoffs = max_backoffs
+        self._max_output_bytes = max_output_bytes
+        self._max_transactional_body_bytes = min(
+            MAX_RESPONSE_BYTES, max_output_bytes + _ENVELOPE_MARGIN_BYTES
+        )
         # DRY (MS4 Task 1): built from the SAME `make_redactor` the streaming reader
         # uses, so the api_key can never leak through either path's error messages.
         self._redact: Callable[[str], str] = make_redactor(config.api_key)
@@ -488,7 +521,7 @@ class OllamaBackend(AgentBackend):
 
     def _call(
         self, req: urllib.request.Request, deadline: float
-    ) -> tuple[str, dict[str, Any] | None]:
+    ) -> tuple[str, dict[str, Any] | None, bool]:
         """Execute *req*, backing off on HTTP 429 up to ``max_backoffs`` (R8), bounded by
         the per-delegation monotonic *deadline* (R25).
 
@@ -506,8 +539,10 @@ class OllamaBackend(AgentBackend):
                 source of truth for the time budget).
 
         Returns:
-            A ``(content, usage)`` tuple: the extracted ``content`` string and the raw
-            ``usage`` dict from the response envelope (``None`` if the server omitted it).
+            A ``(content, usage, truncated)`` tuple: the extracted ``content`` string
+            (possibly truncated by the R24c anti-runaway output cap, MS6), the raw
+            ``usage`` dict from the response envelope (``None`` if the server omitted
+            it), and whether the content was truncated.
 
         Raises:
             OllamaBackendError: on HTTP/connection/shape failure, or on 429 exhaustion
@@ -569,8 +604,8 @@ class OllamaBackend(AgentBackend):
 
     def _call_once(
         self, req: urllib.request.Request, timeout: float
-    ) -> tuple[str, dict[str, Any] | None]:
-        """Execute *req* once and extract ``(content, usage)``, or raise.
+    ) -> tuple[str, dict[str, Any] | None, bool]:
+        """Execute *req* once and extract ``(content, usage, truncated)``, or raise.
 
         Args:
             req: The prepared request.
@@ -578,33 +613,51 @@ class OllamaBackend(AgentBackend):
                 remaining deadline budget by the caller).
 
         Returns:
-            A ``(content, usage)`` tuple: the extracted ``content`` string and the raw
+            A ``(content, usage, truncated)`` tuple: the extracted ``content`` string
+            (possibly truncated by the R24c anti-runaway output cap, MS6), the raw
             ``usage`` dict from the SAME already bounded-read/decoded/parsed ``payload``
-            (``None`` if the server omitted it) — no additional I/O or decoding.
+            (``None`` if the server omitted it) — no additional I/O or decoding — and
+            whether ``content`` was truncated.
 
         Raises:
             ResponseFormatRejected: on a 400 that mentions ``response_format``/
                 ``json_schema`` (caller downgrades and retries once).
             _RateLimited: on a 429 (caller backs off).
             OllamaBackendError: on any other HTTP error, connection failure, oversized
-                response, non-JSON body, unexpected envelope shape, or null content
-                (all messages redacted).
+                response (either the absolute ``MAX_RESPONSE_BYTES`` backstop or the
+                R24c ``max_output_bytes``-derived bound), non-JSON body, unexpected
+                envelope shape, or null content (all messages redacted).
             TimeoutError: on socket timeout.
         """
         resp: Any = None
         try:
             resp = self._urlopen(req, timeout=timeout)
-            # Absolute DoS backstop (MAX_RESPONSE_BYTES, always-on): read at most ONE
-            # byte past the bound so a runaway/hostile server can never force an
-            # unbounded in-memory load — never a bare resp.read(). MS6 layers a tighter,
-            # config-driven MAX_TRANSACTIONAL_BODY_BYTES (derived from max_output_bytes)
-            # on top of this floor; the two bounds are complementary, not conflicting.
-            raw = resp.read(MAX_RESPONSE_BYTES + 1)
-            if len(raw) > MAX_RESPONSE_BYTES:
+            # R24c (MS6): bound the RAW read itself — never read-then-truncate. The
+            # transactional body is a JSON ENVELOPE (`content` lives inside
+            # choices[0].message.content), so a byte-truncated envelope is not reliably
+            # parseable; a runaway response must therefore be ABORTED, not truncated
+            # after the fact. `self._max_transactional_body_bytes` (derived from
+            # `max_output_bytes` + `_ENVELOPE_MARGIN_BYTES`, clamped to never exceed the
+            # absolute `MAX_RESPONSE_BYTES` backstop) is the bound; `+1` is exactly
+            # enough to distinguish "at the bound" from "over the bound" without reading
+            # a single byte further (mirrors `binary_input.load_binary`'s bounded read) —
+            # a runaway response is NEVER fully read into memory.
+            raw = resp.read(self._max_transactional_body_bytes + 1)
+            if len(raw) > self._max_transactional_body_bytes:
+                # The transactional body is a JSON envelope — a byte-truncated envelope
+                # is not reliably parseable, so this ABORTS the transaction (R24c:
+                # "aborta la transacción") rather than truncating raw bytes and trying
+                # to parse a corrupted JSON fragment.
+                print(
+                    f"WARNING: transactional response exceeded "
+                    f"{self._max_transactional_body_bytes} bytes; aborting "
+                    "(R24c anti-runaway output cap) — use streaming for large outputs.",
+                    file=sys.stderr,
+                )
                 raise OllamaBackendError(
                     self._redact(
-                        f"response body exceeded MAX_RESPONSE_BYTES ({MAX_RESPONSE_BYTES} "
-                        "bytes) — server sent an oversized response"
+                        "transactional response exceeded max body size — "
+                        "use streaming for large outputs"
                     )
                 )
             # The chat-completions response body is untrusted server output: decode
@@ -664,10 +717,22 @@ class OllamaBackend(AgentBackend):
                 self._redact("Ollama returned null content (model produced no output)")
             )
         content_str = json.dumps(content) if isinstance(content, dict) else str(content)
+        # R24c (MS6) secondary guard: the raw-body bound above already ensures the
+        # ENVELOPE was never unboundedly read; this caps the EXTRACTED content itself to
+        # `max_output_bytes` UTF-8 bytes (never code points — see `_truncate_utf8_bytes`,
+        # shared with `ollama_stream.py`, Task 3), so a within-bound envelope carrying a
+        # content string right at the edge of the budget is still capped precisely.
+        content_str, truncated = _truncate_utf8_bytes(content_str, self._max_output_bytes)
+        if truncated:
+            print(
+                f"WARNING: response truncated at {self._max_output_bytes} bytes "
+                "(R24c anti-runaway output cap).",
+                file=sys.stderr,
+            )
         # NEW in MS2: read `usage` from the SAME already bounded-read/decoded/parsed
         # `payload` — zero additional I/O, zero additional decoding.
         usage = payload.get("usage")
-        return content_str, usage if isinstance(usage, dict) else None
+        return content_str, usage if isinstance(usage, dict) else None, truncated
 
     def run(
         self,
@@ -717,11 +782,11 @@ class OllamaBackend(AgentBackend):
         prompt_len = len(system_prompt) + len(prompt)
         start = time.monotonic()
         try:
-            content, usage = self._call(req, deadline)
+            content, usage, truncated = self._call(req, deadline)
         except ResponseFormatRejected:
             downgraded = self._build_request(system_prompt, prompt, model, None)
             try:
-                content, usage = self._call(downgraded, deadline)
+                content, usage, truncated = self._call(downgraded, deadline)
             except ResponseFormatRejected:
                 # The DOWNGRADED (no response_format) request was STILL rejected as a
                 # response_format/json_schema 400 — e.g. a proxy whose error body
@@ -737,4 +802,6 @@ class OllamaBackend(AgentBackend):
                 ) from None
         elapsed = time.monotonic() - start
         prompt_tokens, completion_tokens, estimated = _resolve_usage(usage, prompt_len, content)
-        return DelegationResult(content, prompt_tokens, completion_tokens, estimated, elapsed)
+        return DelegationResult(
+            content, prompt_tokens, completion_tokens, estimated, elapsed, truncated=truncated
+        )
