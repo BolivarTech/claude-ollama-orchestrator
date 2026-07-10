@@ -43,7 +43,7 @@ from ollama_config import resolve_config as resolve_config
 from ollama_preflight import preflight
 from ollama_stream import stream_run
 from ollama_vision import stream_vision
-from parse_output import parse_agent_output
+from parse_output import parse_agent_output, strip_think
 from run_lock import (
     SLOTS_DIRNAME,
     STDOUT_TOKEN_FILENAME,
@@ -414,6 +414,11 @@ def make_file_sink(path: str) -> "_FileSink":
 # transport has an established, tested mechanism to opt out of `dispatch` again.
 _MS1_UNSUPPORTED_CAPS: frozenset[str] = frozenset()  # was {"transcribe"} after Task 4; now empty
 
+# Capabilities whose free-text output gets <think>...</think> reasoning-block recovery
+# (BDD-21, MS7 Task 6): the useful CONCLUSION is what Claude reviews, not the scratchpad
+# a reasoning model (e.g. deepseek-v4-pro, thinking's default) emits ahead of it.
+_THINK_RECOVERY_CAPS: frozenset[str] = frozenset({"thinking"})
+
 
 def _capability_streams_to_stdout(config: OllamaAgentsConfig, capability: str) -> bool:
     """Return True iff *capability* streams live deltas (R7b/R7c) rather than running
@@ -606,6 +611,10 @@ def dispatch(
             response_format=response_format,
             deadline=deadline,
         )
+        if capability in _THINK_RECOVERY_CAPS:
+            # Post-process the free-text content only (BDD-21): yield the conclusion,
+            # drop the reasoning scratchpad. `.parsed` stays None here (free-text branch).
+            result = replace(result, content=strip_think(result.content))
         if stats is not None:
             stats.record(capability, model, result)
         return result

@@ -9,7 +9,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from parse_output import parse_agent_output
+from parse_output import parse_agent_output, strip_think
 
 _KEYS = ("agent", "verdict")
 
@@ -93,8 +93,6 @@ def test_parse_never_crashes_only_raises_jsondecodeerror(s):
 
 
 # --- Task 6: thinking capability — <think> conclusion recovery (BDD-21) ---
-
-from parse_output import strip_think
 
 
 def test_strip_think_yields_the_conclusion():
