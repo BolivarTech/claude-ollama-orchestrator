@@ -1206,11 +1206,19 @@ def run_delegation(ns: argparse.Namespace) -> int:
                     def _run_streamed(used_stdout: bool) -> DelegationResult:
                         if used_stdout:
                             return _stream_to_stdout_framed()
-                        # Another process holds the terminal -> file-only, nothing to stdout.
+                        # R7d loser: another process holds the terminal, so DON'T stream
+                        # token-by-token to the shared stdout (that is what would interleave).
+                        # Capture the raw stream to this delegation's own file, then present
+                        # the buffered result to Claude ONCE, nonce-wrapped (R22b) -- Claude
+                        # reads THIS process's own stdout capture (separate from the winner's),
+                        # so a single wrapped block never interleaves the winner's live stream
+                        # yet a token-loser is never handed empty stdout.
                         with make_file_sink(
                             os.path.join(output_dir, f"{ns.capability}.stream.log")
                         ) as fsink:
-                            return _do_dispatch(fsink)
+                            result_file_only = _do_dispatch(fsink)
+                        print(wrap_output(result_file_only.content))
+                        return result_file_only
 
                     result, _used_stdout = _stream_maybe_with_stdout_token(
                         cfg, token_path, ns.timeout, _run_streamed

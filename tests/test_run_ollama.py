@@ -3197,11 +3197,15 @@ def test_stream_with_stdout_token_releases_on_interrupt(tmp_path):
     assert acquire_token(tok, 60) is True
 
 
-def test_streaming_goes_file_only_when_stdout_token_is_held(capsys, monkeypatch, tmp_path):
+def test_streaming_token_loser_streams_to_file_and_presents_the_result_wrapped(
+    capsys, monkeypatch, tmp_path
+):
     # R7d: when the cross-process stdout token is already held (another run_ollama process is
-    # streaming to the terminal), a streaming delegation must NOT stream to stdout (that
-    # would interleave across processes) -- it goes file-only to its own {cap}.stream.log,
-    # writing nothing (no content, no nonce frame) to stdout.
+    # streaming to the terminal), a streaming delegation must NOT stream token-by-token to
+    # the shared stdout (that would interleave) -- it captures the raw stream to its own
+    # {cap}.stream.log AND then presents the buffered result to Claude ONCE, nonce-wrapped
+    # (R22b), so a token-loser is never handed EMPTY stdout (Loop-1 fix). Claude reads this
+    # process's own stdout capture, so the single wrapped block never interleaves the winner.
     monkeypatch.chdir(tmp_path)
     import run_lock
 
@@ -3235,10 +3239,11 @@ def test_streaming_goes_file_only_when_stdout_token_is_held(capsys, monkeypatch,
     rc = run_ollama.main(["coder", "write it", "--no-status", "--output-dir", str(out_dir)])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "STREAMED-CONTENT" not in out  # file-only: nothing streamed to stdout
-    assert "BEGIN UNTRUSTED MODEL OUTPUT" not in out  # no stdout frame when file-only
+    assert "STREAMED-CONTENT" in out  # presented to Claude (buffered), never empty stdout
+    assert out.count("STREAMED-CONTENT") == 1  # ONCE (buffered wrap), not also raw-streamed
+    assert "BEGIN UNTRUSTED MODEL OUTPUT" in out  # nonce-wrapped for Claude (R22b)
     log = (out_dir / "coder.stream.log").read_text(encoding="utf-8")
-    assert "STREAMED-CONTENT" in log  # the stream landed in the per-agent file instead
+    assert "STREAMED-CONTENT" in log  # the raw stream also landed in the per-agent file
 
 
 # --- MS7 Task 3: cross-process slot-counter (R21c) — `_run_one_delegation_slotted` +
