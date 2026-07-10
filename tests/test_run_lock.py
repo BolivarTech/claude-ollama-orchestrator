@@ -258,3 +258,18 @@ def test_release_token_is_idempotent(tmp_path):
     release_token(tok)
     release_token(tok)  # no raise
     assert not os.path.exists(tok)
+
+
+def test_acquire_token_degrades_to_false_on_transient_open_oserror(tmp_path, monkeypatch):
+    # Total / never-raise (plan narrative + the ephemeral primitive's contract): a transient
+    # OSError on the initial atomic create -- e.g. a Windows AV/indexer momentarily locking
+    # the new file, or a read-only temp -- must degrade to "couldn't acquire" (return False,
+    # so the caller falls back to a per-agent file sink), NEVER propagate and crash the
+    # delegation. Only FileExistsError means "held by someone else, try to reclaim".
+    tok = str(tmp_path / STDOUT_TOKEN_FILENAME)
+
+    def _boom_open(*a, **k):
+        raise PermissionError("transient AV lock on the new lockfile")
+
+    monkeypatch.setattr(run_lock.os, "open", _boom_open)
+    assert acquire_token(tok, timeout=60) is False

@@ -455,7 +455,13 @@ def _acquire_ephemeral(path: str, bound: int) -> bool:
         os.close(fd)
         return True
     except FileExistsError:
-        pass
+        pass  # already held -> try to reclaim below
+    except OSError:
+        # Any OTHER transient FS error on the atomic create (a Windows AV/indexer briefly
+        # locking the new file, a read-only temp, EMFILE, ...) means we simply couldn't
+        # acquire the token -- degrade to False so the caller falls back to a per-agent
+        # file sink, NEVER propagate and crash the delegation (total/never-raise).
+        return False
     for _ in range(_EPHEMERAL_RECLAIM_RETRIES):
         if _lockfile_holder_is_live(path):
             return False  # live holder -> do not steal
