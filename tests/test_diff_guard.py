@@ -227,3 +227,76 @@ def test_validate_findings_keeps_a_finding_that_makes_no_file_claim():
     assert fileless in kept  # a finding with no `file` key is NOT dropped
     assert real in kept
     assert dropped == []
+
+
+# --- Corpus: realistic multi-file `git diff` output (mode changes, index lines, multiple
+# hunks, a rename+modify, and a full file addition against /dev/null). Balthasar residual:
+# exercise the parser on shapes closer to real `git diff` than the minimal fixtures above. ---
+_GIT_CORPUS = """\
+diff --git a/src/mod_a.py b/src/mod_a.py
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/mod_a.py
++++ b/src/mod_a.py
+@@ -3,2 +3,3 @@ def existing():
+ unchanged one
+-old removed line
++new line at four
++another new line at five
+@@ -20,1 +21,2 @@ class Foo:
+ ctx
++appended at twenty-two
+diff --git a/src/created.py b/src/created.py
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/src/created.py
+@@ -0,0 +1,2 @@
++brand new one
++brand new two
+diff --git a/old/name.py b/new/name.py
+similarity index 92%
+rename from old/name.py
+rename to new/name.py
+index 111..222 100644
+--- a/old/name.py
++++ b/new/name.py
+@@ -8,1 +8,2 @@
+ kept
++added after rename
+"""
+
+
+def test_corpus_multi_file_git_diff_parses_each_file_and_its_added_lines():
+    files, ranges = parse_diff(_GIT_CORPUS)
+    assert {"src/mod_a.py", "src/created.py", "new/name.py"} <= files
+    # mod_a.py: first hunk new-start 3 -> ctx@3, added@4, added@5; second hunk new-start 21 ->
+    # ctx@21, added@22.
+    assert {4, 5, 22} <= ranges["src/mod_a.py"]
+    # created.py: new-start 1 -> added@1, added@2 (full addition against /dev/null).
+    assert {1, 2} <= ranges["src/created.py"]
+    # renamed file's post-rename path carries the added line at new-start 8 -> ctx@8, added@9.
+    assert 9 in ranges["new/name.py"]
+    # `/dev/null` is never registered as a real file.
+    assert "/dev/null" not in files
+
+
+def test_corpus_findings_are_grounded_against_the_real_paths():
+    # A finding on a real changed line is kept; one on a fabricated file is hard-dropped.
+    kept, dropped = validate_findings(
+        [
+            {"file": "src/created.py", "line": 1, "title": "real add"},
+            {"file": "src/ghost.py", "line": 1, "title": "fabricated"},
+        ],
+        _GIT_CORPUS,
+    )
+    kept_files = {f["file"] for f in kept}
+    assert "src/created.py" in kept_files and "src/ghost.py" not in kept_files
+    assert any(f["file"] == "src/ghost.py" for f in dropped)
+
+
+def test_corpus_out_of_range_finding_on_a_real_file_is_soft_annotated_not_dropped():
+    kept, dropped = validate_findings(
+        [{"file": "src/mod_a.py", "line": 999, "title": "far out of range"}], _GIT_CORPUS
+    )
+    assert dropped == []  # real file -> never hard-dropped
+    assert kept[0].get("annotation") == "[outside changed range]"
