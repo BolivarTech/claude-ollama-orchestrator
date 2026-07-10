@@ -3079,3 +3079,39 @@ def test_streaming_frame_is_closed_even_when_dispatch_raises(capsys, monkeypatch
     assert "END UNTRUSTED MODEL OUTPUT" in out  # frame CLOSED despite the mid-stream failure
     assert "PARTIAL" in out  # the partial stream sits inside the closed frame
     assert rc != 0  # the delegation still reports failure
+
+
+def test_streaming_output_strips_invisibles_for_defense_in_depth(capsys, monkeypatch, tmp_path):
+    # R22b defense-in-depth parity (MAGI INFO): the streaming path strips invisible/bidi
+    # chars from each delta before stdout, matching wrap_output's stripping on the
+    # transactional path -- so a model cannot smuggle zero-width/bidi injection chars past
+    # Claude via the live stream. Each SSE delta is a complete UTF-8 string, so per-delta
+    # stripping equals stripping the assembled output for single-code-point invisibles.
+    monkeypatch.chdir(tmp_path)
+    import run_ollama
+    from backend import DelegationResult
+
+    def _fake_stream_run(
+        config,
+        system_prompt,
+        prompt,
+        model,
+        timeout,
+        *,
+        sink,
+        response_format=None,
+        max_output_bytes=None,
+    ):
+        sink("safe\u200bcode")  # a zero-width space embedded in the streamed delta
+        return DelegationResult("safe\u200bcode", 1, 1, True, 0.1)
+
+    cfg = _cfg_with_structured()  # coder: streaming path
+    monkeypatch.setattr(run_ollama, "resolve_config", lambda **kw: cfg)
+    monkeypatch.setattr(run_ollama, "preflight", lambda cfg, **kw: None)
+    monkeypatch.setattr(run_ollama, "load_system_prompt", lambda cap: "sys")
+    monkeypatch.setattr(run_ollama, "_make_backend", lambda cfg: object())
+    monkeypatch.setattr(run_ollama, "stream_run", _fake_stream_run)
+    run_ollama.main(["coder", "write it", "--no-status"])
+    out = capsys.readouterr().out
+    assert "\u200b" not in out  # zero-width space stripped from the streamed stdout
+    assert "safecode" in out  # the visible content survives; only the invisible is gone

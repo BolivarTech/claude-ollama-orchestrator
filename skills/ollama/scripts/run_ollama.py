@@ -45,7 +45,7 @@ from ollama_stream import stream_run
 from ollama_vision import stream_vision
 from parse_output import parse_agent_output
 from run_lock import remove_lock, staleness_bound_for_timeout, write_lock
-from sanitize import build_user_prompt, open_output_frame, wrap_output
+from sanitize import build_user_prompt, open_output_frame, strip_invisibles, wrap_output
 from scheduler import Scheduler
 from startup_hardening import (
     enable_utf8_console_io,
@@ -282,6 +282,24 @@ def stdout_sink(text: str) -> None:
     """
     sys.stdout.write(text)
     sys.stdout.flush()
+
+
+def _streaming_stdout_sink(text: str) -> None:
+    """R22b defense-in-depth sink: strip invisible/bidi chars from each streamed delta
+    before writing it to stdout, matching :func:`sanitize.wrap_output`'s stripping on the
+    transactional path.
+
+    Each SSE delta is a complete UTF-8 string (the streaming reader assembles on character
+    boundaries), so per-delta stripping of single-code-point invisibles equals stripping
+    the whole assembled output — a model cannot smuggle zero-width / bidi injection
+    characters past Claude via the live stream. The RAW content is still recorded verbatim
+    in the run artifacts (`_write_artifacts` uses `result.content`); only the Claude-facing
+    stdout stream is hardened.
+
+    Args:
+        text: One delta of streamed content.
+    """
+    stdout_sink(strip_invisibles(text))
 
 
 class _FileSink:
@@ -1044,7 +1062,10 @@ def run_delegation(ns: argparse.Namespace) -> int:
                         stats=stats,
                         # R7c: this CLI drives exactly ONE delegation at a time (concurrency
                         # is MS5) -- the single-in-flight case always gets the stdout sink.
-                        sink=stdout_sink,
+                        # R22b: the streaming sink strips invisibles from each delta (parity
+                        # with wrap_output on the transactional path). No-op for a
+                        # transactional capability, whose backend never calls the sink.
+                        sink=_streaming_stdout_sink,
                     )
                 finally:
                     if is_streaming:
