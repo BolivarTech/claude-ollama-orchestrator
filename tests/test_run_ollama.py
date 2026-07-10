@@ -3432,3 +3432,99 @@ def test_build_parser_accepts_optional_diff_flag(tmp_path):
 def test_build_parser_diff_defaults_to_none():
     ns = build_parser().parse_args(["reviewer", "in"])
     assert ns.diff is None
+
+
+# --- MS7 Task 8: disable_fs_locks kill-switch (R7d/R21c operator escape hatch) ---
+#
+# Real `_Job` instances and an explicit, isolated `CircuitBreaker()` are used
+# throughout (same reasoning as the Task 3 slot-counter tests above): the batch
+# machinery reads `job.cap`/`job.model` even on a rejection fast-path, and an
+# isolated breaker keeps these tests from sharing failure-count state with the
+# process-wide `_PROCESS_CIRCUIT_BREAKER` singleton other tests in this module
+# mutate.
+
+from run_lock import STDOUT_TOKEN_FILENAME  # noqa: E402 -- appended section
+
+
+def _cfg_disable_fs_locks(
+    disable: bool, *, max_parallel_agents: int = 2, max_queued_agents: int = 0
+):
+    base = run_ollama._cfg_for_batch(
+        max_parallel_agents=max_parallel_agents, max_queued_agents=max_queued_agents
+    )
+    return replace(base, disable_fs_locks=disable)
+
+
+def test_disable_fs_locks_true_creates_no_slots_dir_and_still_runs_every_job(
+    tmp_path, monkeypatch
+):
+    from circuit_breaker import CircuitBreaker
+
+    ran = {"n": 0}
+
+    def _fake_worker(job, config, sink, stats=None):
+        ran["n"] += 1
+        return "ok"
+
+    monkeypatch.setattr(run_ollama, "_run_one_delegation", _fake_worker)
+    # max_parallel_agents=3 admits all 3 jobs in one Scheduler pass (ceiling 3), so
+    # this test's "every job still ran" assertion is independent of R21b queue
+    # rejection, which is out of scope here.
+    cfg = _cfg_disable_fs_locks(True, max_parallel_agents=3, max_queued_agents=0)
+    output_dir = str(tmp_path / "run")
+    os.makedirs(output_dir, exist_ok=True)  # fan-out sink routing writes into it
+    jobs = [run_ollama._Job(cap="coder", model="m", prompt="p") for _ in range(3)]
+    asyncio.run(
+        run_ollama.run_batch(
+            jobs, config=cfg, output_dir=output_dir, managed=True, breaker=CircuitBreaker()
+        )
+    )
+    slots_dir = os.path.join(os.path.dirname(os.path.realpath(output_dir)), SLOTS_DIRNAME)
+    assert not os.path.exists(slots_dir)  # cross-process slot dir never created
+    assert ran["n"] == 3  # every job still ran (in-process Scheduler bound)
+
+
+def test_disable_fs_locks_false_preserves_task_3_slotted_behavior(tmp_path, monkeypatch):
+    """Regression: the kill-switch is opt-in -- default (False) must not touch Task 3's
+    existing cross-process slot wiring."""
+    from circuit_breaker import CircuitBreaker
+
+    def _fake_slotted(job, config, sink, *, slots_dir, timeout, stats=None):
+        os.makedirs(slots_dir, exist_ok=True)  # what acquire_slot would create
+        return "ok"
+
+    monkeypatch.setattr(run_ollama, "_run_one_delegation_slotted", _fake_slotted)
+    # max_parallel_agents=1 with a single job takes the serial fast path, which (per
+    # Task 3) also routes through the slotted wrapper -- same assertion, no need for
+    # the fan-out sink's output_dir to pre-exist.
+    cfg = _cfg_disable_fs_locks(False, max_parallel_agents=1, max_queued_agents=0)
+    output_dir = str(tmp_path / "run")
+    job = run_ollama._Job(cap="coder", model="m", prompt="p")
+    asyncio.run(
+        run_ollama.run_batch(
+            [job], config=cfg, output_dir=output_dir, managed=True, breaker=CircuitBreaker()
+        )
+    )
+    slots_dir = os.path.join(os.path.dirname(os.path.realpath(output_dir)), SLOTS_DIRNAME)
+    assert os.path.exists(slots_dir)
+
+
+def test_disable_fs_locks_true_skips_the_stdout_token_and_creates_no_lock_file(tmp_path):
+    token_path = str(tmp_path / STDOUT_TOKEN_FILENAME)
+    cfg = _cfg_disable_fs_locks(True)
+    seen = {}
+    result, used = run_ollama._stream_maybe_with_stdout_token(
+        cfg, token_path, 60, lambda used_stdout: seen.setdefault("used", used_stdout) or "ok"
+    )
+    assert result == "ok" and used is True and seen["used"] is True
+    assert not os.path.exists(token_path)  # acquire() was never called
+
+
+def test_disable_fs_locks_false_still_creates_and_arbitrates_the_stdout_token(tmp_path):
+    token_path = str(tmp_path / STDOUT_TOKEN_FILENAME)
+    cfg = _cfg_disable_fs_locks(False)
+    result, used = run_ollama._stream_maybe_with_stdout_token(
+        cfg, token_path, 60, lambda used_stdout: used_stdout
+    )
+    assert used is True and result is True
+    assert os.path.exists(token_path)  # unchanged Task 2 behavior
