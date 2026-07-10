@@ -280,3 +280,67 @@ def test_max_queued_bool_raises(tmp_path):
     r = _write(tmp_path, "repo.toml", "max_queued_agents = true\n")
     with pytest.raises(OllamaConfigError):
         resolve_config(global_path=None, repo_path=r, env={})
+
+
+def test_max_output_bytes_defaults_to_2_000_000_matching_both_backends():
+    # Three-way equality: the config default must match BOTH consumers' own module
+    # defaults (backend.py, ollama_stream.py, MS4/Task 4) -- never a fourth, drifted copy.
+    from backend import DEFAULT_MAX_OUTPUT_BYTES as BACKEND_DEFAULT
+    from ollama_stream import DEFAULT_MAX_OUTPUT_BYTES as STREAM_DEFAULT
+
+    cfg = resolve_config(global_path=None, repo_path=None, env={})
+    assert cfg.max_output_bytes == BACKEND_DEFAULT == STREAM_DEFAULT == 2_000_000
+
+
+def test_max_output_bytes_env_overrides_repo_and_global(tmp_path):
+    r = _write(tmp_path, "repo.toml", "max_output_bytes = 500000\n")
+    cfg = resolve_config(
+        global_path=None,
+        repo_path=r,
+        env={"OLLAMA_AGENTS_MAX_OUTPUT_BYTES": "750000"},
+    )
+    assert cfg.max_output_bytes == 750_000  # env wins over repo
+
+
+def test_max_output_bytes_repo_overrides_global(tmp_path):
+    r = _write(tmp_path, "repo.toml", "max_output_bytes = 300000\n")
+    g = _write(tmp_path, "global.toml", "max_output_bytes = 900000\n")
+    cfg = resolve_config(global_path=g, repo_path=r, env={})
+    assert cfg.max_output_bytes == 300_000
+
+
+def test_max_output_bytes_rejects_zero_and_negative():
+    with pytest.raises(OllamaConfigError):
+        resolve_config(
+            global_path=None, repo_path=None, env={"OLLAMA_AGENTS_MAX_OUTPUT_BYTES": "0"}
+        )
+    with pytest.raises(OllamaConfigError):
+        resolve_config(
+            global_path=None, repo_path=None, env={"OLLAMA_AGENTS_MAX_OUTPUT_BYTES": "-1"}
+        )
+
+
+def test_max_output_bytes_rejects_non_integer_string():
+    with pytest.raises(OllamaConfigError):
+        resolve_config(
+            global_path=None,
+            repo_path=None,
+            env={"OLLAMA_AGENTS_MAX_OUTPUT_BYTES": "not-a-number"},
+        )
+
+
+def test_max_output_bytes_rejects_bool_from_toml(tmp_path):
+    # bool IS-A int in Python -- int(True) == 1 succeeds silently without an explicit
+    # isinstance guard, coercing a config typo (`max_output_bytes = true`) into a
+    # valid-looking-but-wrong 1-byte cap instead of a loud, actionable config error.
+    r = _write(tmp_path, "repo.toml", "max_output_bytes = true\n")
+    with pytest.raises(OllamaConfigError):
+        resolve_config(global_path=None, repo_path=r, env={})
+
+
+def test_max_parallel_agents_also_rejects_bool_now(tmp_path):
+    # The _resolve_int bool-guard is a SHARED fix -- proves it also closes the same
+    # latent gap for a PRE-EXISTING key, not just the new one.
+    r = _write(tmp_path, "repo.toml", "max_parallel_agents = false\n")
+    with pytest.raises(OllamaConfigError):
+        resolve_config(global_path=None, repo_path=r, env={})

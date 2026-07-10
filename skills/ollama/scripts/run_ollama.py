@@ -45,7 +45,14 @@ from ollama_stream import stream_run
 from ollama_vision import stream_vision
 from parse_output import parse_agent_output
 from run_lock import remove_lock, staleness_bound_for_timeout, write_lock
+from sanitize import build_user_prompt, open_output_frame, strip_invisibles, wrap_output
 from scheduler import Scheduler
+from startup_hardening import (
+    enable_utf8_console_io,
+    warn_if_config_world_readable,
+    warn_if_oversize,
+    warn_if_remote_http_with_api_key,
+)
 from status_display import StatusDisplay
 from stderr_shim import (
     buffered_stderr_while,
@@ -277,6 +284,24 @@ def stdout_sink(text: str) -> None:
     sys.stdout.flush()
 
 
+def _streaming_stdout_sink(text: str) -> None:
+    """R22b defense-in-depth sink: strip invisible/bidi chars from each streamed delta
+    before writing it to stdout, matching :func:`sanitize.wrap_output`'s stripping on the
+    transactional path.
+
+    Each SSE delta is a complete UTF-8 string (the streaming reader assembles on character
+    boundaries), so per-delta stripping of single-code-point invisibles equals stripping
+    the whole assembled output — a model cannot smuggle zero-width / bidi injection
+    characters past Claude via the live stream. The RAW content is still recorded verbatim
+    in the run artifacts (`_write_artifacts` uses `result.content`); only the Claude-facing
+    stdout stream is hardened.
+
+    Args:
+        text: One delta of streamed content.
+    """
+    stdout_sink(strip_invisibles(text))
+
+
 class _FileSink:
     """A per-delegation streaming sink that owns ONE open file handle: opened once,
     written per delta, closed once at stream end. Never reopens the file per token
@@ -376,6 +401,21 @@ def make_file_sink(path: str) -> "_FileSink":
 _MS1_UNSUPPORTED_CAPS = frozenset({"vision", "transcribe"})
 
 
+def _capability_streams_to_stdout(config: OllamaAgentsConfig, capability: str) -> bool:
+    """Return True iff *capability* streams live deltas (R7b/R7c) rather than running
+    transactional.
+
+    The SINGLE source of truth for the streaming-vs-transactional choice, shared by
+    :func:`_run_once` (to route to ``stream_run``/``stream_vision`` vs ``backend.run``)
+    and :func:`run_delegation` (to decide R22b live-frame vs buffered ``wrap_output``), so
+    the two can never drift out of sync. A capability streams when its per-capability
+    ``[stream]`` flag is true AND it is not a ``schema`` capability — schema output is
+    parsed/validated, never streamed (making "structured → transactional" a code
+    invariant, not just a config default a user could override).
+    """
+    return bool(config.stream.get(capability)) and config.structured.get(capability) != "schema"
+
+
 def _run_once(
     capability: str,
     system_prompt: str,
@@ -428,8 +468,7 @@ def _run_once(
     # attempt's raw tokens with the retry's on the same sink. The spec's config rationale
     # is "structured/corto → transactional"; making it a code invariant (not just the
     # reviewer/tester [stream]=false default a user could override) closes that gap.
-    is_schema = config.structured.get(capability) == "schema"
-    if bool(config.stream.get(capability)) and sink is not None and not is_schema:
+    if _capability_streams_to_stdout(config, capability) and sink is not None:
         fn = stream_vision if capability == "vision" else stream_run
         return fn(
             config,
@@ -439,6 +478,7 @@ def _run_once(
             timeout,
             sink=sink,
             response_format=response_format,
+            max_output_bytes=config.max_output_bytes,
         )
     return backend.run(
         capability,
@@ -488,8 +528,10 @@ def dispatch(
 
     Args:
         capability: The capability name.
-        prompt: The user prompt, passed as-is in MS1 (anti-injection sanitization is
-            added in M6 — this is a forward reference, MS1 does not sanitize).
+        prompt: The user prompt, passed as-is — the caller (``run_delegation``, MS6
+            Task 6) is responsible for anti-injection sanitization via
+            ``sanitize.build_user_prompt`` (R22) before this function ever sees it;
+            ``dispatch`` itself performs no sanitization of its own.
         backend: An ``AgentBackend`` (injected).
         model: Resolved model tag.
         timeout: Per-delegation timeout.
@@ -597,8 +639,13 @@ def dispatch(
 
 
 def _make_backend(cfg: OllamaAgentsConfig) -> OllamaBackend:
-    """Construct the transactional backend (seam for tests)."""
-    return OllamaBackend(cfg)
+    """Construct the transactional backend (seam for tests).
+
+    Threads the layered ``max_output_bytes`` (R24c, Task 8) into the backend at
+    construction time, so the transactional path's anti-runaway output cap reflects the
+    resolved config instead of silently falling back to the module's own default.
+    """
+    return OllamaBackend(cfg, max_output_bytes=cfg.max_output_bytes)
 
 
 def _global_toml() -> str:
@@ -956,7 +1003,12 @@ def run_delegation(ns: argparse.Namespace) -> int:
     invariant -- stdout streams only when a single delegation is in flight -- always
     holds here.
     """
-    cfg = resolve_config(global_path=_global_toml(), repo_path=_repo_toml(), env=os.environ)
+    global_path, repo_path = _global_toml(), _repo_toml()
+    cfg = resolve_config(global_path=global_path, repo_path=repo_path, env=os.environ)
+    # NR3/NR9 pre-dispatch warnings, once config is resolved (startup_hardening.py).
+    for cfg_path in (repo_path, global_path):
+        warn_if_config_world_readable(cfg_path)
+    warn_if_remote_http_with_api_key(cfg.base_url, cfg.api_key)
 
     with managed_run_dir(ns.keep_runs, ns.timeout, output_dir=ns.output_dir) as output_dir:
         # StatusDisplay captures the REAL sys.stderr at construction (before the shim
@@ -976,32 +1028,76 @@ def run_delegation(ns: argparse.Namespace) -> int:
                 # with the stderr.log diagnostic.
                 preflight(cfg, capability=ns.capability, effective_model=model)
                 system_prompt = load_system_prompt(ns.capability)
-                prompt = _load_input(ns.input)
+                raw_input = _load_input(ns.input)
+                warn_if_oversize(raw_input, ns.warn_input_tokens)  # R24
+                prompt = build_user_prompt(raw_input)  # R22: sanitize + nonce-wrap
                 stats = TokenStats()
                 if display is not None:
                     display.update(ns.capability, "running")
-                result = dispatch(
-                    ns.capability,
-                    prompt,
-                    backend=_make_backend(cfg),
-                    model=model,
-                    timeout=ns.timeout,
-                    system_prompt=system_prompt,
-                    config=cfg,
-                    stats=stats,
-                    # R7c: this CLI drives exactly ONE delegation at a time (concurrency
-                    # is MS5) -- the single-in-flight case always gets the stdout sink.
-                    sink=stdout_sink,
-                )
+                # R22b sink strategy: a STREAMING capability writes RAW deltas to stdout
+                # live inside `dispatch` (stdout_sink), so we bracket that live stream with
+                # nonce BEGIN/END markers (`open_output_frame`) — the streamed output reaches
+                # Claude already framed as untrusted data, with NO second `wrap_output` print
+                # of the same content (which would both DUPLICATE the output on stdout and
+                # leave the streamed copy unframed, defeating R22b). A TRANSACTIONAL
+                # capability streams nothing to stdout, so its single buffered result is
+                # `wrap_output`'d once below. `is_streaming` mirrors `_run_once`'s OWN
+                # streaming choice (per-capability `[stream]` true AND not a schema
+                # capability — schema never streams).
+                is_streaming = _capability_streams_to_stdout(cfg, ns.capability)
+                frame_footer = ""
+                if is_streaming:
+                    frame_header, frame_footer = open_output_frame()
+                    sys.stdout.write(frame_header)
+                    sys.stdout.flush()
+                try:
+                    result = dispatch(
+                        ns.capability,
+                        prompt,
+                        backend=_make_backend(cfg),
+                        model=model,
+                        timeout=ns.timeout,
+                        system_prompt=system_prompt,
+                        config=cfg,
+                        stats=stats,
+                        # R7c: this CLI drives exactly ONE delegation at a time (concurrency
+                        # is MS5) -- the single-in-flight case always gets the stdout sink.
+                        # R22b: the streaming sink strips invisibles from each delta (parity
+                        # with wrap_output on the transactional path). No-op for a
+                        # transactional capability, whose backend never calls the sink.
+                        sink=_streaming_stdout_sink,
+                    )
+                finally:
+                    if is_streaming:
+                        # ALWAYS close the R22b nonce frame around the (possibly partial)
+                        # streamed deltas -- even if `dispatch` raised. An unterminated BEGIN
+                        # marker left on stdout would keep the untrusted-output frame open
+                        # around whatever the error handler prints next, breaking R22b's
+                        # framing integrity on the error path (the frame's whole point is
+                        # that Claude can trust the BEGIN..END bounds).
+                        #
+                        # Best-effort: if stdout itself is broken (e.g. BrokenPipeError)
+                        # WHILE a `dispatch` exception is already in flight, swallow this
+                        # write's OSError -- a `finally` that raised here would MASK the
+                        # original delegation exception the outer handlers below need to see
+                        # (and a broken stdout means no reader is left to care about the
+                        # closing marker anyway).
+                        try:
+                            sys.stdout.write(frame_footer + "\n")
+                            sys.stdout.flush()
+                        except OSError:
+                            pass
                 _write_artifacts(output_dir, ns.capability, prompt, result, stats, errbuf)
                 if display is not None:
                     display.update(ns.capability, "success", tok_per_s=result.tok_per_s)
-                # The reviewable output is the validated structured dict (`.parsed`)
-                # when present, else the raw text content -- both untrusted data for
-                # Claude to review, never auto-applied.
-                review = result.parsed if result.parsed is not None else result.content
-                rendered = review if isinstance(review, str) else json.dumps(review, indent=2)
-                print(rendered)  # Claude reviews stdout before applying via Edit/Write
+                if not is_streaming:
+                    # Transactional: the reviewable output is the validated structured dict
+                    # (`.parsed`) when present, else the raw text content -- buffered, so
+                    # nonce-wrap it once for Claude. Untrusted data, never auto-applied
+                    # (R8/R14).
+                    review = result.parsed if result.parsed is not None else result.content
+                    rendered = review if isinstance(review, str) else json.dumps(review, indent=2)
+                    print(wrap_output(rendered))  # Claude reviews stdout before applying
         except TimeoutError:
             # R20: a timed-out delegation gets its own distinguishable state (not the
             # generic "failed") -- the display update itself never raises (guarded
@@ -1046,12 +1142,17 @@ def main(argv: list[str] | None = None) -> int:
     ``KeyboardInterrupt``/``SystemExit`` are intentionally NOT caught here — they propagate
     unchanged so the R27 interrupt-cleanup path (landing in MS3) stays intact.
 
+    ``enable_utf8_console_io`` (R26) is called as the FIRST statement, before even the
+    ``--ollama-init`` short-circuit, so the console hardening applies regardless of
+    which code path runs.
+
     Args:
         argv: CLI args (defaults to ``sys.argv[1:]``).
 
     Returns:
         Process exit code (0 on success; non-zero on any caught domain/OS failure).
     """
+    enable_utf8_console_io()
     args = sys.argv[1:] if argv is None else argv
     # Detect the flag ONLY as the first token (the documented invocation
     # `run_ollama.py --ollama-init`), so input text that merely contains the

@@ -49,7 +49,7 @@ wheels = [
 
 [[package]]
 name = "claude-ollama-orchestrator"
-version = "0.0.5"
+version = "0.0.6"
 source = { virtual = "." }
 
 [package.optional-dependencies]

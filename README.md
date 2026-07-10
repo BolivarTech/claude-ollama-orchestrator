@@ -19,7 +19,7 @@ Edit/Write tools. The goal: **cut Anthropic token cost** and keep bulk generatio
 
 > [!IMPORTANT]
 > ### Project Status
-> **Early development (v0.0.5).** Built under the SBTDD workflow (Spec + Behavior +
+> **Early development (v0.0.6).** Built under the SBTDD workflow (Spec + Behavior +
 > Test-Driven Development). The authoritative description of *what* to build lives in
 > `sbtdd/`; the tree, tables, and commands below describe the **intended design**, and
 > production code lands milestone-by-milestone, test-first.
@@ -40,8 +40,15 @@ Edit/Write tools. The goal: **cut Anthropic token cost** and keep bulk generatio
 > backstop), a **per-model circuit breaker** (K consecutive backend failures open a model's
 > circuit without blocking others; a 429 is throttling, excluded, with `Retry-After` +
 > jittered backoff), per-delegation stderr capture via `contextvars`, and R7c sink routing
-> (stdout only at effective concurrency 1, else per-delegation files). Untrusted-I/O
-> hardening and the vision / transcribe / thinking capabilities are the remaining milestones.
+> (stdout only at effective concurrency 1, else per-delegation files); and **untrusted-I/O
+> hardening** — 4-layer anti-prompt-injection with a fresh 128-bit nonce, fail-closed, on
+> both the user input (R22) and the model output shown to Claude (R22b, including the live
+> stream), an oversize-input token estimate (CJK-conservative), a transactional + streaming
+> **output cap** that can only tighten the absolute DoS floor, a bounded magic-byte-checked
+> **binary input guard** (vision/transcribe), Windows console UTF-8 hardening, config
+> world-readable + plaintext-key warnings, and a layered/bool-rejecting `max_output_bytes`.
+> The vision / transcribe / thinking capabilities (and cross-process arbitration) are the
+> remaining milestone.
 
 ---
 
