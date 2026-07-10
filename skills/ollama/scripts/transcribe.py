@@ -149,16 +149,12 @@ def transcribe(
     if resolved_transport == "endpoint":
         return _via_audio_endpoint(config, endpoint, data, audio_path, model, urlopen, timeout)
     if resolved_transport == "chat":
-        return _via_audio_chat(
-            config, system_prompt, data, audio_path, model, timeout, stream_fn, sink
-        )
+        return _via_audio_chat(config, system_prompt, data, model, timeout, stream_fn, sink)
     # "auto" (default): probe first, then the audio-multimodal chat fallback, then the gate.
     if probe(endpoint):
         return _via_audio_endpoint(config, endpoint, data, audio_path, model, urlopen, timeout)
     if multimodal_audio(model):
-        return _via_audio_chat(
-            config, system_prompt, data, audio_path, model, timeout, stream_fn, sink
-        )
+        return _via_audio_chat(config, system_prompt, data, model, timeout, stream_fn, sink)
     raise OllamaBackendError(
         "transcribe experimental: the endpoint does not support audio "
         "(/audio/transcriptions absent and the model is not audio-multimodal); "
@@ -347,7 +343,6 @@ def _via_audio_chat(
     config: OllamaAgentsConfig,
     system_prompt: str,
     data: bytes,
-    audio_path: str,
     model: str,
     timeout: int,
     stream_fn: Callable[..., DelegationResult],
