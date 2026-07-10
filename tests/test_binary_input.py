@@ -5,6 +5,8 @@
 allow-list (incl. RIFF form-type disambiguation and the MP3 ID3/frame-sync-mask
 variants), base64 data-uri, domain errors."""
 
+from typing import Literal
+
 import pytest
 
 from binary_input import MAX_INPUT_BYTES, load_binary, to_data_uri
@@ -42,6 +44,7 @@ def test_oversize_raises_validation_error_checked_on_bytes_actually_read(tmp_pat
     # os.path.getsize — this test caps the budget below the real file size and
     # confirms rejection, with no pre-read stat call in the path to race against.
     import binary_input
+
     monkeypatch.setattr(binary_input, "MAX_INPUT_BYTES", 4)
     p = tmp_path / "img.png"
     p.write_bytes(_PNG)
@@ -57,6 +60,7 @@ def test_oversize_read_is_bounded_and_never_reads_the_whole_file(tmp_path, monke
     # bounded (never an unbounded `.read()`/`.read(-1)`), not just that the result is
     # eventually rejected.
     import binary_input
+
     monkeypatch.setattr(binary_input, "MAX_INPUT_BYTES", 4)
     read_sizes: list[int] = []
 
@@ -72,15 +76,16 @@ def test_oversize_read_is_bounded_and_never_reads_the_whole_file(tmp_path, monke
         def __enter__(self) -> "_FakeFile":
             return self
 
-        def __exit__(self, *exc: object) -> bool:
+        def __exit__(self, *exc: object) -> Literal[False]:
             return False
 
-    oversized = _PNG + b"\x00" * 1000   # far larger than the 4-byte cap in effect
-    monkeypatch.setattr(binary_input, "open",
-                        lambda path, mode: _FakeFile(oversized), raising=False)
+    oversized = _PNG + b"\x00" * 1000  # far larger than the 4-byte cap in effect
+    monkeypatch.setattr(
+        binary_input, "open", lambda path, mode: _FakeFile(oversized), raising=False
+    )
     with pytest.raises(ValidationError):
         load_binary("fake-path.png", kind="image")
-    assert read_sizes == [5]   # MAX_INPUT_BYTES + 1 == 5, and read() called exactly once
+    assert read_sizes == [5]  # MAX_INPUT_BYTES + 1 == 5, and read() called exactly once
 
 
 def test_missing_file_raises_validation_error_not_oserror():
