@@ -338,3 +338,37 @@ def test_release_slot_is_idempotent(tmp_path):
     acquire_slot(slots, 1, 60)
     release_slot(slots, 0)
     release_slot(slots, 0)  # no raise
+
+
+def test_acquire_slot_never_exceeds_max_parallel_under_real_thread_contention(tmp_path):
+    # CRITICAL (R21c) under GENUINE thread concurrency: N real threads racing to acquire_slot
+    # against the SAME slots dir must never hold more than max_parallel DISTINCT live slots --
+    # the O_EXCL create + TOCTOU-safe reclaim guarantees at most one winner per index. (The
+    # sequential "two processes" test monkeypatches the liveness probe; this exercises the
+    # real primitive under real contention, mirroring run_batch's asyncio.to_thread fan-out.)
+    import threading
+
+    slots_dir = str(tmp_path / SLOTS_DIRNAME)
+    max_parallel = 4
+    n_threads = 16
+    barrier = threading.Barrier(n_threads)
+    acquired: list[int] = []
+    lock = threading.Lock()
+
+    def _worker() -> None:
+        barrier.wait()  # release all threads at once to maximize contention
+        idx = acquire_slot(slots_dir, max_parallel, timeout=30)
+        if idx is not None:
+            with lock:
+                acquired.append(idx)
+
+    threads = [threading.Thread(target=_worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    # None released -> exactly max_parallel win, each a DISTINCT index (never two on one slot);
+    # the other 12 threads get None (fail-closed), never a duplicate acquisition.
+    assert len(acquired) == max_parallel
+    assert len(set(acquired)) == max_parallel  # all distinct -- no double-acquire of an index
+    assert all(0 <= i < max_parallel for i in acquired)
