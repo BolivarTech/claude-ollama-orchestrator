@@ -10,10 +10,13 @@ from datetime import datetime, timedelta, timezone
 
 import run_lock
 from run_lock import (
+    SLOTS_DIRNAME,
     STDOUT_TOKEN_FILENAME,
+    acquire_slot,
     acquire_token,
     is_dir_live,
     is_pid_alive,
+    release_slot,
     release_token,
     remove_lock,
     staleness_bound_ephemeral,
@@ -273,3 +276,65 @@ def test_acquire_token_degrades_to_false_on_transient_open_oserror(tmp_path, mon
 
     monkeypatch.setattr(run_lock.os, "open", _boom_open)
     assert acquire_token(tok, timeout=60) is False
+
+
+# --- Cross-process concurrency slot-counter (R21c, MS7 Task 3) ---
+
+
+def test_acquire_slot_returns_first_free_index_then_none_when_full(tmp_path):
+    slots = str(tmp_path / SLOTS_DIRNAME)
+    assert acquire_slot(slots, max_parallel=3, timeout=60) == 0
+    assert acquire_slot(slots, max_parallel=3, timeout=60) == 1
+    assert acquire_slot(slots, max_parallel=3, timeout=60) == 2
+    assert acquire_slot(slots, max_parallel=3, timeout=60) is None  # full → queue/reject
+
+
+def test_two_processes_never_exceed_max_parallel_live_slots(tmp_path):
+    slots = str(tmp_path / SLOTS_DIRNAME)
+    held = [acquire_slot(slots, 2, 60) for _ in range(2)]  # two "processes"
+    assert sorted(held) == [0, 1]
+    assert acquire_slot(slots, 2, 60) is None  # a 3rd is refused
+    live = [f for f in os.listdir(slots) if f.startswith("slot-")]
+    assert len(live) == 2  # never > max_parallel
+
+
+def test_release_slot_frees_it_for_reuse(tmp_path):
+    slots = str(tmp_path / SLOTS_DIRNAME)
+    i = acquire_slot(slots, 2, 60)
+    acquire_slot(slots, 2, 60)
+    assert acquire_slot(slots, 2, 60) is None  # full
+    release_slot(slots, i)
+    assert acquire_slot(slots, 2, 60) == i  # freed slot reusable
+
+
+def test_dead_slot_is_reclaimed_not_skipped(tmp_path, monkeypatch):
+    slots = str(tmp_path / SLOTS_DIRNAME)
+    os.makedirs(slots)
+    _write_ephemeral(os.path.join(slots, "slot-0.lock"), pid=999_999, bound=120)
+    monkeypatch.setattr(run_lock, "is_pid_alive", lambda pid: pid == os.getpid())
+    assert acquire_slot(slots, 2, 60) == 0  # dead slot-0 reclaimed
+    assert int(open(os.path.join(slots, "slot-0.lock")).readline()) == os.getpid()
+
+
+def test_orphaned_dead_slot_file_outside_probe_range_is_cleaned_up_on_acquire(
+    tmp_path, monkeypatch
+):
+    """Hygiene regression: a slot file left behind by a PREVIOUS, larger
+    `max_parallel_agents` (e.g. `slot-5.lock`) sits OUTSIDE the current probe range
+    (`0..max_parallel-1`) and would otherwise never be touched again — it must still be
+    swept and removed once its holder is reclaimable, not accumulate forever under
+    `.ollama-slots/`."""
+    slots = str(tmp_path / SLOTS_DIRNAME)
+    os.makedirs(slots)
+    orphan = os.path.join(slots, "slot-5.lock")
+    _write_ephemeral(orphan, pid=999_999, bound=60)  # dead PID, index outside range(0, 2)
+    monkeypatch.setattr(run_lock, "is_pid_alive", lambda pid: pid == os.getpid())
+    acquire_slot(slots, max_parallel=2, timeout=60)  # probes only slot-0/slot-1
+    assert not os.path.exists(orphan)  # swept anyway, not left behind
+
+
+def test_release_slot_is_idempotent(tmp_path):
+    slots = str(tmp_path / SLOTS_DIRNAME)
+    acquire_slot(slots, 1, 60)
+    release_slot(slots, 0)
+    release_slot(slots, 0)  # no raise

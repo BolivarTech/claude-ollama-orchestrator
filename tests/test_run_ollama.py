@@ -1546,6 +1546,7 @@ def test_make_file_sink_closes_handle_on_construction_failure(monkeypatch, tmp_p
 # --- Task 5: run_batch — scheduler + breaker + per-delegation stderr + sink routing ---
 
 import asyncio  # noqa: E402 — appended section, mirrors the plan's own layout
+from run_lock import SLOTS_DIRNAME  # noqa: E402 — same appended-section layout
 
 
 def test_run_batch_fanout_bounds_concurrency_and_files_per_delegation(tmp_path):
@@ -3196,3 +3197,106 @@ def test_streaming_goes_file_only_when_stdout_token_is_held(capsys, monkeypatch,
     assert "BEGIN UNTRUSTED MODEL OUTPUT" not in out  # no stdout frame when file-only
     log = (out_dir / "coder.stream.log").read_text(encoding="utf-8")
     assert "STREAMED-CONTENT" in log  # the stream landed in the per-agent file instead
+
+
+# --- MS7 Task 3: cross-process slot-counter (R21c) — `_run_one_delegation_slotted` +
+# `run_batch` wiring. Real `_Job` instances (not a bare `object()`) are used throughout:
+# `_reject_if_circuit_open` reads `job.model` even on a rejection fast-path, and an
+# isolated `CircuitBreaker()` is always passed explicitly so these tests never share
+# failure-count state with the process-wide `_PROCESS_CIRCUIT_BREAKER` singleton other
+# tests in this module mutate. ---
+
+
+def test_slotted_delegation_holds_exactly_one_slot_while_running_then_releases(
+    tmp_path, monkeypatch
+):
+    slots = str(tmp_path / SLOTS_DIRNAME)
+    ran = {"n": 0}
+
+    def _fake_worker(job, config, sink, stats=None):
+        assert len([f for f in os.listdir(slots) if f.startswith("slot-")]) == 1  # one held
+        ran["n"] += 1
+        return "ok"
+
+    monkeypatch.setattr(run_ollama, "_run_one_delegation", _fake_worker)
+    cfg = run_ollama._cfg_for_batch(max_parallel_agents=2, max_queued_agents=0)
+    job = run_ollama._Job(cap="coder", model="m", prompt="p")
+    res = run_ollama._run_one_delegation_slotted(job, cfg, None, slots_dir=slots, timeout=60)
+    assert res == "ok" and ran["n"] == 1
+    assert [f for f in os.listdir(slots) if f.startswith("slot-")] == []  # released
+
+
+def test_slotted_delegation_rejects_when_no_cross_process_slot_is_free(tmp_path):
+    from errors import DelegationError
+    from run_lock import acquire_slot
+
+    slots = str(tmp_path / SLOTS_DIRNAME)
+    acquire_slot(slots, 1, 60)  # another process took it
+    cfg = run_ollama._cfg_for_batch(max_parallel_agents=1, max_queued_agents=0)
+    job = run_ollama._Job(cap="coder", model="m", prompt="p")
+    with pytest.raises(DelegationError):
+        run_ollama._run_one_delegation_slotted(job, cfg, None, slots_dir=slots, timeout=60)
+
+
+def test_run_batch_serial_max_parallel_one_still_routes_through_the_slotted_wrapper(
+    tmp_path, monkeypatch
+):
+    """Regression for the reconciliation fix: the serial fast path
+    (`max_parallel_agents == 1`) must ALSO go through `_run_one_delegation_slotted` — it
+    may skip the Scheduler/stderr-proxy/indexed-sinks overhead, but never the slot, or the
+    global cap silently stops holding the moment `max_parallel_agents` is 1."""
+    from circuit_breaker import CircuitBreaker
+
+    calls = {"slotted": 0, "unslotted": 0}
+
+    def _fake_slotted(job, config, sink, *, slots_dir, timeout, stats=None):
+        calls["slotted"] += 1
+        return "ok"
+
+    def _fake_unslotted(job, config, sink, *, stats=None):
+        calls["unslotted"] += 1
+        return "ok"
+
+    monkeypatch.setattr(run_ollama, "_run_one_delegation_slotted", _fake_slotted)
+    monkeypatch.setattr(run_ollama, "_run_one_delegation", _fake_unslotted)
+    cfg = run_ollama._cfg_for_batch(max_parallel_agents=1, max_queued_agents=0)
+    job = run_ollama._Job(cap="coder", model="m", prompt="p")
+    asyncio.run(
+        run_ollama.run_batch(
+            [job],
+            config=cfg,
+            output_dir=str(tmp_path / "run"),
+            managed=True,
+            breaker=CircuitBreaker(),
+        )
+    )
+    assert calls == {"slotted": 1, "unslotted": 0}  # serial path now acquires a slot too
+
+
+def test_run_batch_serial_two_overlapping_processes_cannot_both_hold_the_global_slot(
+    tmp_path,
+):
+    """Simulate a second overlapping process that already holds the sole global slot
+    (`max_parallel_agents = 1`, so there is exactly one slot, `slot-0.lock`): this
+    process's serial delegation must be REJECTED, not silently allowed to run a second
+    concurrent Ollama agent against the endpoint."""
+    from circuit_breaker import CircuitBreaker
+    from errors import DelegationError
+    from run_lock import acquire_slot
+
+    output_dir = str(tmp_path / "run")
+    os.makedirs(output_dir, exist_ok=True)
+    slots_dir = os.path.join(os.path.dirname(os.path.realpath(output_dir)), SLOTS_DIRNAME)
+    acquire_slot(slots_dir, max_parallel=1, timeout=60)  # "process A" holds the only slot
+    cfg = run_ollama._cfg_for_batch(max_parallel_agents=1, max_queued_agents=0)
+    job = run_ollama._Job(cap="coder", model="m", prompt="p")
+    with pytest.raises(DelegationError):
+        asyncio.run(
+            run_ollama.run_batch(
+                [job],
+                config=cfg,
+                output_dir=output_dir,
+                managed=True,
+                breaker=CircuitBreaker(),
+            )
+        )
