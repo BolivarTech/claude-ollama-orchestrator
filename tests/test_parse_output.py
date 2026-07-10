@@ -9,7 +9,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from parse_output import parse_agent_output
+from parse_output import parse_agent_output, strip_think
 
 _KEYS = ("agent", "verdict")
 
@@ -90,3 +90,20 @@ def test_parse_never_crashes_only_raises_jsondecodeerror(s):
         parse_agent_output(s, _KEYS)
     except json.JSONDecodeError:
         pass  # the only allowed failure mode
+
+
+# --- Task 6: thinking capability — <think> conclusion recovery (BDD-21) ---
+
+
+def test_strip_think_yields_the_conclusion():
+    raw = "<think>weighing the trade-offs, a heap vs a sorted list...</think>\nUse a heap."
+    assert strip_think(raw) == "Use a heap."
+
+
+def test_strip_think_handles_multiple_blocks_and_is_case_insensitive():
+    raw = "<THINK>a</THINK>keep1<think>b</think>keep2"
+    assert strip_think(raw) == "keep1keep2"
+
+
+def test_strip_think_without_a_block_is_identity():
+    assert strip_think("just an answer") == "just an answer"

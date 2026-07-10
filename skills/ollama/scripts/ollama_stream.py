@@ -72,6 +72,7 @@ def stream_run(
     sleep: Callable[[float], None] = time.sleep,
     rng: Callable[[], float] = random.random,
     max_backoffs: int = 3,
+    content_parts: list[dict[str, Any]] | None = None,
 ) -> DelegationResult:
     """Stream one delegation, emit each delta to *sink*, return the DelegationResult.
 
@@ -98,6 +99,10 @@ def stream_run(
         sleep: Injectable sleep (429 backoff).
         rng: Injectable RNG (jitter).
         max_backoffs: Max 429 backoffs before failing.
+        content_parts: Optional multimodal content-parts array (MS7 vision
+            ``image_url`` transport), forwarded verbatim to ``build_chat_request``.
+            ``None`` (the default) produces the same plain-string user message as
+            before this parameter existed.
 
     Returns:
         The accumulated :class:`DelegationResult` (``parsed`` is None; structured
@@ -133,6 +138,7 @@ def stream_run(
                 deadline,
                 redact,
                 start,
+                content_parts,
             )
         except ResponseFormatRejected:
             rf = None  # R11 downgrade: retry once without response_format
@@ -155,6 +161,7 @@ def _stream_once(
     deadline: float,
     redact: Callable[[str], str],
     start: float,
+    content_parts: list[dict[str, Any]] | None = None,
 ) -> DelegationResult:
     """One stream attempt with 429 backoff (bounded by *deadline*).
 
@@ -173,7 +180,15 @@ def _stream_once(
     (unreachable) and is intentionally omitted; the exhaustion case is exercised by
     `test_stream_429_exhausts_backoffs_then_raises_backend_error`.
     """
-    req = build_chat_request(config, system_prompt, prompt, model, response_format, stream=True)
+    req = build_chat_request(
+        config,
+        system_prompt,
+        prompt,
+        model,
+        response_format,
+        stream=True,
+        content_parts=content_parts,
+    )
     resp: Any = None
     for attempt in range(max_backoffs + 1):
         # Socket timeout = the smaller of the idle timeout (per-read stall detection) and

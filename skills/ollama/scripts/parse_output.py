@@ -15,6 +15,8 @@ MAX_BRACE_PROBES = 2000
 # space. re.MULTILINE anchors ^/$ to EVERY line, so an opening ```json fence that is NOT at
 # char 0 (e.g. after a leading prose line) is still stripped, not just one at string start.
 _FENCE = re.compile(r"^[ \t]*```[a-zA-Z0-9]*[ \t]*$", re.MULTILINE)
+# DOTALL so a <think> block spans multiple lines; IGNORECASE for <THINK>/<Think> variants.
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 
 def _strip_fences(text: str) -> str:
@@ -40,6 +42,24 @@ def _qualifies(obj: object, keys: tuple[str, ...]) -> bool:
         True only if *obj* is a ``dict`` and contains all of *keys*.
     """
     return isinstance(obj, dict) and all(k in obj for k in keys)
+
+
+def strip_think(text: str) -> str:
+    """Remove ``<think>...</think>`` reasoning blocks, returning the useful conclusion.
+
+    Reasoning models (e.g. ``deepseek-v4-pro``) emit chain-of-thought wrapped in
+    ``<think>...</think>`` before the final answer. For free-text capabilities (notably
+    ``thinking``) that ANSWER — not the scratchpad — is what Claude reviews. Matched
+    blocks are removed non-greedily (DOTALL so a block can span lines,
+    case-insensitive). Total: never raises; text without a block is returned stripped.
+
+    Args:
+        text: The raw model output.
+
+    Returns:
+        *text* with matched think blocks removed and surrounding whitespace stripped.
+    """
+    return _THINK_BLOCK.sub("", text).strip()
 
 
 def parse_agent_output(raw: str, discriminator_keys: tuple[str, ...]) -> dict[str, Any]:

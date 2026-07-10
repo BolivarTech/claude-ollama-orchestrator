@@ -26,6 +26,13 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                         "severity": {"enum": _SEVERITY},
                         "title": {"type": "string"},
                         "detail": {"type": "string"},
+                        # Optional location claim (MS7 Task 7, R30): NOT in "required" —
+                        # every existing finding shape (no location claim) still validates
+                        # unchanged. Present so a model MAY claim a file:line for
+                        # diff_guard.validate_findings to ground against.
+                        "file": {"type": "string"},
+                        # 1-based source line; lockstep with validate.py's ``line >= 1``.
+                        "line": {"type": "integer", "minimum": 1},
                     },
                 },
             },

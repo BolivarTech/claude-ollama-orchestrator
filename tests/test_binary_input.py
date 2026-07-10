@@ -20,6 +20,21 @@ def _riff(form_type: bytes) -> bytes:
     return b"RIFF" + b"\x00\x00\x00\x00" + form_type + b"\x00" * 8
 
 
+def test_audio_mime_from_bytes_uses_magic_bytes_not_extension():
+    """Audio MIME is derived from the file's MAGIC BYTES (mirroring image detection), so a
+    mislabeled extension can never yield a wrong Content-Type on the transcribe upload. The
+    recognized signatures mirror load_binary's audio allow-list; anything else falls back to
+    the defensive default (unreachable after the magic-byte gate)."""
+    from binary_input import audio_mime_from_bytes
+
+    assert audio_mime_from_bytes(b"fLaC" + b"\x00" * 8) == "audio/flac"
+    assert audio_mime_from_bytes(b"OggS" + b"\x00" * 8) == "audio/ogg"
+    assert audio_mime_from_bytes(b"ID3" + b"\x00" * 8) == "audio/mpeg"
+    assert audio_mime_from_bytes(b"\xff\xfb" + b"\x00" * 8) == "audio/mpeg"  # raw MP3 frame sync
+    assert audio_mime_from_bytes(_riff(b"WAVE")) == "audio/wav"
+    assert audio_mime_from_bytes(b"\x00\x00\x00\x00" + b"\x00" * 8) == "audio/wav"  # default
+
+
 def test_valid_png_loads(tmp_path):
     p = tmp_path / "img.png"
     p.write_bytes(_PNG)

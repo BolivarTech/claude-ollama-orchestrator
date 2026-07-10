@@ -70,6 +70,43 @@ def _matches_kind(data: bytes, kind: str) -> bool:
     return False
 
 
+# Prefix -> MIME for the audio signatures load_binary admits (MP3-via-frame-sync and WAV are
+# handled below since they are a mask check / a RIFF form-type, not a plain prefix).
+_AUDIO_MIME_BY_PREFIX: tuple[tuple[bytes, str], ...] = (
+    (b"fLaC", "audio/flac"),
+    (b"OggS", "audio/ogg"),
+    (b"ID3", "audio/mpeg"),
+)
+_DEFAULT_AUDIO_MIME = "audio/wav"
+
+
+def audio_mime_from_bytes(data: bytes) -> str:
+    """Return the audio ``Content-Type`` from *data*'s MAGIC BYTES, never a filename extension.
+
+    Mirrors the image side's magic-byte MIME detection so a mislabeled extension (a FLAC named
+    ``.mp3``) can never smuggle a wrong ``Content-Type`` past the transcribe upload to a server
+    that trusts the declared type over sniffing. Recognizes the SAME signatures
+    :func:`load_binary` admits for ``kind="audio"`` -- FLAC (``fLaC``), OGG (``OggS``), MP3
+    (an ``ID3`` tag or a raw MPEG frame-sync), and WAV (``RIFF``/``WAVE``). Anything else falls
+    back to :data:`_DEFAULT_AUDIO_MIME` (unreachable after ``load_binary``'s magic-byte gate,
+    kept defensive/total).
+
+    Args:
+        data: The raw audio bytes (already validated by ``load_binary``).
+
+    Returns:
+        The magic-byte-derived MIME string (e.g. ``"audio/flac"``).
+    """
+    for sig, mime in _AUDIO_MIME_BY_PREFIX:
+        if data.startswith(sig):
+            return mime
+    if _is_mp3_frame_sync(data):
+        return "audio/mpeg"
+    if data.startswith(b"RIFF") and len(data) >= _RIFF_HEADER_LEN and data[8:12] == b"WAVE":
+        return "audio/wav"
+    return _DEFAULT_AUDIO_MIME
+
+
 def load_binary(path: str, *, kind: str) -> bytes:
     """Read *path*, enforcing the size cap and a magic-byte allow-list for *kind*.
 

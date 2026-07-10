@@ -6,6 +6,7 @@
 
 import dataclasses
 import io
+import json
 import socket
 import urllib.error
 
@@ -553,3 +554,30 @@ def test_stream_http_error_body_is_closed_no_fd_leak():
     with pytest.raises(OllamaBackendError):
         stream_run(_cfg(), "s", "p", "m", 60, sink=lambda _s: None, urlopen=_urlopen)
     assert fp.closed  # the error body was closed after being mapped
+
+
+def test_stream_run_threads_content_parts_into_the_request():
+    """MS7 seam consumption: stream_run must forward `content_parts` to
+    build_chat_request so a STREAMED multimodal (vision) request carries the image_url
+    part. Omitting it keeps the plain-string user content (MS4-MS6 behavior)."""
+    seen = {}
+    parts = [
+        {"type": "text", "text": "describe"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    ]
+
+    def _open(req, timeout=None):
+        seen["content"] = json.loads(req.data)["messages"][1]["content"]
+        return io.BytesIO(b'data: {"choices":[{"delta":{"content":"ok"}}]}\ndata: [DONE]\n')
+
+    stream_run(
+        _cfg(),
+        "sys",
+        "describe",
+        "m",
+        60,
+        sink=lambda _s: None,
+        urlopen=_open,
+        content_parts=parts,
+    )
+    assert seen["content"] == parts  # multimodal parts array sent verbatim

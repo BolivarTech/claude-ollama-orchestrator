@@ -12,7 +12,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
-from errors import OllamaConfigError
+from errors import OllamaConfigError, ValidationError
 
 DEFAULT_BASE_URL = "http://localhost:11434/v1"
 # Default semaphore size for concurrent delegations (R21) -- default plan tier is Ollama
@@ -28,6 +28,10 @@ DEFAULT_MAX_QUEUED_AGENTS = 32
 # 4) exactly, enforced by a three-way equality test (Task 8), so the layered default never
 # drifts from the two consumers' own module defaults.
 DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
+# MS7 Task 8: operator kill-switch default -- cross-process FS locking (R7d/R21c) is
+# fully enforced unless explicitly disabled (per-project/per-env, like every other
+# layered key).
+DEFAULT_DISABLE_FS_LOCKS = False
 
 
 def normalize_base_url(raw: str) -> str:
@@ -116,6 +120,11 @@ DEFAULT_STREAM: Mapping[str, bool] = MappingProxyType(
     {c: (c not in ("reviewer", "tester")) for c in CAPABILITIES}
 )
 _STRUCTURED_VALUES = frozenset({"schema", "object", "off"})
+# R2 transcribe: the transport to use for the experimental/gated `transcribe` capability
+# (see `transcribe.py`). "auto" probes the endpoint then falls back to audio-multimodal
+# chat then a gated error; "endpoint"/"chat" force that transport and skip the probe.
+_VALID_TRANSCRIBE_TRANSPORTS = frozenset({"auto", "endpoint", "chat"})
+_DEFAULT_TRANSCRIBE_TRANSPORT = "auto"
 
 
 @dataclass(frozen=True)
@@ -134,6 +143,19 @@ class OllamaAgentsConfig:
     # (which predate this field and pass only the original seven fields) keeps compiling
     # unchanged, per standard dataclass trailing-default-field rules.
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
+    # R2 transcribe: another trailing field WITH a default, for the same reason -- every
+    # pre-existing OllamaAgentsConfig(...) construction site predating this field keeps
+    # compiling unchanged.
+    transcribe_transport: str = _DEFAULT_TRANSCRIBE_TRANSPORT
+    disable_fs_locks: bool = False
+    """Operator kill-switch (R7d/R21c escape hatch, MS7 Task 8): when True, the
+    cross-process `.ollama-slots/`/`.ollama-stdout.lock` coordination (Task 2/3) is
+    bypassed entirely -- no lock files are ever created -- and the runtime falls back
+    to the in-process `Scheduler` semaphore + the documented single-orchestrator
+    invariant (exactly the v0.1 default, pre-R7d/R21c). Use when the per-project temp
+    namespace sits on a filesystem that cannot be trusted to honor atomic
+    `O_CREAT|O_EXCL` (e.g. certain NFS/SMB configurations) or under persistent
+    Windows AV/indexer interference on lock files."""
 
 
 def _load_toml(path: str | None) -> dict[str, Any]:
@@ -265,13 +287,17 @@ def _coerce_bool(value: Any, ctx: str) -> bool:
     """Coerce a config value to bool WITHOUT the ``bool('false') is True`` trap.
 
     A native TOML bool passes through; a string is parsed case-insensitively
-    (``true``/``1`` -> True, ``false``/``0`` -> False), consistent with the env path;
-    anything else is a config error. Never use bare ``bool(str)`` -- ``bool("false")``
-    is ``True``, which would silently invert a ``stream.<cap> = "false"`` setting.
+    (``true``/``1``/``yes`` -> True, ``false``/``0``/``no`` -> False -- the
+    ``yes``/``no`` tokens added in MS7 Task 8 for ``disable_fs_locks``'s env override,
+    backward-compatible with every existing ``stream.<cap>`` value); anything else is
+    a config error. Never use bare ``bool(str)`` -- ``bool("false")`` is ``True``,
+    which would silently invert a ``stream.<cap> = "false"`` / ``disable_fs_locks =
+    "false"`` setting.
 
     Args:
         value: The resolved config value (native bool or string).
-        ctx: Key name for the error message (e.g. ``"stream.reviewer"``).
+        ctx: Key name for the error message (e.g. ``"stream.reviewer"``,
+            ``"disable_fs_locks"``).
 
     Returns:
         The coerced boolean.
@@ -283,11 +309,80 @@ def _coerce_bool(value: Any, ctx: str) -> bool:
         return value
     if isinstance(value, str):
         low = value.strip().lower()
-        if low in ("true", "1"):
+        if low in ("true", "1", "yes"):
             return True
-        if low in ("false", "0"):
+        if low in ("false", "0", "no"):
             return False
     raise OllamaConfigError(f"{ctx} must be a boolean (true/false), got {value!r}")
+
+
+def _resolve_bool(
+    env: Mapping[str, str],
+    env_key: str,
+    repo: dict[str, Any],
+    glob: dict[str, Any],
+    toml_key: str,
+    default: bool,
+) -> bool:
+    """Resolve a single, non-per-capability boolean key: env > repo > global > default.
+
+    Mirrors ``_resolve_int``'s exact precedence shape and presence-semantics (an
+    empty-string override at any layer is treated as ABSENT, falling through to the
+    next layer) but coerces through ``_coerce_bool`` instead of ``int(...)``, so a
+    native TOML ``true``/``false`` and every string token ``_coerce_bool`` accepts
+    both resolve, and anything else raises the same actionable ``OllamaConfigError``
+    every other malformed key raises here -- never a silent fallback to *default*.
+
+    Args:
+        env: Environment mapping (injected for tests).
+        env_key: The env var name (e.g. ``"OLLAMA_AGENTS_DISABLE_FS_LOCKS"``).
+        repo: Parsed repo TOML.
+        glob: Parsed global TOML.
+        toml_key: The TOML key name, also used as ``_coerce_bool``'s error context.
+        default: Returned when absent at every layer.
+
+    Returns:
+        The resolved boolean.
+
+    Raises:
+        OllamaConfigError: if a present value at any layer is not a recognized
+            boolean token/type.
+    """
+    for src in (env.get(env_key), repo.get(toml_key), glob.get(toml_key)):
+        if src is None or src == "":
+            continue
+        return _coerce_bool(src, toml_key)
+    return default
+
+
+def _resolve_transcribe_transport(
+    env: Mapping[str, str], repo: dict[str, Any], global_: dict[str, Any]
+) -> str:
+    """Resolve ``transcribe_transport`` (R2 transcribe): env > repo > global > default.
+
+    Args:
+        env: The environment mapping (``OLLAMA_AGENTS_TRANSCRIBE_TRANSPORT``).
+        repo: The parsed repo TOML (top-level ``transcribe_transport`` key).
+        global_: The parsed global TOML (same key).
+
+    Returns:
+        One of ``"auto"``, ``"endpoint"``, ``"chat"``.
+
+    Raises:
+        ValidationError: the resolved value is not one of the three valid strings.
+    """
+    value = (
+        env.get("OLLAMA_AGENTS_TRANSCRIBE_TRANSPORT")
+        or repo.get("transcribe_transport")
+        or global_.get("transcribe_transport")
+        or _DEFAULT_TRANSCRIBE_TRANSPORT
+    )
+    if value not in _VALID_TRANSCRIBE_TRANSPORTS:
+        raise ValidationError(
+            f"invalid transcribe_transport: {value!r} "
+            f"(must be one of {sorted(_VALID_TRANSCRIBE_TRANSPORTS)})"
+        )
+    return str(value)
 
 
 def resolve_config(
@@ -437,5 +532,14 @@ def resolve_config(
             "max_output_bytes",
             DEFAULT_MAX_OUTPUT_BYTES,
             1,
+        ),
+        transcribe_transport=_resolve_transcribe_transport(env, repo, glob),
+        disable_fs_locks=_resolve_bool(
+            env,
+            "OLLAMA_AGENTS_DISABLE_FS_LOCKS",
+            repo,
+            glob,
+            "disable_fs_locks",
+            DEFAULT_DISABLE_FS_LOCKS,
         ),
     )

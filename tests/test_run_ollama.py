@@ -250,24 +250,26 @@ def test_dispatch_object_mode_sends_generic_json_envelope():
     assert be.calls[0]["response_format"] == {"type": "json_object"}
 
 
-def test_dispatch_rejects_vision_transcribe_in_ms1():
-    # MS1 has no multimodal/binary transport (lands in M7). Dispatching vision/transcribe
-    # must fail actionably with DelegationError, not send a binary as garbled chat text.
-    from errors import DelegationError
-
+def test_dispatch_treats_transcribe_as_an_ordinary_text_capability_after_ms7_task5():
+    # M7 Task 5 empties `_MS1_UNSUPPORTED_CAPS` (transcribe now has a real, gated audio
+    # transport: `transcribe.transcribe`). `dispatch` itself is a TEXT-only pipeline —
+    # it does not route "transcribe" to that new module (the module is invoked
+    # directly by a caller that has a binary audio path, not through this text-prompt
+    # `dispatch`) — so the MS1-era guard is gone and the capability now behaves like any
+    # other free-text capability (`structured.transcribe` defaults to "off"). `vision`
+    # gained its real image_url transport in M7 Task 4 and is no longer guarded either.
     be = _FakeBackend(["unused"])
-    for cap in ("vision", "transcribe"):
-        with pytest.raises(DelegationError):
-            run_ollama.dispatch(
-                cap,
-                "img-or-audio",
-                backend=be,
-                model="m",
-                timeout=10,
-                system_prompt="sys",
-                config=_CFG,
-            )
-    assert be.calls == []  # backend never invoked
+    out = run_ollama.dispatch(
+        "transcribe",
+        "audio",
+        backend=be,
+        model="m",
+        timeout=10,
+        system_prompt="sys",
+        config=_CFG,
+    )
+    assert out.content == "unused"
+    assert len(be.calls) == 1  # backend IS invoked now — no more MS1 guard
 
 
 def test_dispatch_structured_schema_without_a_schema_fails_loud():
@@ -695,26 +697,66 @@ def test_output_dir_writes_raw_artifact(tmp_path, monkeypatch):
     assert raw["content"] == "hi there"
 
 
-def test_main_rejects_vision_as_actionable_nonzero_not_a_traceback(monkeypatch, capsys):
-    # `dispatch` raises DelegationError for the MS1 vision/transcribe transport guard
-    # (multimodal lands in M7). `main` must catch it — never an uncaught traceback — and
-    # the backend must NEVER be invoked (the guard fires before any backend.run call).
-    class _BackendMustNotBeCalled:
-        def run(self, *args, **kwargs):
-            raise AssertionError(
-                "backend.run must not be invoked for an MS1-unsupported capability"
-            )
+def test_main_routes_transcribe_to_the_audio_transport_with_the_input_path(
+    monkeypatch, capsys, tmp_path
+):
+    # MS7 CLI wiring: `/ollama transcribe <audio>` routes the `<input>` positional (an AUDIO
+    # PATH, not text) to the gated `transcribe.transcribe` transport -- NOT the text
+    # stream/dispatch path (which would wrongly stream it as text via stream_run) -- and
+    # presents the transcript nonce-wrapped (R22b) for Claude. `_make_backend` is never
+    # even constructed on this path (the transcribe branch returns first).
+    from backend import DelegationResult
 
-    cfg = _cfg_with_structured()
+    seen: dict[str, object] = {}
+
+    def _fake_transcribe(config, audio_path, model, timeout, **kw):
+        seen["audio_path"] = audio_path
+        seen["model"] = model
+        return DelegationResult("a transcript", 1, 1, True, 0.1)
+
+    cfg = _cfg_with_structured()  # transcribe defaults [stream]=True -- irrelevant, own transport
     monkeypatch.setattr(run_ollama, "resolve_config", lambda **kw: cfg)
-    # **kw absorbs preflight's capability=/effective_model= kwargs (R10/R28 fix) — the
-    # stub only needs to no-op regardless of what run_delegation now threads through.
     monkeypatch.setattr(run_ollama, "preflight", lambda cfg, **kw: None)
     monkeypatch.setattr(run_ollama, "load_system_prompt", lambda cap: "sys")
-    monkeypatch.setattr(run_ollama, "_make_backend", lambda cfg: _BackendMustNotBeCalled())
-    rc = run_ollama.main(["vision", "img.png", "--no-status"])
-    assert rc != 0
-    assert "delegation failed" in capsys.readouterr().err.lower()
+    monkeypatch.setattr(run_ollama, "transcribe", _fake_transcribe)
+    rc = run_ollama.main(
+        ["transcribe", "my-audio.wav", "--no-status", "--output-dir", str(tmp_path)]
+    )
+    assert rc == 0
+    assert seen["audio_path"] == "my-audio.wav"  # the CLI input path reached the audio transport
+    out = capsys.readouterr().out
+    assert "a transcript" in out
+    assert "BEGIN UNTRUSTED MODEL OUTPUT" in out  # R22b: the transcript is wrapped for Claude
+    raw = json.loads((tmp_path / "transcribe.raw.json").read_text(encoding="utf-8"))
+    assert raw["content"] == "a transcript"
+
+
+def test_main_routes_vision_input_path_to_stream_vision_as_the_image(monkeypatch, tmp_path):
+    # MS7 CLI wiring: `/ollama vision <image>` threads the `<input>` positional (an IMAGE
+    # PATH) through dispatch -> _run_once -> stream_vision as `image_path=` (so the image is
+    # actually attached), with a default analysis prompt -- not read+sanitized as text.
+    from backend import DelegationResult
+
+    seen: dict[str, object] = {}
+
+    def _fake_stream_vision(
+        config, system_prompt, prompt, model, timeout, *, sink, image_path=None, **kw
+    ):
+        seen["image_path"] = image_path
+        seen["prompt"] = prompt
+        sink("a description")
+        return DelegationResult("a description", 1, 1, True, 0.1)
+
+    cfg = _cfg_with_structured()  # vision: [stream]=True, [structured]=off -> streaming path
+    monkeypatch.setattr(run_ollama, "resolve_config", lambda **kw: cfg)
+    monkeypatch.setattr(run_ollama, "preflight", lambda cfg, **kw: None)
+    monkeypatch.setattr(run_ollama, "load_system_prompt", lambda cap: "sys")
+    monkeypatch.setattr(run_ollama, "_make_backend", lambda cfg: object())
+    monkeypatch.setattr(run_ollama, "stream_vision", _fake_stream_vision)
+    rc = run_ollama.main(["vision", "screenshot.png", "--no-status", "--output-dir", str(tmp_path)])
+    assert rc == 0
+    assert seen["image_path"] == "screenshot.png"  # the CLI input path reached stream_vision
+    assert "screenshot.png" not in str(seen["prompt"])  # the path is NOT read as the text prompt
 
 
 def test_main_handles_missing_agent_prompt_as_actionable_nonzero_not_a_traceback(
@@ -838,6 +880,52 @@ def _delegate(argv):
     ns = parser.parse_args(argv)
     run_ollama._validate_args(parser, ns)
     return run_ollama.run_delegation(ns)
+
+
+def test_run_delegation_acquires_and_releases_a_cross_process_slot(tmp_path, monkeypatch):
+    """R21c: the single-delegation CLI path (`main` -> `run_delegation`) must acquire a
+    GLOBAL cross-process slot, not only the fan-out batch path. Otherwise two concurrent
+    `/ollama` invocations each dispatch without a slot and exceed max_parallel_agents,
+    over-subscribing the endpoint against the documented global cap. A managed run dir with
+    fs-locks enabled acquires exactly one slot for the one delegation and releases it."""
+    _wire(monkeypatch, tmp_path, DelegationResult("hi", 3, 2, False, 0.1))
+    calls: dict[str, list] = {"acquire": [], "release": []}
+
+    def _spy_acquire(slots_dir, max_parallel, timeout):
+        calls["acquire"].append((slots_dir, max_parallel, timeout))
+        return 0
+
+    monkeypatch.setattr(run_ollama, "acquire_slot", _spy_acquire)
+    monkeypatch.setattr(
+        run_ollama,
+        "release_slot",
+        lambda slots_dir, index: calls["release"].append((slots_dir, index)),
+    )
+    assert run_ollama.main(["coder", "write hi", "--no-status"]) == 0
+    assert len(calls["acquire"]) == 1  # exactly one slot for the one delegation
+    slots_dir = calls["acquire"][0][0]
+    assert slots_dir.endswith(SLOTS_DIRNAME)
+    assert calls["release"] == [(slots_dir, 0)]  # released the acquired index
+
+
+def test_run_delegation_rejects_when_no_cross_process_slot_is_free(tmp_path, monkeypatch):
+    """R21c fail-closed: if every global slot is live (acquire_slot -> None), the single
+    delegation is rejected with DelegationError BEFORE any backend call -- never a silent
+    over-subscription; and since nothing was acquired, nothing is released."""
+    from errors import DelegationError
+
+    _wire(monkeypatch, tmp_path, DelegationResult("hi", 3, 2, False, 0.1))
+    monkeypatch.setattr(
+        run_ollama,
+        "_make_backend",
+        lambda cfg: (_ for _ in ()).throw(AssertionError("must not delegate when no slot")),
+    )
+    monkeypatch.setattr(run_ollama, "acquire_slot", lambda *a, **k: None)
+    released: list = []
+    monkeypatch.setattr(run_ollama, "release_slot", lambda *a, **k: released.append(a))
+    with pytest.raises(DelegationError):
+        _delegate(["coder", "write hi", "--no-status"])
+    assert released == []  # nothing acquired -> nothing released
 
 
 def test_managed_run_writes_full_artifacts_and_removes_lock(tmp_path, monkeypatch):
@@ -1546,6 +1634,7 @@ def test_make_file_sink_closes_handle_on_construction_failure(monkeypatch, tmp_p
 # --- Task 5: run_batch — scheduler + breaker + per-delegation stderr + sink routing ---
 
 import asyncio  # noqa: E402 — appended section, mirrors the plan's own layout
+from run_lock import SLOTS_DIRNAME  # noqa: E402 — same appended-section layout
 
 
 def test_run_batch_fanout_bounds_concurrency_and_files_per_delegation(tmp_path):
@@ -1850,6 +1939,29 @@ def test_run_one_delegation_uses_real_dispatch_path(monkeypatch):
 
     assert result.content == "real-dispatch-output"
     assert seen == ["real-dispatch-output"]
+
+
+@pytest.mark.parametrize("media_cap", ["vision", "transcribe"])
+def test_run_one_delegation_rejects_media_caps_fail_closed(media_cap, monkeypatch):
+    """The batch/fan-out worker's `_Job` carries only (cap, model, prompt) -- no field for a
+    media file path -- so vision/transcribe cannot be dispatched through it. Rather than
+    SILENTLY misroute a media cap (dispatch with no image/audio), the worker fail-closes with
+    an actionable DelegationError, so a future fan-out wiring can never route media caps here.
+    The single-delegation CLI path (run_delegation) is the supported route for media."""
+    import run_ollama
+    from errors import DelegationError
+
+    monkeypatch.setattr(
+        run_ollama,
+        "dispatch",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not dispatch a media cap")),
+    )
+    monkeypatch.setattr(run_ollama, "_make_backend", lambda cfg: object())
+    monkeypatch.setattr(run_ollama, "load_system_prompt", lambda cap: "sys")
+    config = run_ollama._cfg_for_batch(max_parallel_agents=2, max_queued_agents=10)
+    job = run_ollama._Job(cap=media_cap, model="m", prompt="p")
+    with pytest.raises(DelegationError):
+        run_ollama._run_one_delegation(job, config, None)
 
 
 def test_run_batch_worker_none_drives_run_one_delegation(tmp_path, monkeypatch):
@@ -3115,3 +3227,425 @@ def test_streaming_output_strips_invisibles_for_defense_in_depth(capsys, monkeyp
     out = capsys.readouterr().out
     assert "\u200b" not in out  # zero-width space stripped from the streamed stdout
     assert "safecode" in out  # the visible content survives; only the invisible is gone
+
+
+# --- Cross-process stdout token wiring (R7d + R27) ---
+
+
+def test_stream_with_stdout_token_holder_uses_stdout(tmp_path):
+    tok = str(tmp_path / ".ollama-stdout.lock")
+    seen = {}
+
+    def _run(used_stdout):
+        seen["used"] = used_stdout
+        return "ok"
+
+    result, used = run_ollama._stream_with_stdout_token(tok, 60, _run)
+    assert result == "ok" and used is True and seen["used"] is True
+
+
+def test_stream_with_stdout_token_second_process_is_file_only(tmp_path):
+    tok = str(tmp_path / ".ollama-stdout.lock")
+    from run_lock import acquire_token
+
+    acquire_token(tok, 60)  # another process holds it
+    result, used = run_ollama._stream_with_stdout_token(tok, 60, lambda used_stdout: used_stdout)
+    assert used is False and result is False  # degraded to file-only, no interleave
+
+
+def test_stream_with_stdout_token_releases_on_interrupt(tmp_path):
+    tok = str(tmp_path / ".ollama-stdout.lock")
+    from run_lock import acquire_token
+
+    def _boom(_used_stdout):
+        raise KeyboardInterrupt("ctrl-c mid-stream")
+
+    with pytest.raises(KeyboardInterrupt):
+        run_ollama._stream_with_stdout_token(tok, 60, _boom)
+    # The finally released the token \u2192 the next process can take it immediately.
+    assert acquire_token(tok, 60) is True
+
+
+def test_streaming_token_loser_streams_to_file_and_presents_the_result_wrapped(
+    capsys, monkeypatch, tmp_path
+):
+    # R7d: when the cross-process stdout token is already held (another run_ollama process is
+    # streaming to the terminal), a streaming delegation must NOT stream token-by-token to
+    # the shared stdout (that would interleave) -- it captures the raw stream to its own
+    # {cap}.stream.log AND then presents the buffered result to Claude ONCE, nonce-wrapped
+    # (R22b), so a token-loser is never handed EMPTY stdout (Loop-1 fix). Claude reads this
+    # process's own stdout capture, so the single wrapped block never interleaves the winner.
+    monkeypatch.chdir(tmp_path)
+    import run_lock
+
+    import run_ollama
+    from backend import DelegationResult
+
+    # Simulate the token being held by another live process: acquire fails.
+    monkeypatch.setattr(run_lock, "_acquire_ephemeral", lambda path, bound: False)
+
+    def _fake_stream_run(
+        config,
+        system_prompt,
+        prompt,
+        model,
+        timeout,
+        *,
+        sink,
+        response_format=None,
+        max_output_bytes=None,
+    ):
+        sink("STREAMED-CONTENT")
+        return DelegationResult("STREAMED-CONTENT", 1, 1, True, 0.1)
+
+    cfg = _cfg_with_structured()  # coder: streaming path
+    monkeypatch.setattr(run_ollama, "resolve_config", lambda **kw: cfg)
+    monkeypatch.setattr(run_ollama, "preflight", lambda cfg, **kw: None)
+    monkeypatch.setattr(run_ollama, "load_system_prompt", lambda cap: "sys")
+    monkeypatch.setattr(run_ollama, "_make_backend", lambda cfg: object())
+    monkeypatch.setattr(run_ollama, "stream_run", _fake_stream_run)
+    out_dir = tmp_path / "out"
+    rc = run_ollama.main(["coder", "write it", "--no-status", "--output-dir", str(out_dir)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "STREAMED-CONTENT" in out  # presented to Claude (buffered), never empty stdout
+    assert out.count("STREAMED-CONTENT") == 1  # ONCE (buffered wrap), not also raw-streamed
+    assert "BEGIN UNTRUSTED MODEL OUTPUT" in out  # nonce-wrapped for Claude (R22b)
+    log = (out_dir / "coder.stream.log").read_text(encoding="utf-8")
+    assert "STREAMED-CONTENT" in log  # the raw stream also landed in the per-agent file
+
+
+# --- MS7 Task 3: cross-process slot-counter (R21c) — `_run_one_delegation_slotted` +
+# `run_batch` wiring. Real `_Job` instances (not a bare `object()`) are used throughout:
+# `_reject_if_circuit_open` reads `job.model` even on a rejection fast-path, and an
+# isolated `CircuitBreaker()` is always passed explicitly so these tests never share
+# failure-count state with the process-wide `_PROCESS_CIRCUIT_BREAKER` singleton other
+# tests in this module mutate. ---
+
+
+def test_slotted_delegation_holds_exactly_one_slot_while_running_then_releases(
+    tmp_path, monkeypatch
+):
+    slots = str(tmp_path / SLOTS_DIRNAME)
+    ran = {"n": 0}
+
+    def _fake_worker(job, config, sink, stats=None):
+        assert len([f for f in os.listdir(slots) if f.startswith("slot-")]) == 1  # one held
+        ran["n"] += 1
+        return "ok"
+
+    monkeypatch.setattr(run_ollama, "_run_one_delegation", _fake_worker)
+    cfg = run_ollama._cfg_for_batch(max_parallel_agents=2, max_queued_agents=0)
+    job = run_ollama._Job(cap="coder", model="m", prompt="p")
+    res = run_ollama._run_one_delegation_slotted(job, cfg, None, slots_dir=slots, timeout=60)
+    assert res == "ok" and ran["n"] == 1
+    assert [f for f in os.listdir(slots) if f.startswith("slot-")] == []  # released
+
+
+def test_slotted_delegation_rejects_when_no_cross_process_slot_is_free(tmp_path):
+    from errors import DelegationError
+    from run_lock import acquire_slot
+
+    slots = str(tmp_path / SLOTS_DIRNAME)
+    acquire_slot(slots, 1, 60)  # another process took it
+    cfg = run_ollama._cfg_for_batch(max_parallel_agents=1, max_queued_agents=0)
+    job = run_ollama._Job(cap="coder", model="m", prompt="p")
+    with pytest.raises(DelegationError):
+        run_ollama._run_one_delegation_slotted(job, cfg, None, slots_dir=slots, timeout=60)
+
+
+def test_run_batch_serial_max_parallel_one_still_routes_through_the_slotted_wrapper(
+    tmp_path, monkeypatch
+):
+    """Regression for the reconciliation fix: the serial fast path
+    (`max_parallel_agents == 1`) must ALSO go through `_run_one_delegation_slotted` — it
+    may skip the Scheduler/stderr-proxy/indexed-sinks overhead, but never the slot, or the
+    global cap silently stops holding the moment `max_parallel_agents` is 1."""
+    from circuit_breaker import CircuitBreaker
+
+    calls = {"slotted": 0, "unslotted": 0}
+
+    def _fake_slotted(job, config, sink, *, slots_dir, timeout, stats=None):
+        calls["slotted"] += 1
+        return "ok"
+
+    def _fake_unslotted(job, config, sink, *, stats=None):
+        calls["unslotted"] += 1
+        return "ok"
+
+    monkeypatch.setattr(run_ollama, "_run_one_delegation_slotted", _fake_slotted)
+    monkeypatch.setattr(run_ollama, "_run_one_delegation", _fake_unslotted)
+    cfg = run_ollama._cfg_for_batch(max_parallel_agents=1, max_queued_agents=0)
+    job = run_ollama._Job(cap="coder", model="m", prompt="p")
+    asyncio.run(
+        run_ollama.run_batch(
+            [job],
+            config=cfg,
+            output_dir=str(tmp_path / "run"),
+            managed=True,
+            breaker=CircuitBreaker(),
+        )
+    )
+    assert calls == {"slotted": 1, "unslotted": 0}  # serial path now acquires a slot too
+
+
+def test_run_batch_serial_two_overlapping_processes_cannot_both_hold_the_global_slot(
+    tmp_path,
+):
+    """Simulate a second overlapping process that already holds the sole global slot
+    (`max_parallel_agents = 1`, so there is exactly one slot, `slot-0.lock`): this
+    process's serial delegation must be REJECTED, not silently allowed to run a second
+    concurrent Ollama agent against the endpoint.
+
+    `run_batch` never RAISES a per-delegation `DelegationError` (the same contract
+    `_reject_if_circuit_open`'s open-circuit rejection already follows elsewhere in this
+    module, unchanged by this task) -- it is returned as this delegation's own result,
+    so a rejected sibling never aborts a whole batch."""
+    from circuit_breaker import CircuitBreaker
+    from errors import DelegationError
+    from run_lock import acquire_slot
+
+    output_dir = str(tmp_path / "run")
+    os.makedirs(output_dir, exist_ok=True)
+    slots_dir = os.path.join(os.path.dirname(os.path.realpath(output_dir)), SLOTS_DIRNAME)
+    acquire_slot(slots_dir, max_parallel=1, timeout=60)  # "process A" holds the only slot
+    cfg = run_ollama._cfg_for_batch(max_parallel_agents=1, max_queued_agents=0)
+    job = run_ollama._Job(cap="coder", model="m", prompt="p")
+    results = asyncio.run(
+        run_ollama.run_batch(
+            [job],
+            config=cfg,
+            output_dir=output_dir,
+            managed=True,
+            breaker=CircuitBreaker(),
+        )
+    )
+    assert len(results) == 1
+    assert isinstance(results[0], DelegationError)  # rejected, not a silent 2nd concurrent agent
+
+
+# --- Task 6: thinking capability — <think> conclusion recovery (BDD-21) ---
+
+
+class _FakeThinkingBackend:
+    def run(
+        self,
+        cap,
+        system_prompt,
+        prompt,
+        model,
+        timeout,
+        *,
+        response_format=None,
+        deadline=None,
+    ):
+        return DelegationResult(
+            "<think>let me reason through the trade-offs...</think>\nUse a min-heap.",
+            1,
+            1,
+            True,
+            0.1,
+        )
+
+
+def test_thinking_uses_the_thinking_model_not_coder():
+    cfg = resolve_config(global_path=None, repo_path=None, env={})
+    assert cfg.models["thinking"] == "deepseek-v4-pro:cloud"
+    assert cfg.models["thinking"] != cfg.models["coder"]
+
+
+def test_thinking_dispatch_strips_think_to_the_conclusion():
+    cfg = resolve_config(global_path=None, repo_path=None, env={})
+    out = run_ollama.dispatch(
+        "thinking",
+        "hard problem",
+        backend=_FakeThinkingBackend(),
+        model=cfg.models["thinking"],
+        timeout=60,
+        system_prompt="s",
+        config=cfg,
+    )
+    assert out.content == "Use a min-heap."  # <think> scratchpad stripped, conclusion kept
+
+
+# --- MS7 Task 7: wire diff_guard into the reviewer dispatch path via CLI `--diff` (R30).
+
+_DIFF = (
+    "diff --git a/src/app.py b/src/app.py\n"
+    "--- a/src/app.py\n"
+    "+++ b/src/app.py\n"
+    "@@ -10,2 +10,3 @@\n"
+    " context\n"
+    "+added line one\n"
+    "+added line two\n"
+)
+
+_REVIEW_WITH_ONE_FABRICATED_FINDING = (
+    '{"capability": "reviewer", "findings": ['
+    '{"severity": "warning", "title": "real", "detail": "d", "file": "src/app.py", "line": 11}, '
+    '{"severity": "critical", "title": "ghost", "detail": "d", '
+    '"file": "does/not/exist.py", "line": 5}]}'
+)
+
+
+class _FakeReviewBackend:
+    """Always returns one grounded finding + one finding on a file absent from `_DIFF`."""
+
+    def run(
+        self,
+        capability,
+        system_prompt,
+        prompt,
+        model,
+        timeout,
+        *,
+        response_format=None,
+        deadline=None,
+    ):
+        return DelegationResult(_REVIEW_WITH_ONE_FABRICATED_FINDING, 0, 0, True, 0.0)
+
+
+def test_dispatch_with_diff_drops_the_finding_on_a_file_absent_from_the_diff():
+    out = run_ollama.dispatch(
+        "reviewer",
+        "review this change",
+        backend=_FakeReviewBackend(),
+        model=_CFG.models["reviewer"],
+        timeout=60,
+        system_prompt="s",
+        config=_CFG,
+        diff=_DIFF,
+    )
+    titles = [f["title"] for f in out.parsed["findings"]]
+    assert titles == ["real"]  # the fabricated-file finding never reaches Claude
+
+
+def test_dispatch_without_diff_passes_every_finding_through_unchanged():
+    out = run_ollama.dispatch(
+        "reviewer",
+        "review this change",
+        backend=_FakeReviewBackend(),
+        model=_CFG.models["reviewer"],
+        timeout=60,
+        system_prompt="s",
+        config=_CFG,
+    )
+    titles = [f["title"] for f in out.parsed["findings"]]
+    assert titles == ["real", "ghost"]  # no --diff given => diff_guard never invoked
+
+
+def test_build_parser_accepts_optional_diff_flag(tmp_path):
+    diff_file = tmp_path / "change.diff"
+    diff_file.write_text(_DIFF, encoding="utf-8")
+    ns = build_parser().parse_args(["reviewer", "in", "--diff", str(diff_file)])
+    assert ns.diff == str(diff_file)  # raw arg; run_delegation loads it via _load_input
+
+
+def test_build_parser_diff_defaults_to_none():
+    ns = build_parser().parse_args(["reviewer", "in"])
+    assert ns.diff is None
+
+
+# --- MS7 Task 8: disable_fs_locks kill-switch (R7d/R21c operator escape hatch) ---
+#
+# Real `_Job` instances and an explicit, isolated `CircuitBreaker()` are used
+# throughout (same reasoning as the Task 3 slot-counter tests above): the batch
+# machinery reads `job.cap`/`job.model` even on a rejection fast-path, and an
+# isolated breaker keeps these tests from sharing failure-count state with the
+# process-wide `_PROCESS_CIRCUIT_BREAKER` singleton other tests in this module
+# mutate.
+
+from run_lock import STDOUT_TOKEN_FILENAME  # noqa: E402 -- appended section
+
+
+def _cfg_disable_fs_locks(
+    disable: bool, *, max_parallel_agents: int = 2, max_queued_agents: int = 0
+):
+    base = run_ollama._cfg_for_batch(
+        max_parallel_agents=max_parallel_agents, max_queued_agents=max_queued_agents
+    )
+    return replace(base, disable_fs_locks=disable)
+
+
+def test_disable_fs_locks_true_creates_no_slots_dir_and_still_runs_every_job(tmp_path, monkeypatch):
+    from circuit_breaker import CircuitBreaker
+
+    ran = {"n": 0}
+
+    def _fake_worker(job, config, sink, stats=None):
+        ran["n"] += 1
+        return "ok"
+
+    monkeypatch.setattr(run_ollama, "_run_one_delegation", _fake_worker)
+    # max_parallel_agents=3 admits all 3 jobs in one Scheduler pass (ceiling 3), so
+    # this test's "every job still ran" assertion is independent of R21b queue
+    # rejection, which is out of scope here.
+    cfg = _cfg_disable_fs_locks(True, max_parallel_agents=3, max_queued_agents=0)
+    output_dir = str(tmp_path / "run")
+    os.makedirs(output_dir, exist_ok=True)  # fan-out sink routing writes into it
+    jobs = [run_ollama._Job(cap="coder", model="m", prompt="p") for _ in range(3)]
+    asyncio.run(
+        run_ollama.run_batch(
+            jobs, config=cfg, output_dir=output_dir, managed=True, breaker=CircuitBreaker()
+        )
+    )
+    slots_dir = os.path.join(os.path.dirname(os.path.realpath(output_dir)), SLOTS_DIRNAME)
+    assert not os.path.exists(slots_dir)  # cross-process slot dir never created
+    assert ran["n"] == 3  # every job still ran (in-process Scheduler bound)
+
+
+def test_disable_fs_locks_false_preserves_task_3_slotted_behavior(tmp_path, monkeypatch):
+    """Regression: the kill-switch is opt-in -- default (False) must not touch Task 3's
+    existing cross-process slot wiring."""
+    from circuit_breaker import CircuitBreaker
+
+    def _fake_slotted(job, config, sink, *, slots_dir, timeout, stats=None):
+        os.makedirs(slots_dir, exist_ok=True)  # what acquire_slot would create
+        return "ok"
+
+    monkeypatch.setattr(run_ollama, "_run_one_delegation_slotted", _fake_slotted)
+    # max_parallel_agents=1 with a single job takes the serial fast path, which (per
+    # Task 3) also routes through the slotted wrapper -- same assertion, no need for
+    # the fan-out sink's output_dir to pre-exist.
+    cfg = _cfg_disable_fs_locks(False, max_parallel_agents=1, max_queued_agents=0)
+    output_dir = str(tmp_path / "run")
+    job = run_ollama._Job(cap="coder", model="m", prompt="p")
+    asyncio.run(
+        run_ollama.run_batch(
+            [job], config=cfg, output_dir=output_dir, managed=True, breaker=CircuitBreaker()
+        )
+    )
+    slots_dir = os.path.join(os.path.dirname(os.path.realpath(output_dir)), SLOTS_DIRNAME)
+    assert os.path.exists(slots_dir)
+
+
+def test_disable_fs_locks_true_skips_the_stdout_token_and_creates_no_lock_file(tmp_path):
+    token_path = str(tmp_path / STDOUT_TOKEN_FILENAME)
+    cfg = _cfg_disable_fs_locks(True)
+    seen = {}
+
+    def _run(used_stdout):
+        seen["used"] = used_stdout
+        return "ok"
+
+    result, used = run_ollama._stream_maybe_with_stdout_token(cfg, token_path, 60, _run)
+    assert result == "ok" and used is True and seen["used"] is True
+    assert not os.path.exists(token_path)  # acquire() was never called
+
+
+def test_disable_fs_locks_false_still_creates_and_arbitrates_the_stdout_token(tmp_path):
+    token_path = str(tmp_path / STDOUT_TOKEN_FILENAME)
+    cfg = _cfg_disable_fs_locks(False)
+    seen = {}
+
+    def _run(used_stdout):
+        # The real Task 2 acquire() ran (unchanged behavior): the lockfile exists
+        # WHILE the delegation holds it, and is released (removed) once it returns --
+        # asserting existence only DURING the call, not after, matches
+        # `_stream_with_stdout_token`'s own release-in-`finally` semantics.
+        seen["existed_during_call"] = os.path.exists(token_path)
+        return used_stdout
+
+    result, used = run_ollama._stream_maybe_with_stdout_token(cfg, token_path, 60, _run)
+    assert used is True and result is True
+    assert seen["existed_during_call"] is True

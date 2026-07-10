@@ -25,6 +25,7 @@ from typing import Any, TextIO
 from agent_schema import DISCRIMINATOR_KEYS, SCHEMAS
 from backend import AgentBackend, DelegationResult, OllamaBackend
 from circuit_breaker import CircuitBreaker
+from diff_guard import validate_findings
 from errors import (
     DelegationError,
     InvalidInputError,
@@ -43,8 +44,18 @@ from ollama_config import resolve_config as resolve_config
 from ollama_preflight import preflight
 from ollama_stream import stream_run
 from ollama_vision import stream_vision
-from parse_output import parse_agent_output
-from run_lock import remove_lock, staleness_bound_for_timeout, write_lock
+from parse_output import parse_agent_output, strip_think
+from run_lock import (
+    SLOTS_DIRNAME,
+    STDOUT_TOKEN_FILENAME,
+    acquire_slot,
+    acquire_token,
+    release_slot,
+    release_token,
+    remove_lock,
+    staleness_bound_for_timeout,
+    write_lock,
+)
 from sanitize import build_user_prompt, open_output_frame, strip_invisibles, wrap_output
 from scheduler import Scheduler
 from startup_hardening import (
@@ -59,6 +70,7 @@ from stderr_shim import (
     capture_stderr_for_delegation,
     install_dispatching_stderr,
 )
+from transcribe import transcribe
 from temp_dirs import (
     cleanup_old_runs,
     create_output_dir,
@@ -124,6 +136,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--warn-input-tokens", type=int, default=150_000, help="Oversize warning threshold (tokens)"
+    )
+    parser.add_argument(
+        "--diff",
+        default=None,
+        help="Path to a unified diff (or inline diff text) grounding reviewer findings "
+        "against it (R30); omit for no grounding",
     )
     # --ollama-init is intentionally NOT an argparse flag: it is handled solely by the
     # pre-parse first-token short-circuit in `main` (before argparse ever runs), so there
@@ -396,9 +414,27 @@ def make_file_sink(path: str) -> "_FileSink":
         raise
 
 
-# Capabilities whose transport is not in MS1 (multimodal/audio → M7). Guarded in
-# ``dispatch`` so a binary input is never sent as garbled chat text. Removed in M7.
-_MS1_UNSUPPORTED_CAPS = frozenset({"vision", "transcribe"})
+# Capabilities whose transport was not in MS1 (multimodal/audio → M7). `vision` gained
+# its real transport in MS7 Task 4 (`ollama_vision.stream_vision`); `transcribe` gained
+# its real, gated transport in MS7 Task 5 (`transcribe.transcribe`). Both multimodal
+# capabilities now have real transports, so this guard is empty -- kept as a named,
+# documented set (rather than removed outright) so a FUTURE capability lacking a wired
+# transport has an established, tested mechanism to opt out of `dispatch` again.
+_MS1_UNSUPPORTED_CAPS: frozenset[str] = frozenset()  # was {"transcribe"} after Task 4; now empty
+
+# Capabilities whose free-text output gets <think>...</think> reasoning-block recovery
+# (BDD-21, MS7 Task 6): the useful CONCLUSION is what Claude reviews, not the scratchpad
+# a reasoning model (e.g. deepseek-v4-pro, thinking's default) emits ahead of it.
+_THINK_RECOVERY_CAPS: frozenset[str] = frozenset({"thinking"})
+
+# The `<input>` positional for `vision`/`transcribe` is a MEDIA FILE PATH, not text — the
+# transport's `load_binary` (R24b) validates/loads it, so it is never read+sanitized as
+# text. `vision` still needs a user prompt (the analysis instruction) alongside the image;
+# `transcribe` needs none (it is pure transcription via its own transport).
+_MEDIA_INPUT_CAPS: frozenset[str] = frozenset({"vision", "transcribe"})
+_DEFAULT_VISION_PROMPT = (
+    "Describe and analyze this image in detail, including any UI, layout, text, or notable content."
+)
 
 
 def _capability_streams_to_stdout(config: OllamaAgentsConfig, capability: str) -> bool:
@@ -428,6 +464,7 @@ def _run_once(
     sink: Callable[[str], None] | None,
     response_format: dict[str, Any] | None,
     deadline: float | None = None,
+    image_path: str | None = None,
 ) -> DelegationResult:
     """Pick the streaming or transactional path for one delegation attempt (R7b/R7c).
 
@@ -469,8 +506,22 @@ def _run_once(
     # is "structured/corto → transactional"; making it a code invariant (not just the
     # reviewer/tester [stream]=false default a user could override) closes that gap.
     if _capability_streams_to_stdout(config, capability) and sink is not None:
-        fn = stream_vision if capability == "vision" else stream_run
-        return fn(
+        if capability == "vision":
+            # R2 vision: forward the CLI image path so the multimodal transport (MS7 Task 4)
+            # attaches it as an `image_url` content-part; `image_path=None` still streams
+            # text-only, identical to the pre-wiring behavior.
+            return stream_vision(
+                config,
+                system_prompt,
+                prompt,
+                model,
+                timeout,
+                sink=sink,
+                response_format=response_format,
+                max_output_bytes=config.max_output_bytes,
+                image_path=image_path,
+            )
+        return stream_run(
             config,
             system_prompt,
             prompt,
@@ -502,6 +553,8 @@ def dispatch(
     config: OllamaAgentsConfig,
     stats: TokenStats | None = None,
     sink: Callable[[str], None] | None = None,
+    diff: str | None = None,
+    image_path: str | None = None,
 ) -> DelegationResult:
     """Run one delegation; for the ``schema`` mode parse+validate with one retry.
 
@@ -544,6 +597,20 @@ def dispatch(
             default) never streams regardless of *config*'s ``[stream]`` setting —
             callers that want streaming must supply one (e.g. ``stdout_sink`` for the
             single in-flight delegation).
+        diff: Optional unified diff (R30) grounding ``reviewer``'s findings against the
+            change Claude is reviewing. Consulted ONLY for ``reviewer``: right after the
+            structured output is parsed + schema-validated and BEFORE the result is
+            returned, a finding whose claimed ``file`` is absent from *diff* is
+            HARD-DROPPED — it never reaches the caller; one whose ``line`` is outside
+            the changed range is kept, soft-annotated
+            (``diff_guard.validate_findings``). ``None`` (the default, for both this
+            parameter and the CLI's ``--diff``) is a strict no-op: ``diff_guard`` is
+            never even called, and every finding passes through byte-for-byte
+            unchanged. Accepted uniformly for every capability (one signature), but
+            capabilities other than ``reviewer`` — including ``coder`` (free-text,
+            ``structured="off"``) — never consult it: a documented, intentional
+            no-op there, not a silent gap. A coder response is raw code text with no
+            structured ``file``/``line`` claims to ground in this build.
 
     Returns:
         The ``DelegationResult`` — with the validated dict in ``.parsed`` for schema mode,
@@ -552,13 +619,15 @@ def dispatch(
     Raises:
         OllamaBackendError: if the composite retry deadline is exceeded.
         ValidationError: if the output is still invalid after the retry.
-        DelegationError: if *capability* is ``vision``/``transcribe`` (their
-            multimodal/audio transport lands in M7 — sending a binary as chat text
-            would garble it, so MS1 fails actionably instead).
+        DelegationError: if *capability* is ``transcribe`` (its audio transport
+            lands in M7 Task 5 — sending a binary as chat text would garble it, so
+            this build fails actionably instead). ``vision`` gained its real
+            ``image_url`` transport in M7 Task 4 and is no longer guarded here.
     """
-    # R28 keeps all 7 capabilities in the CLI surface, but MS1 implements only the
-    # chat/text ones. vision/transcribe need the multimodal/binary transport added in
-    # M7 — guard so a binary input isn't silently garbled. (Removed/replaced in M7.)
+    # R28 keeps all 7 capabilities in the CLI surface. `vision` gained its real
+    # transport in M7 Task 4 (`ollama_vision.stream_vision`); `transcribe` still needs
+    # the audio transport added in Task 5 — guarded so a binary input isn't silently
+    # garbled. (Removed/replaced in Task 5.)
     if capability in _MS1_UNSUPPORTED_CAPS:
         raise DelegationError(
             f"capability {capability!r} requires the multimodal/audio transport added "
@@ -589,7 +658,12 @@ def dispatch(
             sink=sink,
             response_format=response_format,
             deadline=deadline,
+            image_path=image_path,
         )
+        if capability in _THINK_RECOVERY_CAPS:
+            # Post-process the free-text content only (BDD-21): yield the conclusion,
+            # drop the reasoning scratchpad. `.parsed` stays None here (free-text branch).
+            result = replace(result, content=strip_think(result.content))
         if stats is not None:
             stats.record(capability, model, result)
         return result
@@ -619,7 +693,6 @@ def dispatch(
             stats.record(capability, model, result, counts_as_delegation=(attempt == 0))
         try:
             parsed = validate_output(capability, parse_agent_output(result.content, keys))
-            return replace(result, parsed=parsed)
         except (ValidationError, json.JSONDecodeError) as exc:
             last_error = str(exc)
             # Reinject the ACTUAL per-capability JSON-Schema (not just the key list) so the
@@ -635,6 +708,17 @@ def dispatch(
                 + json.dumps(SCHEMAS[capability])
                 + "\n"
             )
+            continue
+        if capability == "reviewer" and diff is not None:
+            # R30: ground the model's file:line claims against the PROVIDED diff, right
+            # after schema validation and BEFORE the result is returned to
+            # run_delegation/Claude. A fabricated-file finding is HARD-DROPPED here — it
+            # never reaches the caller; an out-of-range one is kept, soft-annotated.
+            # `diff=None` (the default) skips this branch entirely, so `tester` and every
+            # other capability (and `reviewer` itself with no `--diff`) is unaffected.
+            kept, _dropped = validate_findings(parsed["findings"], diff)
+            parsed = {**parsed, "findings": kept}
+        return replace(result, parsed=parsed)
     raise ValidationError(f"{capability} output invalid after retry: {last_error}")
 
 
@@ -1014,6 +1098,10 @@ def run_delegation(ns: argparse.Namespace) -> int:
         # StatusDisplay captures the REAL sys.stderr at construction (before the shim
         # below), so it still renders live while the shim buffers everyone else's stderr.
         display = None if not ns.show_status else StatusDisplay([ns.capability])
+        # R21c cross-process slot state, initialized BEFORE the try so the `finally` can
+        # release it on ANY exit path (transcribe early-return, normal return, exception).
+        slot_index: int | None = None
+        slots_dir: str | None = None
         try:
             # `active` = a live StatusDisplay owns the terminal -> buffer only (protects
             # the ANSI redraw, flush once on exit). `--no-status` -> display is None ->
@@ -1028,12 +1116,67 @@ def run_delegation(ns: argparse.Namespace) -> int:
                 # with the stderr.log diagnostic.
                 preflight(cfg, capability=ns.capability, effective_model=model)
                 system_prompt = load_system_prompt(ns.capability)
-                raw_input = _load_input(ns.input)
-                warn_if_oversize(raw_input, ns.warn_input_tokens)  # R24
-                prompt = build_user_prompt(raw_input)  # R22: sanitize + nonce-wrap
+                # vision/transcribe take a MEDIA PATH as `<input>` (validated by the
+                # transport's `load_binary`, R24b), NOT text to read+sanitize. `transcribe`
+                # is fully handled by its own transport branch below; `vision` threads the
+                # image path to `stream_vision` (below) alongside a default analysis prompt.
+                image_path: str | None
+                if ns.capability in _MEDIA_INPUT_CAPS:
+                    image_path = ns.input
+                    prompt = build_user_prompt(_DEFAULT_VISION_PROMPT)
+                else:
+                    image_path = None
+                    raw_input = _load_input(ns.input)
+                    warn_if_oversize(raw_input, ns.warn_input_tokens)  # R24
+                    prompt = build_user_prompt(raw_input)  # R22: sanitize + nonce-wrap
+                # R30: `--diff` is loaded through the SAME file-or-inline-text helper as
+                # `input` (same MAX_INPUT_FILE_SIZE guard, same errors="replace" decode) —
+                # no bespoke size/encoding path for the diff. `None` (the default) is a
+                # strict no-op forwarded to `dispatch` unchanged.
+                diff = _load_input(ns.diff) if ns.diff is not None else None
                 stats = TokenStats()
                 if display is not None:
                     display.update(ns.capability, "running")
+                # R21c: this single delegation counts against the GLOBAL cross-process cap
+                # too, not only the fan-out batch path -- acquire one slot so two concurrent
+                # `/ollama` invocations can never exceed `max_parallel_agents` Ollama agents
+                # against the endpoint. Gated EXACTLY like the batch path (`_call_real_worker`):
+                # only a MANAGED run dir (`--output-dir` opts out of every collision protection,
+                # R15/R28) with the `disable_fs_locks` kill-switch OFF (MS7 Task 8) -> a slots
+                # dir alongside the `ollama-run-*` dirs; otherwise `None` (no slot). No free
+                # slot -> fail-closed `DelegationError` (an R21b rejection) BEFORE dispatching,
+                # so a second overlapping process degrades gracefully instead of
+                # over-subscribing. Released in this function's `finally` (covers the transcribe
+                # early-return, the normal return, and every interrupt/exception path).
+                slots_dir = (
+                    os.path.join(os.path.dirname(os.path.realpath(output_dir)), SLOTS_DIRNAME)
+                    if ns.output_dir is None and not cfg.disable_fs_locks
+                    else None
+                )
+                if slots_dir is not None:
+                    slot_index = acquire_slot(slots_dir, cfg.max_parallel_agents, ns.timeout)
+                    if slot_index is None:
+                        raise DelegationError(
+                            "no free cross-process slot: "
+                            f"{cfg.max_parallel_agents} Ollama agents already running across "
+                            "processes (raise max_parallel_agents or retry once one finishes)"
+                        )
+                # R2 transcribe (experimental, gated): the audio path goes to its OWN
+                # probe/endpoint/chat transport (MS7 Task 5), never the stream/dispatch path
+                # (which would wrongly route it to `stream_run` as text). `load_binary`
+                # (R24b) validates the audio inside `transcribe()`; an endpoint without audio
+                # support yields an actionable `OllamaBackendError`, never a crash. Returns
+                # here after presenting — the `finally` (display.stop) and the surrounding
+                # `with` cleanups still run on this early return.
+                if ns.capability == "transcribe":
+                    result = transcribe(cfg, ns.input, model, ns.timeout)
+                    stats.record(ns.capability, model, result)
+                    _write_artifacts(output_dir, ns.capability, ns.input, result, stats, errbuf)
+                    if display is not None:
+                        display.update(ns.capability, "success", tok_per_s=result.tok_per_s)
+                    # R22b: wrap the transcript as untrusted data for Claude (never auto-applied).
+                    print(wrap_output(result.content))
+                    return 0
                 # R22b sink strategy: a STREAMING capability writes RAW deltas to stdout
                 # live inside `dispatch` (stdout_sink), so we bracket that live stream with
                 # nonce BEGIN/END markers (`open_output_frame`) — the streamed output reaches
@@ -1045,48 +1188,81 @@ def run_delegation(ns: argparse.Namespace) -> int:
                 # streaming choice (per-capability `[stream]` true AND not a schema
                 # capability — schema never streams).
                 is_streaming = _capability_streams_to_stdout(cfg, ns.capability)
-                frame_footer = ""
-                if is_streaming:
-                    frame_header, frame_footer = open_output_frame()
-                    sys.stdout.write(frame_header)
-                    sys.stdout.flush()
-                try:
-                    result = dispatch(
+                backend = _make_backend(cfg)
+
+                def _do_dispatch(sink: Callable[[str], None]) -> DelegationResult:
+                    """Run the single delegation with *sink* (one backend, one attempt path)."""
+                    return dispatch(
                         ns.capability,
                         prompt,
-                        backend=_make_backend(cfg),
+                        backend=backend,
                         model=model,
                         timeout=ns.timeout,
                         system_prompt=system_prompt,
                         config=cfg,
                         stats=stats,
-                        # R7c: this CLI drives exactly ONE delegation at a time (concurrency
-                        # is MS5) -- the single-in-flight case always gets the stdout sink.
-                        # R22b: the streaming sink strips invisibles from each delta (parity
-                        # with wrap_output on the transactional path). No-op for a
-                        # transactional capability, whose backend never calls the sink.
-                        sink=_streaming_stdout_sink,
+                        sink=sink,
+                        diff=diff,
+                        image_path=image_path,
                     )
-                finally:
-                    if is_streaming:
-                        # ALWAYS close the R22b nonce frame around the (possibly partial)
-                        # streamed deltas -- even if `dispatch` raised. An unterminated BEGIN
-                        # marker left on stdout would keep the untrusted-output frame open
-                        # around whatever the error handler prints next, breaking R22b's
-                        # framing integrity on the error path (the frame's whole point is
-                        # that Claude can trust the BEGIN..END bounds).
-                        #
-                        # Best-effort: if stdout itself is broken (e.g. BrokenPipeError)
-                        # WHILE a `dispatch` exception is already in flight, swallow this
-                        # write's OSError -- a `finally` that raised here would MASK the
-                        # original delegation exception the outer handlers below need to see
-                        # (and a broken stdout means no reader is left to care about the
-                        # closing marker anyway).
+
+                def _stream_to_stdout_framed() -> DelegationResult:
+                    """Stream live to stdout, nonce-framed (R22b) + invisible-stripped; close
+                    the frame even if dispatch raises (best-effort, never masks the error)."""
+                    frame_header, frame_footer = open_output_frame()
+                    sys.stdout.write(frame_header)
+                    sys.stdout.flush()
+                    try:
+                        return _do_dispatch(_streaming_stdout_sink)
+                    finally:
                         try:
                             sys.stdout.write(frame_footer + "\n")
                             sys.stdout.flush()
                         except OSError:
                             pass
+
+                if is_streaming:
+                    # R7d: stdout is a serial resource ACROSS processes. Acquire the
+                    # project-level `.ollama-stdout.lock`; the winner streams live to stdout
+                    # (nonce-framed), any concurrent process goes file-only to its own
+                    # `{cap}.stream.log` (no stdout, no interleaving). The token is released
+                    # on any BaseException (SIGINT/R27) inside `_stream_with_stdout_token`.
+                    token_path = os.path.join(
+                        project_run_root(resolve_project_root()), STDOUT_TOKEN_FILENAME
+                    )
+
+                    def _run_streamed(used_stdout: bool) -> DelegationResult:
+                        if used_stdout:
+                            return _stream_to_stdout_framed()
+                        # R7d loser: another process holds the terminal, so DON'T stream
+                        # token-by-token to the shared stdout -- interleaving per-token deltas
+                        # with the winner's live stream is exactly what the token prevents.
+                        # Capture the raw stream to this delegation's own file, then present the
+                        # buffered result to Claude ONCE as a single nonce-framed block (R22b).
+                        # Data integrity does NOT rely on stdout being private (R7d's whole
+                        # premise is a SHARED terminal): `wrap_output` brackets this result with
+                        # a UNIQUE per-delegation nonce, distinct from the winner's own frame
+                        # nonce, so a nonce-aware consumer (Claude, R22b) always recovers both
+                        # blocks intact. If the loser finishes first, its one block can appear
+                        # between the winner's deltas -- a benign visual interleave, never a
+                        # torn/ambiguous frame -- and a token-loser is never handed empty stdout.
+                        # (A naive first-BEGIN..first-END parser would mis-close; the R22b
+                        # contract is nonce-matched extraction, which this preserves.)
+                        with make_file_sink(
+                            os.path.join(output_dir, f"{ns.capability}.stream.log")
+                        ) as fsink:
+                            result_file_only = _do_dispatch(fsink)
+                        print(wrap_output(result_file_only.content))
+                        return result_file_only
+
+                    result, _used_stdout = _stream_maybe_with_stdout_token(
+                        cfg, token_path, ns.timeout, _run_streamed
+                    )
+                else:
+                    # Transactional: the backend never calls the sink; the single buffered
+                    # result is nonce-wrapped once for Claude below.
+                    result = _do_dispatch(_streaming_stdout_sink)
+
                 _write_artifacts(output_dir, ns.capability, prompt, result, stats, errbuf)
                 if display is not None:
                     display.update(ns.capability, "success", tok_per_s=result.tok_per_s)
@@ -1115,11 +1291,93 @@ def run_delegation(ns: argparse.Namespace) -> int:
             _safe_display_update(display, ns.capability, "failed")
             raise
         finally:
+            # R21c: release the cross-process slot on EVERY exit path (success, transcribe
+            # early-return, timeout/failure, or interrupt). `release_slot` is total (never
+            # raises), so it cannot replace an in-flight exception; `slot_index is None`
+            # whenever no slot was acquired (unmanaged run, kill-switch, or acquire miss).
+            if slot_index is not None and slots_dir is not None:
+                release_slot(slots_dir, slot_index)
             # R20: flush/restore the live display even on interrupt or a mid-run
             # exception. Guarded (R27): a raising stop() must never REPLACE the exception
             # in flight (esp. KeyboardInterrupt), or managed_run_dir's rmtree path is missed.
             _safe_display_stop(display)
     return 0
+
+
+def _stream_with_stdout_token(
+    token_path: str,
+    timeout: int,
+    run: Callable[[bool], Any],
+    *,
+    acquire: Callable[[str, int], bool] = acquire_token,
+    release: Callable[[str], None] = release_token,
+) -> tuple[Any, bool]:
+    """Run *run(used_stdout)* while (or without) holding the cross-process stdout token.
+
+    The token is acquired before streaming; ``run`` is told via ``used_stdout`` whether it
+    won stdout (stream live) or must go file-only (``{cap}.stream.log``). The token is
+    released in a ``finally`` on ANY ``BaseException`` -- including ``KeyboardInterrupt``
+    (Ctrl-C / SIGINT, R27) -- so an interrupted delegation never leaves a live token that
+    would force the next process file-only. A process that never held the token (file-only)
+    releases nothing (idempotent).
+
+    Args:
+        token_path: The ``.ollama-stdout.lock`` path in the per-project namespace.
+        timeout: Per-delegation timeout (short staleness bound).
+        run: Callback receiving ``used_stdout: bool``; returns the delegation result.
+        acquire: Injectable token acquirer (tests).
+        release: Injectable token releaser (tests).
+
+    Returns:
+        ``(result, used_stdout)``.
+    """
+    used_stdout = acquire(token_path, timeout)
+    try:
+        return run(used_stdout), used_stdout
+    finally:
+        if used_stdout:
+            release(token_path)
+
+
+def _stream_maybe_with_stdout_token(
+    config: OllamaAgentsConfig,
+    token_path: str,
+    timeout: int,
+    run: Callable[[bool], Any],
+    *,
+    acquire: Callable[[str, int], bool] = acquire_token,
+    release: Callable[[str], None] = release_token,
+) -> tuple[Any, bool]:
+    """Stream-role wrapper honoring the ``disable_fs_locks`` kill-switch (MS7 Task 8).
+
+    ``config.disable_fs_locks is False`` (default): delegates to
+    :func:`_stream_with_stdout_token` unchanged -- the cross-process
+    ``.ollama-stdout.lock`` arbitrates which of possibly several processes streams to
+    stdout (R7d).
+
+    ``config.disable_fs_locks is True``: the cross-process arbitration is BYPASSED
+    entirely -- ``acquire``/``release`` are never called (no lock file is ever
+    created), and ``run(True)`` is invoked directly, unconditionally granting the
+    stdout role. This is the v0.1/no-R7d fallback: only the in-process ``Scheduler``
+    semaphore (MS5) and the documented single-orchestrator invariant remain as
+    concurrency guarantees.
+
+    Args:
+        config: The resolved, batch-scoped config (consulted for the kill-switch).
+        token_path: The ``.ollama-stdout.lock`` path (unused when disabled).
+        timeout: Per-delegation timeout (unused when disabled).
+        run: Callback receiving ``used_stdout: bool``; returns the delegation result.
+        acquire: Injectable token acquirer (tests; forwarded to
+            :func:`_stream_with_stdout_token`).
+        release: Injectable token releaser (tests; forwarded to
+            :func:`_stream_with_stdout_token`).
+
+    Returns:
+        ``(result, used_stdout)`` -- ``used_stdout`` is always ``True`` when disabled.
+    """
+    if config.disable_fs_locks:
+        return run(True), True
+    return _stream_with_stdout_token(token_path, timeout, run, acquire=acquire, release=release)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1493,9 +1751,23 @@ def _run_one_delegation(
 
     Raises:
         OllamaBackendError, TimeoutError, RateLimitError, ValidationError,
-        DelegationError: propagated as-is from `dispatch()`/the backend — the caller
-        (`_execute_delegation`) classifies these.
+        DelegationError: for a media capability (vision/transcribe) -- the batch `_Job`
+            has no field to carry the required media-file path, so this fail-closes rather
+            than silently misroute; and propagated as-is from `dispatch()`/the backend for
+            everything else — the caller (`_execute_delegation`) classifies these.
     """
+    # Fail-closed media guard (R2): `_Job` carries only (cap, model, prompt) -- it CANNOT
+    # carry the image/audio path vision/transcribe require. Dispatching a media cap here
+    # would silently misroute (a vision call with no image, etc.). Reject it explicitly so a
+    # future fan-out wiring can never route media caps through the batch path; the supported
+    # route for media is the single-delegation CLI path (`run_delegation`), which threads the
+    # media file through to `stream_vision`/`transcribe`.
+    if job.cap in _MEDIA_INPUT_CAPS:
+        raise DelegationError(
+            f"the batch/fan-out path does not support the media capability {job.cap!r} "
+            "(its input is a media-file path the batch _Job cannot carry); use the "
+            f"single-delegation path instead (/ollama {job.cap} <file>)"
+        )
     backend = _make_backend(config)
     return dispatch(
         job.cap,
@@ -1508,6 +1780,99 @@ def _run_one_delegation(
         sink=sink,
         stats=stats,
     )
+
+
+def _run_one_delegation_slotted(
+    job: _Job,
+    config: OllamaAgentsConfig,
+    sink: Callable[[str], None] | None,
+    *,
+    slots_dir: str,
+    timeout: int,
+    stats: TokenStats | None = None,
+) -> DelegationResult:
+    """Run one fan-out delegation while holding a cross-process slot (R21c).
+
+    Acquires a GLOBAL slot before dispatch so the number of concurrent Ollama agents
+    across ALL processes never exceeds ``config.max_parallel_agents`` -- the in-process
+    ``Scheduler`` semaphore only caps this process. No free slot -> ``DelegationError``
+    (counts as an R21b queue rejection; per-delegation, never a whole-batch raise), so
+    a second overlapping process degrades gracefully instead of over-subscribing the
+    endpoint. The slot is released in a ``finally`` (including on interrupt).
+
+    Args:
+        job: The delegation job (opaque here; forwarded to ``_run_one_delegation``).
+        config: The batch-scoped config (its ``max_parallel_agents`` is the global cap).
+        sink: The per-delegation output sink (file sink in fan-out).
+        slots_dir: ``<project_run_root>/.ollama-slots``.
+        timeout: Per-delegation timeout (short staleness bound for the slot lock).
+        stats: Optional batch-scoped ``TokenStats`` (R12).
+
+    Returns:
+        The delegation result from ``_run_one_delegation``.
+
+    Raises:
+        DelegationError: if no cross-process slot is free.
+    """
+    index = acquire_slot(slots_dir, config.max_parallel_agents, timeout)
+    if index is None:
+        raise DelegationError(
+            "no free cross-process slot: "
+            f"{config.max_parallel_agents} Ollama agents already running across "
+            "processes (raise max_parallel_agents or retry once one finishes)"
+        )
+    try:
+        return _run_one_delegation(job, config, sink, stats=stats)
+    finally:
+        release_slot(slots_dir, index)
+
+
+async def _call_real_worker(
+    job: _Job,
+    config: OllamaAgentsConfig,
+    sink: Callable[[str], None] | None,
+    *,
+    slots_dir: str | None,
+    stats: TokenStats | None,
+) -> DelegationResult:
+    """Dispatch one REAL (non-test-seam) delegation, routed through the cross-process
+    slot wrapper (R21c) when *slots_dir* is set (a MANAGED run), else straight to
+    `_run_one_delegation`.
+
+    Shared by BOTH concurrency shapes -- `_run_batch_serial_fast_path`'s and
+    `run_batch`'s own fan-out `_one()`'s -- `_call_worker` closures, so the
+    slot-wrapping decision lives in exactly ONE place (never duplicated between the
+    two). Only ever reached when the caller's `_worker` test seam is `None` (the
+    production path); a caller-substituted `_worker` bypasses this entirely and
+    therefore never touches the cross-process slot machinery -- appropriate, since it
+    never dispatches a real delegation in the first place.
+
+    Args:
+        job: The `_Job` to run.
+        config: The resolved layered config (`max_parallel_agents` is the global cap
+            `acquire_slot` probes against).
+        sink: The per-delegation output sink, or `None`.
+        slots_dir: The per-project `.ollama-slots` dir, or `None` for an unmanaged run
+            (`--output-dir`, R15/R28) -- no cross-process slot is acquired.
+        stats: Optional shared `TokenStats` (R12).
+
+    Returns:
+        The `DelegationResult` from `_run_one_delegation`/`_run_one_delegation_slotted`.
+
+    Raises:
+        DelegationError: no free cross-process slot (R21c fail-closed).
+    """
+    if slots_dir is not None:
+        return await asyncio.to_thread(
+            _run_one_delegation_slotted,
+            job,
+            config,
+            sink,
+            slots_dir=slots_dir,
+            timeout=int(job.timeout),
+            stats=stats,
+        )
+    return await asyncio.to_thread(_run_one_delegation, job, config, sink, stats)
 
 
 def _reject_if_circuit_open(
@@ -1709,6 +2074,7 @@ async def _run_batch_serial_fast_path(
     breaker: CircuitBreaker,
     output_dir: str,
     managed: bool,
+    slots_dir: str | None,
     _worker: _WorkerFn | None,
     stats: TokenStats,
     now: Callable[[], float],
@@ -1728,7 +2094,11 @@ async def _run_batch_serial_fast_path(
 
     The circuit breaker (R14b) and R27 managed-`output_dir` cleanup still apply in
     full — neither is fan-out-specific; only the concurrency-coordination machinery
-    (Scheduler/proxy/indexed sinks) is skipped.
+    (Scheduler/proxy/indexed sinks) is skipped. The cross-process slot (R21c) is NOT
+    skipped: even this single-delegation path acquires and releases exactly one global
+    slot via `_call_real_worker`/`_run_one_delegation_slotted`, so `max_parallel_agents`
+    stays a GLOBAL cap even at `max_parallel_agents == 1` — see the CRITICAL rationale
+    on `run_batch` for why the single-orchestrator invariant alone cannot be relied on.
 
     Args:
         job: The batch's sole `_Job`.
@@ -1737,6 +2107,8 @@ async def _run_batch_serial_fast_path(
             default, same as the general path).
         output_dir: The run dir for the plain `{cap}.stderr.log`.
         managed: Whether `output_dir` is removed on an interrupt (R27).
+        slots_dir: The per-project `.ollama-slots` dir (R21c), or `None` for an
+            unmanaged run — forwarded to `_call_real_worker`.
         _worker: Test-only seam, same contract as `run_batch`'s.
         stats: The batch-scoped `TokenStats` (R12) to fold this delegation's tokens
             into; written to `token_stats.json` on success via the best-effort
@@ -1746,8 +2118,8 @@ async def _run_batch_serial_fast_path(
 
     Returns:
         A single-element list: a `DelegationResult`, a `DelegationError` (open
-        circuit), or the caught exception — never a raise for anything short of a
-        genuine whole-batch interrupt.
+        circuit, or no free cross-process slot, R21c), or the caught exception —
+        never a raise for anything short of a genuine whole-batch interrupt.
 
     Raises:
         BaseException: a genuine interrupt (`KeyboardInterrupt`/`SystemExit`) — the
@@ -1778,7 +2150,7 @@ async def _run_batch_serial_fast_path(
         async def _call_worker() -> DelegationResult:
             if _worker is not None:
                 return await _worker(job.cap, job.model, sink)
-            return await asyncio.to_thread(_run_one_delegation, job, config, sink, stats)
+            return await _call_real_worker(job, config, sink, slots_dir=slots_dir, stats=stats)
 
         try:
             outcome = await _execute_delegation(
@@ -1922,6 +2294,30 @@ async def run_batch(
     stats = TokenStats()
     loop = asyncio.get_running_loop()
 
+    # R21c: the cross-process slot dir is a SIBLING of this run's own unique
+    # `ollama-run-*` output_dir (never inside it), so it is shared by every concurrent
+    # process of the SAME project -- making `config.max_parallel_agents` a GLOBAL cap,
+    # not merely a per-process one (the in-process `Scheduler` semaphore below only
+    # bounds THIS process). Computed ONCE here, unconditionally on `managed` (NOT on
+    # `config.max_parallel_agents > 1`): the global cap must hold at
+    # `max_parallel_agents == 1` too -- a second overlapping process each running its
+    # own single serial delegation would otherwise each acquire their own in-process
+    # semaphore of 1 and run concurrently, defeating the "1" cap globally. Threaded into
+    # BOTH concurrency shapes below (the serial fast path and the general fan-out path's
+    # `_one()`). `None` only for an UNMANAGED run (`--output-dir`, R15/R28) -- the caller
+    # opted out of every collision protection this runtime offers, cross-process slots
+    # included, and is responsible for not sharing that directory between concurrent
+    # delegations. Also `None` when `config.disable_fs_locks` is True (MS7 Task 8, the
+    # operator kill-switch): every delegation then routes through the plain, unslotted
+    # `_run_one_delegation` (the SAME code path already used for an unmanaged run) --
+    # no `.ollama-slots/` dir is ever created, and the global cap (R21c) falls back to
+    # the in-process `Scheduler` semaphore + the single-orchestrator invariant.
+    slots_dir = (
+        os.path.join(os.path.dirname(os.path.realpath(output_dir)), SLOTS_DIRNAME)
+        if managed and not config.disable_fs_locks
+        else None
+    )
+
     def _now() -> float:
         # `loop.time()` is the breaker's OWN monotonic clock domain. It is only ever
         # compared against breaker-internal values recorded with this SAME callable
@@ -1947,6 +2343,7 @@ async def run_batch(
             breaker=breaker,
             output_dir=output_dir,
             managed=managed,
+            slots_dir=slots_dir,
             _worker=_worker,
             stats=stats,
             now=_now,
@@ -2005,14 +2402,15 @@ async def run_batch(
             async def _call_worker() -> DelegationResult:
                 if _worker is not None:
                     return await _worker(job.cap, job.model, sink)
-                # `asyncio.to_thread` — NOT a bare `loop.run_in_executor(executor,
-                # ...)` — copies the calling context, so the
-                # `capture_stderr_for_delegation()` ContextVar this `with` block just
-                # set is still visible from INSIDE the worker thread. It dispatches
-                # onto the loop's DEFAULT executor, sized above by
-                # `_ensure_sized_default_executor` so it is never capped below
-                # `max_parallel_agents`.
-                return await asyncio.to_thread(_run_one_delegation, job, config, sink, stats)
+                # `_call_real_worker` dispatches via `asyncio.to_thread` — NOT a bare
+                # `loop.run_in_executor(executor, ...)` — which copies the calling
+                # context, so the `capture_stderr_for_delegation()` ContextVar this
+                # `with` block just set is still visible from INSIDE the worker
+                # thread. It dispatches onto the loop's DEFAULT executor, sized above
+                # by `_ensure_sized_default_executor` so it is never capped below
+                # `max_parallel_agents`, and threads this delegation through the
+                # cross-process slot wrapper (R21c) whenever `slots_dir` is set.
+                return await _call_real_worker(job, config, sink, slots_dir=slots_dir, stats=stats)
 
             return await _execute_delegation(
                 job.model,
