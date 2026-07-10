@@ -27,9 +27,14 @@ def test_transcribe_errors_actionably_when_endpoint_has_no_audio(tmp_path):
     audio = tmp_path / "a.wav"
     audio.write_bytes(_WAV)
     with pytest.raises(OllamaBackendError) as exc:
-        transcribe(_cfg(), str(audio), "gemma4:cloud", 60,
-                   probe=lambda url: False,               # no /audio/transcriptions
-                   multimodal_audio=lambda model: False)  # model not audio-multimodal
+        transcribe(
+            _cfg(),
+            str(audio),
+            "gemma4:cloud",
+            60,
+            probe=lambda url: False,  # no /audio/transcriptions
+            multimodal_audio=lambda model: False,
+        )  # model not audio-multimodal
     assert "experimental" in str(exc.value).lower()
     assert "audio" in str(exc.value).lower()
 
@@ -45,12 +50,13 @@ def test_transcribe_via_audio_endpoint_returns_the_transcript(tmp_path):
         posted["timeout"] = timeout
         return io.BytesIO(json.dumps({"text": "hello world"}).encode("utf-8"))
 
-    res = transcribe(_cfg(), str(audio), "whisper-1", 60,
-                     probe=lambda url: True, urlopen=_fake_urlopen)
+    res = transcribe(
+        _cfg(), str(audio), "whisper-1", 60, probe=lambda url: True, urlopen=_fake_urlopen
+    )
     assert res.content == "hello world"
     assert posted["url"].endswith("/audio/transcriptions")
-    assert posted["ctype"].startswith("multipart/form-data")   # multipart upload
-    assert posted["timeout"] == 60          # the DELEGATION timeout, not a hardcoded 60
+    assert posted["ctype"].startswith("multipart/form-data")  # multipart upload
+    assert posted["timeout"] == 60  # the DELEGATION timeout, not a hardcoded 60
 
 
 def test_transcribe_via_audio_endpoint_forwards_a_non_default_timeout(tmp_path):
@@ -64,8 +70,7 @@ def test_transcribe_via_audio_endpoint_forwards_a_non_default_timeout(tmp_path):
         posted["timeout"] = timeout
         return io.BytesIO(json.dumps({"text": "ok"}).encode("utf-8"))
 
-    transcribe(_cfg(), str(audio), "whisper-1", 137,
-              probe=lambda url: True, urlopen=_fake_urlopen)
+    transcribe(_cfg(), str(audio), "whisper-1", 137, probe=lambda url: True, urlopen=_fake_urlopen)
     assert posted["timeout"] == 137
 
 
@@ -77,12 +82,14 @@ def test_via_audio_endpoint_wraps_http_error_as_a_domain_exception(tmp_path):
     audio.write_bytes(_WAV)
 
     def _fake_urlopen(req, timeout=None):
-        raise urllib.error.HTTPError(req.full_url, 500, "Internal Server Error",
-                                     hdrs=None, fp=io.BytesIO(b"boom"))
+        raise urllib.error.HTTPError(
+            req.full_url, 500, "Internal Server Error", hdrs=None, fp=io.BytesIO(b"boom")
+        )
 
     with pytest.raises(OllamaBackendError):
-        transcribe(_cfg(), str(audio), "whisper-1", 60,
-                  probe=lambda url: True, urlopen=_fake_urlopen)
+        transcribe(
+            _cfg(), str(audio), "whisper-1", 60, probe=lambda url: True, urlopen=_fake_urlopen
+        )
 
 
 def test_via_audio_endpoint_wraps_url_error_as_a_domain_exception(tmp_path):
@@ -93,8 +100,9 @@ def test_via_audio_endpoint_wraps_url_error_as_a_domain_exception(tmp_path):
         raise urllib.error.URLError("connection refused")
 
     with pytest.raises(OllamaBackendError):
-        transcribe(_cfg(), str(audio), "whisper-1", 60,
-                  probe=lambda url: True, urlopen=_fake_urlopen)
+        transcribe(
+            _cfg(), str(audio), "whisper-1", 60, probe=lambda url: True, urlopen=_fake_urlopen
+        )
 
 
 def test_via_audio_endpoint_wraps_malformed_json_as_a_domain_exception(tmp_path):
@@ -105,8 +113,9 @@ def test_via_audio_endpoint_wraps_malformed_json_as_a_domain_exception(tmp_path)
         return io.BytesIO(b"this is not json {")
 
     with pytest.raises(OllamaBackendError):
-        transcribe(_cfg(), str(audio), "whisper-1", 60,
-                  probe=lambda url: True, urlopen=_fake_urlopen)
+        transcribe(
+            _cfg(), str(audio), "whisper-1", 60, probe=lambda url: True, urlopen=_fake_urlopen
+        )
 
 
 def test_default_probe_receives_a_timeout_bounded_by_probe_timeout_seconds(tmp_path):
@@ -115,18 +124,31 @@ def test_default_probe_receives_a_timeout_bounded_by_probe_timeout_seconds(tmp_p
     # (`min(timeout, PROBE_TIMEOUT_SECONDS)`) and forwards it — plus the injected
     # `urlopen` — to the default probe, so a slow/hanging probe can never outlast this
     # bound regardless of how large the delegation `timeout` is.
+    #
+    # DEVIATION from the plan's literal test body (documented, see task report): the
+    # plan's version recorded the timeout in a single `seen["timeout"]` dict key. With no
+    # `probe=` override AND the default probe succeeding (no exception raised), `transcribe`
+    # makes a SECOND `urlopen` call for the real `/audio/transcriptions` POST (using the
+    # full delegation timeout, 600 — required/asserted by
+    # `test_transcribe_via_audio_endpoint_returns_the_transcript` et al.) — that second
+    # call would overwrite a single shared dict key, making the original assertion
+    # (`== PROBE_TIMEOUT_SECONDS`) unsatisfiable by ANY correct implementation. Recording
+    # every call's timeout in a list and asserting on the FIRST entry (the probe's own
+    # GET) preserves the test's actual intent — the probe is bounded independently of the
+    # delegation timeout — without depending on whether a second call happens afterward.
     from transcribe import PROBE_TIMEOUT_SECONDS
+
     audio = tmp_path / "a.wav"
     audio.write_bytes(_WAV)
-    seen = {}
+    seen_timeouts: list[int | None] = []
 
     def _fake_urlopen(req, timeout=None):
-        seen["timeout"] = timeout
+        seen_timeouts.append(timeout)
         return io.BytesIO(json.dumps({"text": "ok"}).encode("utf-8"))
 
     # No `probe=` override: exercises the real `_default_probe` default-resolution path.
     transcribe(_cfg(), str(audio), "whisper-1", 600, urlopen=_fake_urlopen)
-    assert seen["timeout"] == PROBE_TIMEOUT_SECONDS == min(600, PROBE_TIMEOUT_SECONDS)
+    assert seen_timeouts[0] == PROBE_TIMEOUT_SECONDS == min(600, PROBE_TIMEOUT_SECONDS)
 
 
 def test_transcribe_transport_endpoint_forces_the_endpoint_transport_and_skips_the_probe(
@@ -143,10 +165,17 @@ def test_transcribe_transport_endpoint_forces_the_endpoint_transport_and_skips_t
     def _fake_urlopen(req, timeout=None):
         return io.BytesIO(json.dumps({"text": "forced endpoint"}).encode("utf-8"))
 
-    res = transcribe(_cfg(), str(audio), "whisper-1", 60, transport="endpoint",
-                     probe=_probe, urlopen=_fake_urlopen)
+    res = transcribe(
+        _cfg(),
+        str(audio),
+        "whisper-1",
+        60,
+        transport="endpoint",
+        probe=_probe,
+        urlopen=_fake_urlopen,
+    )
     assert res.content == "forced endpoint"
-    assert probed["called"] is False        # "endpoint" bypasses the probe entirely
+    assert probed["called"] is False  # "endpoint" bypasses the probe entirely
 
 
 def test_transcribe_transport_chat_forces_the_chat_transport_and_skips_the_probe(tmp_path):
@@ -156,18 +185,28 @@ def test_transcribe_transport_chat_forces_the_chat_transport_and_skips_the_probe
 
     def _probe(url):
         probed["called"] = True
-        return False                        # would otherwise fall through to the gate
+        return False  # would otherwise fall through to the gate
 
-    def _fake_stream_run(config, system_prompt, prompt, model, timeout, *, sink,
-                         content_parts=None, **_kw):
+    def _fake_stream_run(
+        config, system_prompt, prompt, model, timeout, *, sink, content_parts=None, **_kw
+    ):
         assert content_parts is not None
         from backend import DelegationResult
+
         return DelegationResult("forced chat", 3, 2, False, 0.1)
 
-    res = transcribe(_cfg(), str(audio), "gemma4:cloud", 60, transport="chat",
-                     probe=_probe, stream_fn=_fake_stream_run, sink=lambda _s: None)
+    res = transcribe(
+        _cfg(),
+        str(audio),
+        "gemma4:cloud",
+        60,
+        transport="chat",
+        probe=_probe,
+        stream_fn=_fake_stream_run,
+        sink=lambda _s: None,
+    )
     assert res.content == "forced chat"
-    assert probed["called"] is False        # "chat" bypasses the probe entirely
+    assert probed["called"] is False  # "chat" bypasses the probe entirely
 
 
 def test_transcribe_transport_defaults_to_the_resolved_config_value(tmp_path):
@@ -184,8 +223,7 @@ def test_transcribe_transport_defaults_to_the_resolved_config_value(tmp_path):
     def _fake_urlopen(req, timeout=None):
         return io.BytesIO(json.dumps({"text": "auto"}).encode("utf-8"))
 
-    res = transcribe(_cfg(), str(audio), "whisper-1", 60, probe=_probe,
-                     urlopen=_fake_urlopen)
+    res = transcribe(_cfg(), str(audio), "whisper-1", 60, probe=_probe, urlopen=_fake_urlopen)
     assert res.content == "auto" and probed["called"] is True
 
 
@@ -193,16 +231,24 @@ def test_transcribe_via_audio_multimodal_chat_returns_the_transcript(tmp_path):
     audio = tmp_path / "a.wav"
     audio.write_bytes(_WAV)
 
-    def _fake_stream_run(config, system_prompt, prompt, model, timeout, *, sink,
-                         content_parts=None, **_kw):
-        assert content_parts is not None                # audio sent as a content-part
+    def _fake_stream_run(
+        config, system_prompt, prompt, model, timeout, *, sink, content_parts=None, **_kw
+    ):
+        assert content_parts is not None  # audio sent as a content-part
         from backend import DelegationResult
+
         return DelegationResult("spoken text", 3, 2, False, 0.2)
 
-    res = transcribe(_cfg(), str(audio), "gemma4:cloud", 60,
-                     probe=lambda url: False,            # no dedicated endpoint
-                     multimodal_audio=lambda model: True,  # but the model accepts audio
-                     stream_fn=_fake_stream_run, sink=lambda _s: None)
+    res = transcribe(
+        _cfg(),
+        str(audio),
+        "gemma4:cloud",
+        60,
+        probe=lambda url: False,  # no dedicated endpoint
+        multimodal_audio=lambda model: True,  # but the model accepts audio
+        stream_fn=_fake_stream_run,
+        sink=lambda _s: None,
+    )
     assert res.content == "spoken text"
 
 
@@ -214,22 +260,32 @@ def test_transcribe_via_audio_chat_forwards_the_caller_system_prompt(tmp_path):
     audio.write_bytes(_WAV)
     seen = {}
 
-    def _fake_stream_run(config, system_prompt, prompt, model, timeout, *, sink,
-                         content_parts=None, **_kw):
+    def _fake_stream_run(
+        config, system_prompt, prompt, model, timeout, *, sink, content_parts=None, **_kw
+    ):
         seen["system_prompt"] = system_prompt
         from backend import DelegationResult
+
         return DelegationResult("ok", 1, 1, False, 0.1)
 
     custom_prompt = "Custom domain-specific transcription instructions."
-    transcribe(_cfg(), str(audio), "gemma4:cloud", 60,
-              probe=lambda url: False, multimodal_audio=lambda model: True,
-              stream_fn=_fake_stream_run, sink=lambda _s: None,
-              system_prompt=custom_prompt)
+    transcribe(
+        _cfg(),
+        str(audio),
+        "gemma4:cloud",
+        60,
+        probe=lambda url: False,
+        multimodal_audio=lambda model: True,
+        stream_fn=_fake_stream_run,
+        sink=lambda _s: None,
+        system_prompt=custom_prompt,
+    )
     assert seen["system_prompt"] == custom_prompt
 
 
 def test_transcribe_rejects_a_non_audio_file(tmp_path):
     from errors import ValidationError
+
     bad = tmp_path / "a.wav"
     bad.write_bytes(b"not audio at all")
     with pytest.raises(ValidationError):
@@ -248,8 +304,12 @@ def test_multipart_body_round_trips_through_a_stdlib_multipart_parser():
     from transcribe import _multipart_body
 
     body, content_type = _multipart_body(
-        {"model": "whisper-1"}, file_field="file", filename="a.wav",
-        file_bytes=_WAV, mime="audio/wav")
+        {"model": "whisper-1"},
+        file_field="file",
+        filename="a.wav",
+        file_bytes=_WAV,
+        mime="audio/wav",
+    )
     # email.message_from_bytes needs a Content-Type header to locate the boundary.
     header = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("ascii")
     msg = email.message_from_bytes(header + body, policy=policy.compat32)
@@ -259,7 +319,7 @@ def test_multipart_body_round_trips_through_a_stdlib_multipart_parser():
     file_part = fields["file"]
     assert file_part.get_filename() == "a.wav"
     assert file_part.get_content_type() == "audio/wav"
-    assert file_part.get_payload(decode=True) == _WAV     # exact bytes survive round-trip
+    assert file_part.get_payload(decode=True) == _WAV  # exact bytes survive round-trip
 
 
 def test_multipart_body_escapes_a_filename_with_quotes_backslashes_and_a_newline():
@@ -275,12 +335,24 @@ def test_multipart_body_escapes_a_filename_with_quotes_backslashes_and_a_newline
 
     hostile_filename = 'evil"\\name\r\nX-Injected: pwned.wav'
     body, content_type = _multipart_body(
-        {"model": "whisper-1"}, file_field="file", filename=hostile_filename,
-        file_bytes=_WAV, mime="audio/wav")
+        {"model": "whisper-1"},
+        file_field="file",
+        filename=hostile_filename,
+        file_bytes=_WAV,
+        mime="audio/wav",
+    )
 
-    # No raw CR/LF from the filename survives inside the body — a newline is exactly what
-    # would let the filename smuggle a new header line or multipart boundary.
-    assert b"X-Injected" not in body
+    # DEVIATION from the plan's literal `assert b"X-Injected" not in body` (documented,
+    # see task report): per `_escape_multipart_filename`'s own docstring, CR/LF are
+    # REMOVED (not the whole tail truncated), so the harmless LITERAL text
+    # "X-Injected: pwned.wav" still appears, concatenated onto the escaped filename value
+    # — it is no longer preceded by a CRLF, so it can never start a new header line. The
+    # actual security invariant is that it can NEVER be interpreted as a real header/part
+    # (checked below via the real stdlib parser), not that the substring is textually
+    # absent. No raw CR/LF survives anywhere in the body — that is exactly what would let
+    # the filename smuggle a new header line or multipart boundary.
+    assert b"\r\n\r\nX-Injected" not in body
+    assert b"X-Injected: pwned.wav\r\n" not in body
 
     # The body still parses as a well-formed multipart message with exactly one file part
     # (a broken/injected header would either fail to parse or produce extra parts).
@@ -288,12 +360,13 @@ def test_multipart_body_escapes_a_filename_with_quotes_backslashes_and_a_newline
     msg = email.message_from_bytes(header + body, policy=policy.compat32)
     assert msg.is_multipart()
     payload = msg.get_payload()
-    assert len(payload) == 2                              # exactly "model" + "file", no extras
+    assert len(payload) == 2  # exactly "model" + "file", no extras
     fields = {p.get_param("name", header="Content-Disposition"): p for p in payload}
     file_part = fields["file"]
-    assert file_part.get_payload(decode=True) == _WAV     # file content is untouched
+    assert file_part.get_payload(decode=True) == _WAV  # file content is untouched
+    assert file_part.get("X-Injected") is None  # never became a real MIME header
     # The quote/backslash were escaped (not dropped) and the newline was stripped — the
     # parsed filename reflects that escaping, never the raw hostile string verbatim.
     recovered = file_part.get_filename()
     assert "\r" not in recovered and "\n" not in recovered
-    assert recovered != hostile_filename                  # never passed through unescaped
+    assert recovered != hostile_filename  # never passed through unescaped

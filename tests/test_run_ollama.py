@@ -250,24 +250,26 @@ def test_dispatch_object_mode_sends_generic_json_envelope():
     assert be.calls[0]["response_format"] == {"type": "json_object"}
 
 
-def test_dispatch_rejects_transcribe_in_ms7_task4():
-    # `transcribe`'s audio transport lands in M7 Task 5; until then, dispatching it must
-    # fail actionably with DelegationError, not send a binary as garbled chat text.
-    # `vision` gained its real image_url transport in M7 Task 4 and is no longer guarded.
-    from errors import DelegationError
-
+def test_dispatch_treats_transcribe_as_an_ordinary_text_capability_after_ms7_task5():
+    # M7 Task 5 empties `_MS1_UNSUPPORTED_CAPS` (transcribe now has a real, gated audio
+    # transport: `transcribe.transcribe`). `dispatch` itself is a TEXT-only pipeline —
+    # it does not route "transcribe" to that new module (the module is invoked
+    # directly by a caller that has a binary audio path, not through this text-prompt
+    # `dispatch`) — so the MS1-era guard is gone and the capability now behaves like any
+    # other free-text capability (`structured.transcribe` defaults to "off"). `vision`
+    # gained its real image_url transport in M7 Task 4 and is no longer guarded either.
     be = _FakeBackend(["unused"])
-    with pytest.raises(DelegationError):
-        run_ollama.dispatch(
-            "transcribe",
-            "audio",
-            backend=be,
-            model="m",
-            timeout=10,
-            system_prompt="sys",
-            config=_CFG,
-        )
-    assert be.calls == []  # backend never invoked
+    out = run_ollama.dispatch(
+        "transcribe",
+        "audio",
+        backend=be,
+        model="m",
+        timeout=10,
+        system_prompt="sys",
+        config=_CFG,
+    )
+    assert out.content == "unused"
+    assert len(be.calls) == 1  # backend IS invoked now — no more MS1 guard
 
 
 def test_dispatch_structured_schema_without_a_schema_fails_loud():
@@ -695,28 +697,28 @@ def test_output_dir_writes_raw_artifact(tmp_path, monkeypatch):
     assert raw["content"] == "hi there"
 
 
-def test_main_rejects_transcribe_as_actionable_nonzero_not_a_traceback(monkeypatch, capsys):
-    # `dispatch` raises DelegationError for the `transcribe` audio-transport guard (lands
-    # in M7 Task 5). `main` must catch it — never an uncaught traceback — and the backend
-    # must NEVER be invoked (the guard fires before any backend.run call). `vision` gained
-    # its real transport in M7 Task 4 and is no longer guarded (see the `stream_vision`
-    # coverage in test_ollama_vision.py instead).
-    class _BackendMustNotBeCalled:
-        def run(self, *args, **kwargs):
-            raise AssertionError(
-                "backend.run must not be invoked for an MS1-unsupported capability"
-            )
-
-    cfg = _cfg_with_structured()
+def test_main_treats_transcribe_as_an_ordinary_text_capability_after_ms7_task5(
+    monkeypatch, capsys, tmp_path
+):
+    # M7 Task 5 empties `_MS1_UNSUPPORTED_CAPS` (transcribe now has a real, gated audio
+    # transport: `transcribe.transcribe`). `main`'s CLI pipeline is still TEXT-only — it
+    # does not route "transcribe" to that new module — so the previous MS1-era guard
+    # (DelegationError before any backend call) is gone, and the capability now succeeds
+    # like any other free-text capability through the stubbed `_FakeBackend`. `[stream]`
+    # is forced False (mirrors `_cfg_no_stream`, MS4 Task 4): "transcribe" defaults to
+    # `stream=True`, which would otherwise route this delegation to the REAL
+    # `ollama_stream.stream_run` (an actual network call) instead of the stubbed backend.
+    cfg = _cfg_no_stream("transcribe")
     monkeypatch.setattr(run_ollama, "resolve_config", lambda **kw: cfg)
     # **kw absorbs preflight's capability=/effective_model= kwargs (R10/R28 fix) — the
     # stub only needs to no-op regardless of what run_delegation now threads through.
     monkeypatch.setattr(run_ollama, "preflight", lambda cfg, **kw: None)
     monkeypatch.setattr(run_ollama, "load_system_prompt", lambda cap: "sys")
-    monkeypatch.setattr(run_ollama, "_make_backend", lambda cfg: _BackendMustNotBeCalled())
-    rc = run_ollama.main(["transcribe", "audio.wav", "--no-status"])
-    assert rc != 0
-    assert "delegation failed" in capsys.readouterr().err.lower()
+    monkeypatch.setattr(run_ollama, "_make_backend", lambda cfg: _FakeBackend(["a transcript"]))
+    rc = run_ollama.main(["transcribe", "audio.wav", "--no-status", "--output-dir", str(tmp_path)])
+    assert rc == 0
+    raw = json.loads((tmp_path / "transcribe.raw.json").read_text(encoding="utf-8"))
+    assert raw["content"] == "a transcript"
 
 
 def test_main_handles_missing_agent_prompt_as_actionable_nonzero_not_a_traceback(

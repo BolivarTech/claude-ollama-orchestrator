@@ -406,11 +406,13 @@ def make_file_sink(path: str) -> "_FileSink":
         raise
 
 
-# Capabilities whose transport is not in MS1 (multimodal/audio → M7). Guarded in
-# ``dispatch`` so a binary input is never sent as garbled chat text. `vision` gained its
-# real transport in MS7 Task 4 (`ollama_vision.stream_vision`); `transcribe` is removed
-# in Task 5.
-_MS1_UNSUPPORTED_CAPS = frozenset({"transcribe"})
+# Capabilities whose transport was not in MS1 (multimodal/audio → M7). `vision` gained
+# its real transport in MS7 Task 4 (`ollama_vision.stream_vision`); `transcribe` gained
+# its real, gated transport in MS7 Task 5 (`transcribe.transcribe`). Both multimodal
+# capabilities now have real transports, so this guard is empty -- kept as a named,
+# documented set (rather than removed outright) so a FUTURE capability lacking a wired
+# transport has an established, tested mechanism to opt out of `dispatch` again.
+_MS1_UNSUPPORTED_CAPS: frozenset[str] = frozenset()  # was {"transcribe"} after Task 4; now empty
 
 
 def _capability_streams_to_stdout(config: OllamaAgentsConfig, capability: str) -> bool:

@@ -12,7 +12,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
-from errors import OllamaConfigError
+from errors import OllamaConfigError, ValidationError
 
 DEFAULT_BASE_URL = "http://localhost:11434/v1"
 # Default semaphore size for concurrent delegations (R21) -- default plan tier is Ollama
@@ -116,6 +116,11 @@ DEFAULT_STREAM: Mapping[str, bool] = MappingProxyType(
     {c: (c not in ("reviewer", "tester")) for c in CAPABILITIES}
 )
 _STRUCTURED_VALUES = frozenset({"schema", "object", "off"})
+# R2 transcribe: the transport to use for the experimental/gated `transcribe` capability
+# (see `transcribe.py`). "auto" probes the endpoint then falls back to audio-multimodal
+# chat then a gated error; "endpoint"/"chat" force that transport and skip the probe.
+_VALID_TRANSCRIBE_TRANSPORTS = frozenset({"auto", "endpoint", "chat"})
+_DEFAULT_TRANSCRIBE_TRANSPORT = "auto"
 
 
 @dataclass(frozen=True)
@@ -134,6 +139,10 @@ class OllamaAgentsConfig:
     # (which predate this field and pass only the original seven fields) keeps compiling
     # unchanged, per standard dataclass trailing-default-field rules.
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
+    # R2 transcribe: another trailing field WITH a default, for the same reason -- every
+    # pre-existing OllamaAgentsConfig(...) construction site predating this field keeps
+    # compiling unchanged.
+    transcribe_transport: str = _DEFAULT_TRANSCRIBE_TRANSPORT
 
 
 def _load_toml(path: str | None) -> dict[str, Any]:
@@ -290,6 +299,36 @@ def _coerce_bool(value: Any, ctx: str) -> bool:
     raise OllamaConfigError(f"{ctx} must be a boolean (true/false), got {value!r}")
 
 
+def _resolve_transcribe_transport(
+    env: Mapping[str, str], repo: dict[str, Any], global_: dict[str, Any]
+) -> str:
+    """Resolve ``transcribe_transport`` (R2 transcribe): env > repo > global > default.
+
+    Args:
+        env: The environment mapping (``OLLAMA_AGENTS_TRANSCRIBE_TRANSPORT``).
+        repo: The parsed repo TOML (top-level ``transcribe_transport`` key).
+        global_: The parsed global TOML (same key).
+
+    Returns:
+        One of ``"auto"``, ``"endpoint"``, ``"chat"``.
+
+    Raises:
+        ValidationError: the resolved value is not one of the three valid strings.
+    """
+    value = (
+        env.get("OLLAMA_AGENTS_TRANSCRIBE_TRANSPORT")
+        or repo.get("transcribe_transport")
+        or global_.get("transcribe_transport")
+        or _DEFAULT_TRANSCRIBE_TRANSPORT
+    )
+    if value not in _VALID_TRANSCRIBE_TRANSPORTS:
+        raise ValidationError(
+            f"invalid transcribe_transport: {value!r} "
+            f"(must be one of {sorted(_VALID_TRANSCRIBE_TRANSPORTS)})"
+        )
+    return str(value)
+
+
 def resolve_config(
     *, global_path: str | None, repo_path: str | None, env: Mapping[str, str]
 ) -> OllamaAgentsConfig:
@@ -438,4 +477,5 @@ def resolve_config(
             DEFAULT_MAX_OUTPUT_BYTES,
             1,
         ),
+        transcribe_transport=_resolve_transcribe_transport(env, repo, glob),
     )

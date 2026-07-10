@@ -348,8 +348,9 @@ def test_max_parallel_agents_also_rejects_bool_now(tmp_path):
 
 @pytest.mark.parametrize("value", ["auto", "endpoint", "chat"])
 def test_transcribe_transport_accepts_each_valid_value(value):
-    cfg = resolve_config(global_path=None, repo_path=None,
-                         env={"OLLAMA_AGENTS_TRANSCRIBE_TRANSPORT": value})
+    cfg = resolve_config(
+        global_path=None, repo_path=None, env={"OLLAMA_AGENTS_TRANSCRIBE_TRANSPORT": value}
+    )
     assert cfg.transcribe_transport == value
 
 
@@ -360,13 +361,19 @@ def test_transcribe_transport_defaults_to_auto_when_unset():
 
 def test_transcribe_transport_invalid_value_raises_validation_error():
     with pytest.raises(ValidationError):
-        resolve_config(global_path=None, repo_path=None,
-                       env={"OLLAMA_AGENTS_TRANSCRIBE_TRANSPORT": "carrier-pigeon"})
+        resolve_config(
+            global_path=None,
+            repo_path=None,
+            env={"OLLAMA_AGENTS_TRANSCRIBE_TRANSPORT": "carrier-pigeon"},
+        )
 
 
 def test_transcribe_transport_env_overrides_repo_toml(tmp_path):
     repo = tmp_path / "ollama-agents.toml"
     repo.write_text('transcribe_transport = "chat"\n', encoding="utf-8")
-    cfg = resolve_config(global_path=None, repo_path=str(repo),
-                         env={"OLLAMA_AGENTS_TRANSCRIBE_TRANSPORT": "endpoint"})
-    assert cfg.transcribe_transport == "endpoint"    # env wins over repo (R6 precedence)
+    cfg = resolve_config(
+        global_path=None,
+        repo_path=str(repo),
+        env={"OLLAMA_AGENTS_TRANSCRIBE_TRANSPORT": "endpoint"},
+    )
+    assert cfg.transcribe_transport == "endpoint"  # env wins over repo (R6 precedence)
