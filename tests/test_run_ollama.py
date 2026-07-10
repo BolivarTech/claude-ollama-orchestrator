@@ -165,6 +165,38 @@ def _cfg_with_structured(**overrides):
     return replace(_CFG, structured=MappingProxyType({**_CFG.structured, **overrides}))
 
 
+def _cfg_no_stream(capability, **structured_overrides):
+    """Real config (as `_cfg_with_structured`) with `[stream].<capability>` forced
+    False -- forces the MS1 transactional `backend.run` path (MS4 Task 4).
+
+    Several pre-MS4 `main()`-pipeline tests stub only `_make_backend` (a fake
+    ``AgentBackend``), never the MS4 streaming layer (`ollama_stream.stream_run`).
+    Most capabilities (e.g. "coder") default to `[stream]=True`, so without this
+    override `dispatch`'s per-capability streaming choice (R7b/R7c) would route these
+    tests' delegation to the REAL `stream_run` -- hitting the actual network instead
+    of the stubbed backend. Forcing the tested capability's stream flag to False keeps
+    these tests on the transactional path they were always designed to exercise.
+    """
+    cfg = _cfg_with_structured(**structured_overrides)
+    return replace(cfg, stream=MappingProxyType({**cfg.stream, capability: False}))
+
+
+def _cfg_all_transactional(**structured_overrides):
+    """Real config (as `_cfg_with_structured`) with EVERY capability's `[stream]` flag
+    forced False -- forces the MS1 transactional `backend.run` path across the board
+    (MS4 Task 4).
+
+    Used by test helpers (`_wire`) whose tests stub only `_make_backend` (a fake
+    ``AgentBackend``) and never the MS4 streaming layer, and whose capability under
+    test varies -- most capabilities default to `[stream]=True` (everything except
+    "reviewer"/"tester"), which would otherwise route `dispatch` to the REAL
+    `ollama_stream.stream_run`/`ollama_vision.stream_vision` (an actual network call)
+    instead of the stubbed backend.
+    """
+    cfg = _cfg_with_structured(**structured_overrides)
+    return replace(cfg, stream=MappingProxyType(dict.fromkeys(cfg.stream, False)))
+
+
 def test_dispatch_free_text_returns_content_and_sends_no_schema():
     be = _FakeBackend(["def f(): pass"])
     out = run_ollama.dispatch(
@@ -515,9 +547,13 @@ def test_main_runs_full_pipeline_and_prints_output(capsys, monkeypatch, tmp_path
     # Isolate cwd: run_delegation writes token_stats.json to os.getcwd() (MS2 interim, no
     # --output-dir here) — chdir to tmp_path so the suite never touches the real repo root.
     monkeypatch.chdir(tmp_path)
-    # Use the REAL OllamaAgentsConfig (via _cfg_with_structured) — a hand-rolled stub with
-    # only `models` would AttributeError once dispatch reads `config.structured` (coder→"off").
-    cfg = _cfg_with_structured()
+    # Use the REAL OllamaAgentsConfig (via _cfg_no_stream) — a hand-rolled stub with only
+    # `models` would AttributeError once dispatch reads `config.structured` (coder→"off").
+    # `[stream].coder` is forced False (MS4 Task 4): this test stubs only `_make_backend`
+    # (the transactional AgentBackend), not the MS4 streaming layer, and "coder" defaults
+    # to `stream=True` — without the override, dispatch would route to the REAL
+    # `stream_run` instead of this test's fake backend.
+    cfg = _cfg_no_stream("coder")
     monkeypatch.setattr(run_ollama, "resolve_config", lambda **kw: cfg)
     # **kw absorbs preflight's capability=/effective_model= kwargs (R10/R28 fix) — the
     # stub only needs to no-op regardless of what run_delegation now threads through.
@@ -549,7 +585,10 @@ def test_main_model_override_reaches_backend(monkeypatch, tmp_path):
             seen["model"] = model
             return DelegationResult("ok", 0, 0, True, 0.0)
 
-    cfg = _cfg_with_structured()
+    # `[stream].coder` forced False (MS4 Task 4): this test stubs only `_make_backend`,
+    # not the MS4 streaming layer — "coder" defaults to `stream=True`, which would
+    # otherwise route dispatch to the REAL `stream_run` instead of `_CapBackend`.
+    cfg = _cfg_no_stream("coder")
     monkeypatch.setattr(run_ollama, "resolve_config", lambda **kw: cfg)
     # **kw absorbs preflight's capability=/effective_model= kwargs (R10/R28 fix) — the
     # stub only needs to no-op regardless of what run_delegation now threads through.
@@ -572,7 +611,11 @@ def test_main_threads_the_model_override_into_preflight_not_just_the_backend(mon
     def _preflight(cfg, **kw):
         seen_preflight.update(kw)
 
-    cfg = _cfg_with_structured()
+    # `[stream].coder` forced False (MS4 Task 4): only `_make_backend` is stubbed
+    # below, not the MS4 streaming layer -- "coder" defaults to `stream=True`, which
+    # would otherwise route dispatch to the REAL `stream_run` (an actual network call)
+    # instead of `_FakeBackend`.
+    cfg = _cfg_no_stream("coder")
     monkeypatch.setattr(run_ollama, "resolve_config", lambda **kw: cfg)
     monkeypatch.setattr(run_ollama, "preflight", _preflight)
     monkeypatch.setattr(run_ollama, "load_system_prompt", lambda cap: "sys")
@@ -635,7 +678,11 @@ def test_output_dir_writes_raw_artifact(tmp_path, monkeypatch):
     # {cap}.raw.json follows the canonical R18 artifact format (`_write_artifacts`, a JSON
     # envelope `{"content": ...}`) for BOTH a managed run dir and an explicit --output-dir —
     # the interim MS1/MS2 verbatim-text dump is superseded by that standardized format.
-    cfg = _cfg_with_structured()  # real config; coder→"off" free-text → content written verbatim
+    # real config; coder→"off" free-text → content written verbatim. `[stream].coder`
+    # forced False (MS4 Task 4): only `_make_backend` is stubbed below, not the MS4
+    # streaming layer -- "coder" defaults to `stream=True`, which would otherwise route
+    # dispatch to the REAL `stream_run` (an actual network call) instead of `_FakeBackend`.
+    cfg = _cfg_no_stream("coder")
     monkeypatch.setattr(run_ollama, "resolve_config", lambda **kw: cfg)
     # **kw absorbs preflight's capability=/effective_model= kwargs (R10/R28 fix) — the
     # stub only needs to no-op regardless of what run_delegation now threads through.
@@ -735,6 +782,12 @@ def _wire(monkeypatch, tmp_path, result, *, container=None):
     # names live in run_ollama's namespace — patch THERE (where they're looked up), not temp_dirs.
     monkeypatch.setattr(run_ollama, "resolve_project_root", lambda start=None: str(tmp_path))
     monkeypatch.setattr(run_ollama, "project_run_root", lambda root: container)
+    # MS4 Task 4: force EVERY capability's `[stream]` flag False so `dispatch` always
+    # takes the transactional path exercised by `_FakeBackend` below -- without this,
+    # a capability that defaults to `stream=True` (everything except reviewer/tester)
+    # would route to the REAL streaming layer (an actual network call) instead of this
+    # stub, since only `_make_backend`/preflight/`load_system_prompt` are faked here.
+    monkeypatch.setattr(run_ollama, "resolve_config", lambda **kw: _cfg_all_transactional())
 
     class _FakeBackend:
         def run(
@@ -1094,6 +1147,10 @@ def test_gettempdir_fallback_skips_cross_project_cleanup(tmp_path, monkeypatch):
     # SHARED gettempdir → cleanup must be skipped (never prune other projects' runs).
     monkeypatch.setattr(run_ollama, "resolve_project_root", lambda start=None: str(tmp_path))
     monkeypatch.setattr(run_ollama, "project_run_root", lambda root: tempfile.gettempdir())
+    # `[stream].coder` forced False (MS4 Task 4): only `_make_backend` is stubbed below,
+    # not the MS4 streaming layer -- "coder" defaults to `stream=True`, which would
+    # otherwise route dispatch to the REAL `stream_run` (an actual network call).
+    monkeypatch.setattr(run_ollama, "resolve_config", lambda **kw: _cfg_no_stream("coder"))
     calls = {"cleanup": 0}
     monkeypatch.setattr(
         run_ollama,
