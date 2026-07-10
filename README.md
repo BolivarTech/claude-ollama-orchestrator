@@ -5,7 +5,7 @@
 [![Ruff](https://img.shields.io/badge/linter-ruff-orange.svg)](https://docs.astral.sh/ruff/)
 [![Typecheck](https://img.shields.io/badge/mypy-strict-blue.svg)](https://mypy-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Status](https://img.shields.io/badge/status-spec%20phase-yellow.svg)](#project-status)
+[![Status](https://img.shields.io/badge/status-v0.0.7%20%E2%80%94%20all%207%20milestones-brightgreen.svg)](#project-status)
 
 A Claude Code plugin that lets Claude **orchestrate a set of Ollama subagents** and
 **delegate** concrete generation tasks to them — code, review, tests, explanation,
@@ -19,10 +19,13 @@ Edit/Write tools. The goal: **cut Anthropic token cost** and keep bulk generatio
 
 > [!IMPORTANT]
 > ### Project Status
-> **Early development (v0.0.6).** Built under the SBTDD workflow (Spec + Behavior +
-> Test-Driven Development). The authoritative description of *what* to build lives in
-> `sbtdd/`; the tree, tables, and commands below describe the **intended design**, and
-> production code lands milestone-by-milestone, test-first.
+> **v0.0.7 — feature-complete (all 7 milestones shipped).** Built under the SBTDD workflow
+> (Spec + Behavior + Test-Driven Development), milestone-by-milestone, test-first, each
+> milestone passing a 3-perspective MAGI review gate to `STRONG GO`. The full plugin —
+> transactional core, token accounting, temp/lock/status, visible streaming, bounded
+> concurrency, untrusted-I/O hardening, and the vision / transcribe / thinking capabilities
+> plus cross-process arbitration — is implemented with 573 passing tests, `mypy --strict`
+> clean, and a stdlib-only runtime.
 >
 > **Implemented so far:** the **transactional delegation core** — layered config, fail-fast
 > preflight, an OpenAI-compatible backend with structured output + downgrade-on-400, a
@@ -47,8 +50,14 @@ Edit/Write tools. The goal: **cut Anthropic token cost** and keep bulk generatio
 > **output cap** that can only tighten the absolute DoS floor, a bounded magic-byte-checked
 > **binary input guard** (vision/transcribe), Windows console UTF-8 hardening, config
 > world-readable + plaintext-key warnings, and a layered/bool-rejecting `max_output_bytes`.
-> The vision / transcribe / thinking capabilities (and cross-process arbitration) are the
-> remaining milestone.
+> The final milestone (MS7) completes the plugin: **`vision`** (image sent as an `image_url`
+> data-URI content-part, multimodal-gated, MIME from magic bytes), **`transcribe`**
+> (experimental, endpoint- or audio-chat-gated, RFC 5987 multipart filenames, header-injection
+> safe), and **`thinking`** (`<think>` recovery); **cross-process arbitration** — a project-level
+> stdout token and a `.ollama-slots/` counter over a shared, TOCTOU-safe ephemeral-lock
+> primitive (atomic `O_EXCL` steal/reclaim, live-holder-safe restore, self-healing, with a
+> `disable_fs_locks` kill-switch); and the optional **diff-grounded hallucination guard** (R30)
+> that grounds a model's `file:line` claims against a Claude-provided unified diff.
 
 ---
 
