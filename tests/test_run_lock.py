@@ -404,6 +404,45 @@ def test_read_lock_fields_clamps_negative_age_from_a_future_timestamp(tmp_path):
     assert bound == 60
 
 
+def test_acquire_ephemeral_never_deletes_a_stolen_live_lock_when_restore_fails(
+    tmp_path, monkeypatch
+):
+    """[CRITICAL] If restoring a stolen LIVE lock fails, `_acquire_ephemeral` must NOT delete
+    it -- destroying a live holder's lock is an eviction, the exact bug the atomic reclaim
+    exists to prevent. On restore failure the stolen copy is retried and, if it ultimately
+    cannot be restored, LEFT intact (self-heals), never removed."""
+    path = str(tmp_path / "eph.lock")
+    b_pid = 424242
+    _write_ephemeral(path, pid=999_999, bound=60)  # stale holder to reclaim
+    monkeypatch.setattr(run_lock, "is_pid_alive", lambda pid: pid == b_pid)
+    real_is_live = run_lock._lockfile_holder_is_live
+    calls = {"n": 0}
+
+    def _swap_live(p):
+        calls["n"] += 1
+        if calls["n"] == 1 and p == path:
+            _write_ephemeral(path, pid=b_pid, bound=60)  # competitor B swaps in a LIVE lock
+            return False
+        return real_is_live(p)
+
+    monkeypatch.setattr(run_lock, "_lockfile_holder_is_live", _swap_live)
+    real_replace = run_lock.os.replace
+    steal = f"{path}.reclaim.{os.getpid()}"
+
+    def _fail_only_restore(src, dst):
+        if src == steal:  # the restore direction (steal_path -> path) always fails
+            raise OSError("simulated restore failure")
+        return real_replace(src, dst)  # the steal direction (path -> steal_path) works
+
+    monkeypatch.setattr(run_lock.os, "replace", _fail_only_restore)
+    monkeypatch.setattr(run_lock.time, "sleep", lambda _s: None)  # don't actually wait
+    result = run_lock._acquire_ephemeral(path, bound=60)
+    assert result is False  # backed off; did not acquire
+    assert os.path.exists(steal)  # the stolen LIVE lock was NOT deleted on restore failure
+    pid, _age, _bound = run_lock._read_lock_fields(steal)
+    assert pid == b_pid  # B's live-lock content is preserved intact, never destroyed
+
+
 def test_acquire_ephemeral_writes_full_payload_even_on_a_short_os_write(tmp_path, monkeypatch):
     """os.write may perform a SHORT write (fewer bytes than requested); the lock payload must
     be written in FULL (looped) so the lockfile never lands with a truncated/torn payload that

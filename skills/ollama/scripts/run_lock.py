@@ -637,10 +637,22 @@ def _acquire_ephemeral(path: str, bound: int) -> bool:
             # fires on a stale lock left by a CRASHED prior process, then needs THREE
             # concurrent same-index reclaimers in overlapping microsecond windows -- a
             # pattern the single-orchestrator invariant does not produce.
-            try:
-                os.replace(steal_path, path)
-            except OSError:
-                _remove_quiet(steal_path)
+            #
+            # CRITICAL: on a restore failure we must NEVER delete the stolen live lock --
+            # deleting it evicts the live holder, the exact bug this reclaim exists to prevent.
+            # Retry the restore (a same-dir rename virtually always succeeds; transient Windows
+            # PermissionError under contention clears on retry). If it ultimately fails
+            # (extraordinarily rare), LEAVE the stolen copy in place: it is a bounded ephemeral
+            # lock that self-heals on the holder's own bound/liveness, whereas destroying it is
+            # an immediate, unbounded eviction.
+            for _restore_try in range(_RELEASE_RETRY_ATTEMPTS):
+                try:
+                    os.replace(steal_path, path)
+                    break
+                except OSError:
+                    if _restore_try < _RELEASE_RETRY_ATTEMPTS - 1:
+                        time.sleep(_RELEASE_RETRY_DELAY_SECONDS)
+                    # else: give up -- leave steal_path, NEVER delete a live lock
             return False
         # The stolen copy was genuinely stale -> discard it; `path` is now free. Create our
         # fresh lock atomically; if a competitor created one meanwhile, O_EXCL fails -> retry.
