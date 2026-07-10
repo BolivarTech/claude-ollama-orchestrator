@@ -17,15 +17,14 @@ use small hand-written diff fixtures (Task 1, Step 1); corpus/property tests aga
 renames, combined diffs) should be added once the module is actually implemented, to catch
 parser edge cases synthetic fixtures miss.
 
-Known parser limitation (accepted, documented, low-impact): the parser does not track a
-hunk's declared line COUNT, so an ADDED line whose own content starts with ``++ `` (the
-full line reads ``+++ ...``) or a REMOVED line whose content starts with ``-- ``
-(``--- ...``) is misread as a ``+++``/``---`` file-header, registering a phantom file. The
-effect is strictly a FALSE NEGATIVE — the guard may FAIL TO DROP a fabricated-file finding,
-never dropping a real one — and the guard is defense-in-depth over Claude's own review
-(diff-grounding is optional/scope-gated, R30). A fully robust fix tracks the
-``@@ -a,b +c,d @@`` counts to know exactly when a hunk body ends; deferred with the corpus
-tests above as it requires that hunk-length bookkeeping.
+The parser tracks each hunk's declared line COUNT from its ``@@ -a,b +c,d @@`` header
+(hunk-length bookkeeping), so it knows exactly when a hunk body ends. That means an ADDED
+line whose own content starts with ``++ `` (the full line reads ``+++ ...``) or a REMOVED
+line whose content starts with ``-- `` (``--- ...``) is correctly read as body content while
+inside the hunk, never misread as a ``+++``/``---`` file header -- file/binary/rename/hunk
+headers are only matched OUTSIDE a hunk body. (An earlier revision lacked this bookkeeping and
+could register a phantom file from such a line -- a false negative that let the guard miss a
+fabricated-file finding; that is now closed.)
 """
 
 from __future__ import annotations
@@ -33,14 +32,16 @@ from __future__ import annotations
 import re
 from typing import Any
 
-# A hunk header: `@@ -<old> +<newStart>[,<newCount>] @@[ <section heading>]`. Only the
-# new-file start is captured. **CRITICAL fix:** a REAL unified diff often carries trailing
-# context after the closing `@@` — e.g. `@@ -1,3 +10,4 @@ def foo():` (git's "funcname"
-# hint naming the enclosing function/section) — so the pattern must NOT require the line to
-# END at the closing `@@`; an optional ` <anything>` trailer is allowed via `(?: .*)?$`. The
-# earlier `$`-anchored-at-`@@` form silently rejected every hunk header carrying a section
-# heading, which meant the diff failed to ground at all for a large share of real-world diffs.
-_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@(?: .*)?$")
+# A hunk header: `@@ -<oldStart>[,<oldCount>] +<newStart>[,<newCount>] @@[ <section heading>]`.
+# All four numbers are captured (counts optional, defaulting to 1 for a single-line hunk):
+# group 1 = old start, 2 = old count, 3 = new start, 4 = new count. The old/new COUNTS drive
+# hunk-length bookkeeping in :func:`parse_diff` -- knowing exactly how many body lines a hunk
+# spans lets an added/removed line whose CONTENT starts with `++ `/`-- ` (diff line `+++ `/
+# `--- `) be read as body content, never confused with a `+++`/`---` file header. A REAL
+# unified diff often carries trailing context after the closing `@@` (git's "funcname" hint,
+# e.g. `@@ -1,3 +10,4 @@ def foo():`), so an optional ` <anything>` trailer is allowed via
+# `(?: .*)?$` rather than anchoring at the closing `@@`.
+_HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$")
 # The new-file path line `+++ b/<path>` (the `b/` prefix is git's; `diff -u` omits it).
 _PLUSFILE = re.compile(r"^\+\+\+ (?:b/)?(.+?)\s*$")
 # `Binary files a/<x> and b/<y> differ` — capture the new-side (b/) path.
@@ -74,8 +75,39 @@ def parse_diff(diff: str) -> tuple[set[str], dict[str, set[int]]]:
     ranges: dict[str, set[int]] = {}
     current: str | None = None
     line_no = 0
+    # Hunk-length bookkeeping: how many old-side / new-side lines the CURRENT hunk body still
+    # has, from its `@@ -a,b +c,d @@` header. While EITHER is positive we are inside the body,
+    # so a line is classified by its FIRST char (content), never as a file header -- that is
+    # what lets a `+++ `/`--- ` whose text merely starts with `++ `/`-- ` be read as an
+    # added/removed line instead of a phantom `+++`/`---` file header. Header matching (file,
+    # binary, rename, next hunk) only runs OUTSIDE a hunk body.
+    old_remaining = 0
+    new_remaining = 0
     try:
         for line in diff.splitlines():
+            if old_remaining > 0 or new_remaining > 0:
+                # INSIDE a hunk body -> classify by first char, decrement the budgets.
+                if line.startswith("+"):
+                    if current is not None:
+                        ranges.setdefault(current, set()).add(line_no)
+                    line_no += 1  # added line advances the new-file counter
+                    new_remaining -= 1
+                elif line.startswith("-"):
+                    old_remaining -= 1  # removed line does NOT advance the new-file counter
+                elif line.startswith("\\"):
+                    continue  # "\ No newline at end of file": a marker, consumes no budget
+                else:
+                    # context line (leading space, or a bare empty line) -> both sides.
+                    line_no += 1
+                    old_remaining -= 1
+                    new_remaining -= 1
+                continue
+            m_hunk = _HUNK.match(line)
+            if m_hunk:
+                old_remaining = int(m_hunk.group(2) or 1)
+                line_no = int(m_hunk.group(3))
+                new_remaining = int(m_hunk.group(4) or 1)
+                continue
             m_bin = _BINARY.match(line)
             if m_bin:  # binary file: touched, no line info
                 path = m_bin.group(1)
@@ -96,25 +128,8 @@ def parse_diff(diff: str) -> tuple[set[str], dict[str, set[int]]]:
                     files.add(current)
                     ranges.setdefault(current, set())
                 continue
-            m_hunk = _HUNK.match(line)
-            if m_hunk:
-                line_no = int(m_hunk.group(1))
-                continue
-            if current is None:
-                continue
-            if line.startswith("\\ "):
-                # e.g. "\ No newline at end of file" — a marker, not content. Must NOT
-                # advance the new-file line counter (falling through to the "context
-                # line" branch below would shift every subsequent added-line number
-                # off by one).
-                continue
-            if line.startswith("+") and not line.startswith("+++"):
-                ranges.setdefault(current, set()).add(line_no)
-                line_no += 1
-            elif line.startswith("-") and not line.startswith("---"):
-                continue  # removed line: does not advance the new-file counter
-            else:
-                line_no += 1  # context line advances the new-file counter
+            # Any other line OUTSIDE a hunk body (`--- a/...`, `index ...`, `diff --git ...`,
+            # a blank separator) carries no added-line info -> ignore.
     except Exception:  # noqa: BLE001 — total: degrade to the partial result, never raise.
         pass
     return files, ranges

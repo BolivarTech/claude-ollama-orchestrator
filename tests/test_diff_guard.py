@@ -24,6 +24,42 @@ def test_parse_diff_extracts_files_and_added_lines():
     assert {11, 12} <= ranges["src/app.py"]  # the two added lines
 
 
+def test_added_content_line_starting_with_plus_plus_is_not_misread_as_file_header():
+    """Hunk-length bookkeeping: an ADDED line whose own CONTENT starts with '++ ' (so the diff
+    line reads '+++ ...') sits INSIDE the hunk body and must be counted as an added line, not
+    misread as a '+++ b/<file>' file header -- which would register a PHANTOM file and miss the
+    added line. The @@ header's declared new-count tells the parser exactly how many body lines
+    to consume, so a '+++ '/'--- ' inside a hunk is never confused with a file header."""
+    diff = (
+        "diff --git a/src/app.py b/src/app.py\n"
+        "--- a/src/app.py\n"
+        "+++ b/src/app.py\n"
+        "@@ -10,1 +10,3 @@\n"
+        " context\n"
+        "+++ an added line whose text starts with plus-plus\n"
+        "+another added line\n"
+    )
+    files, ranges = parse_diff(diff)
+    assert files == {"src/app.py"}  # NO phantom file from the '+++ ...' body line
+    assert {11, 12} <= ranges["src/app.py"]  # 11='+++ ...' added, 12='+another' added
+
+
+def test_removed_content_line_starting_with_minus_minus_is_not_misread_as_file_header():
+    """Symmetric to the '+++' case: a REMOVED line whose content starts with '-- ' (diff line
+    '--- ...') inside a hunk body is a removed line, not a '--- a/<file>' header. It must not
+    register a phantom file nor shift the new-file line counter (removed lines don't advance it)."""
+    diff = (
+        "diff --git a/src/app.py b/src/app.py\n"
+        "--- a/src/app.py\n"
+        "+++ b/src/app.py\n"
+        "@@ -10,2 +10,1 @@\n"
+        " context\n"
+        "--- a removed line whose text starts with minus-minus\n"
+    )
+    files, ranges = parse_diff(diff)
+    assert files == {"src/app.py"}  # no phantom file from the '--- ...' body line
+
+
 def test_finding_on_fabricated_file_is_hard_dropped():
     kept, dropped = validate_findings(
         [{"file": "does/not/exist.py", "line": 5, "title": "ghost"}], _DIFF
