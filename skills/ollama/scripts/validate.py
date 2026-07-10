@@ -76,6 +76,39 @@ def clean_title(raw: str) -> str:
     return cleaned
 
 
+def _truncate_utf8_bytes(text: str, max_bytes: int) -> tuple[str, bool]:
+    """Truncate *text* to at most *max_bytes* UTF-8 bytes, never splitting a
+    multi-byte character (R24c anti-runaway output cap).
+
+    THE single canonical implementation of this algorithm: both `backend.py`
+    (transactional path) and `ollama_stream.py` (streaming path, MS4) import it from
+    here instead of each carrying its own copy.
+
+    Args:
+        text: The text to (possibly) truncate.
+        max_bytes: The maximum length of the UTF-8-encoded result, in bytes.
+
+    Returns:
+        A ``(result_text, was_truncated)`` tuple. ``result_text`` equals *text*
+        unchanged when it already fits; otherwise it is the longest prefix of *text*
+        whose UTF-8 encoding is at most *max_bytes* bytes, cut on a whole-character
+        boundary (never a bare ``0b10xxxxxx`` continuation byte), so
+        ``result_text.encode("utf-8")`` always succeeds and never raises. A
+        non-positive *max_bytes* (``<= 0``) has no valid non-negative slice, so it
+        returns ``("", True)`` (fully truncated) rather than risking a wrong or
+        negative-length slice (defensive guard, Caspar residual).
+    """
+    if max_bytes <= 0:
+        return "", True
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text, False
+    cut = max_bytes
+    while cut > 0 and (encoded[cut] & 0xC0) == 0x80:  # 0x80 = continuation-byte marker
+        cut -= 1
+    return encoded[:cut].decode("utf-8"), True
+
+
 def _reject_extra_keys(obj: dict[str, Any], allowed: set[str], ctx: str) -> None:
     """Raise if *obj* carries keys outside *allowed* — mirrors the JSON-Schema's
     ``additionalProperties: false`` so the validator stays in lockstep with the schema

@@ -45,6 +45,7 @@ from errors import (  # domain exceptions from errors, never defined locally in 
     SinkError,  # "Modify: errors.py" step)
 )
 from ollama_config import OllamaAgentsConfig
+from validate import _truncate_utf8_bytes
 
 _SSE_PREFIX = "data:"
 MAX_SSE_LINE_BYTES = 1_048_576  # bound a single SSE line (anti-DoS)
@@ -225,28 +226,6 @@ def _stream_once(
         _safe_close(resp)
 
 
-def _truncate_utf8_bytes(data: bytes, max_bytes: int) -> bytes:
-    """Truncate *data* to at most *max_bytes* bytes WITHOUT splitting a multi-byte
-    UTF-8 character: back off from the cut point over any trailing continuation
-    bytes (``0b10xxxxxx``) until it lands on an ASCII byte or a lead byte, so the
-    result always ``.decode("utf-8")``-s cleanly.
-
-    Args:
-        data: The UTF-8 encoded bytes to truncate.
-        max_bytes: The maximum length of the result, in bytes.
-
-    Returns:
-        ``data`` unchanged if it already fits; otherwise a prefix of ``data`` of at
-        most ``max_bytes`` bytes, cut on a whole-character boundary.
-    """
-    if len(data) <= max_bytes:
-        return data
-    cut = max_bytes
-    while cut > 0 and (data[cut] & 0xC0) == 0x80:  # 0x80 = continuation-byte marker
-        cut -= 1
-    return data[:cut]
-
-
 def _consume(
     resp: Any,
     sink: Callable[[str], None],
@@ -376,15 +355,14 @@ def _consume(
         except (KeyError, IndexError, TypeError, AttributeError):
             delta = None
         if isinstance(delta, str) and delta:  # non-string content → skip, no TypeError
-            encoded = delta.encode("utf-8")
             remaining = max_output_bytes - byte_count
             if remaining <= 0:  # already at/over the cap: drop it whole
                 truncated = True
                 break
-            if len(encoded) > remaining:  # a SINGLE delta overshoots the cap —
-                encoded = _truncate_utf8_bytes(encoded, remaining)  # truncate AT the boundary
-                delta = encoded.decode("utf-8")  # safe: cut only on a char boundary
-                truncated = True
+            # a SINGLE delta overshoots the cap — truncate AT the boundary (never splits a
+            # multi-byte UTF-8 character; shared with the transactional path, R24c DRY fix).
+            delta, was_cut = _truncate_utf8_bytes(delta, remaining)
+            truncated = truncated or was_cut
             parts.append(delta)
             try:
                 sink(delta)  # a sink failure is NOT a transport error
@@ -393,7 +371,7 @@ def _consume(
                 # which is NOT an `OSError` subclass — both are wrapped as the same
                 # domain SinkError so a closed sink never leaks a raw ValueError.
                 raise SinkError(redact(f"output sink write failed: {exc}")) from None
-            byte_count += len(encoded)  # UTF-8 BYTES, not code points (CJK-safe)
+            byte_count += len(delta.encode("utf-8"))  # UTF-8 BYTES, not code points (CJK-safe)
             if truncated or byte_count >= max_output_bytes:
                 truncated = True
                 break
