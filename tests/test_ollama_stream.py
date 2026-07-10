@@ -510,3 +510,30 @@ def test_stream_incomplete_read_mid_stream_maps_to_backend_error():
             sink=lambda _s: None,
             urlopen=lambda req, timeout=None: _Truncated(),
         )
+
+
+def test_stream_response_close_failure_never_masks_the_real_result():
+    # A raising close() in the cleanup `finally` must never mask the real result: the
+    # response cleanup uses backend's guarded `_safe_close` (which swallows a close()
+    # failure), so a fully-successful stream is not turned into a spurious OSError.
+    class _ClosingRaises:
+        def __init__(self, body):
+            self._buf = io.BytesIO(body)
+
+        def read(self, n=-1):
+            return self._buf.read(n)
+
+        def close(self):
+            raise OSError("close failed")
+
+    body = b'data: {"choices":[{"delta":{"content":"ok"}}]}\ndata: [DONE]\n'
+    res = stream_run(
+        _cfg(),
+        "s",
+        "p",
+        "m",
+        60,
+        sink=lambda _s: None,
+        urlopen=lambda req, timeout=None: _ClosingRaises(body),
+    )
+    assert res.content == "ok"  # close() failure swallowed by _safe_close, result intact

@@ -34,6 +34,7 @@ from backend import (
     DelegationResult,
     ResponseFormatRejected,
     _resolve_usage,
+    _safe_close,
     build_chat_request,
     make_redactor,
     map_http_error,
@@ -196,8 +197,11 @@ def _stream_once(
             map_http_error(exc, redact=redact)  # NoReturn: last attempt (or non-429) →
             # always raises (400→ResponseFormatRejected,
             # 429-exhausted/5xx→OllamaBackendError)
-        except (TimeoutError, OSError) as exc:
-            map_http_error(exc, redact=redact)  # NoReturn: socket timeout / URLError → domain
+        except (TimeoutError, OSError, http.client.IncompleteRead) as exc:
+            # socket timeout / URLError / (defensively) a truncated read at connect time →
+            # domain error. IncompleteRead is not an OSError subclass, so it is named here
+            # too, mirroring the read-loop and the transactional core.
+            map_http_error(exc, redact=redact)  # NoReturn
     try:
         return _consume(
             resp, sink, max_output_bytes, deadline, system_prompt, prompt, redact, start
@@ -205,9 +209,12 @@ def _stream_once(
     finally:
         # The response handle must be closed even when `_consume` raises mid-stream
         # (TimeoutError from idle/deadline, OllamaBackendError from an oversized line,
-        # SinkError from a broken sink) — not just on the success path. `resp` may not
-        # support `.close()` (e.g. a bare test double), so this is best-effort/guarded.
-        getattr(resp, "close", lambda: None)()
+        # SinkError from a broken sink) — not just on the success path. Uses backend's
+        # shared `_safe_close`: it guards BOTH a missing `.close` (a bare test double) AND a
+        # `.close()` that RAISES — an unguarded close in this `finally` would otherwise
+        # REPLACE the real exception in flight (the exact `_safe_close` policy the
+        # transactional core already applies to response/error bodies).
+        _safe_close(resp)
 
 
 def _truncate_utf8_bytes(data: bytes, max_bytes: int) -> bytes:
