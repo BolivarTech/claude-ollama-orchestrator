@@ -1545,7 +1545,13 @@ async def _execute_delegation(
         except RateLimitError as exc:
             # Throttling, not a dead model (R14b) — the breaker's failure count is
             # deliberately left untouched; the `finally` below still releases the probe
-            # reservation if this call held one.
+            # reservation if this call held one. If THIS call WAS the half-open probe, that
+            # `release_probe` reopens the circuit for a fresh cooldown (an inconclusive probe
+            # is treated like a failed one). That is intentional and conservative: a 429
+            # proves the model is REACHABLE but NOT that it successfully served a request, so
+            # the model's health is still unproven — re-arming the cooldown (without counting
+            # a failure) is safer than closing the circuit on a request the model rejected.
+            # It self-corrects: once throttling clears, a later probe closes the circuit.
             outcome = exc
         except (OllamaBackendError, TimeoutError) as exc:
             # Real backend/transport failure (connection refused / 5xx / socket timeout)
@@ -1832,6 +1838,16 @@ async def run_batch(
         )
 
     sched = Scheduler(config.max_parallel_agents, config.max_queued_agents)
+    # `parallel` gates R7c stdout-vs-file sink routing on the CONFIGURED cap, not the exact
+    # effective concurrency of this particular batch. This is a DELIBERATE conservative
+    # approximation: the true single-delegation case (one job under a cap of 1) is already
+    # handled above by the serial fast path, which streams to stdout. Here, with a cap > 1,
+    # even a batch that happens to have a single eligible job routes to its own
+    # `{cap}_{index}.stream.log` rather than stdout. That is always SAFE (a file sink can
+    # never interleave with a sibling on the shared serial stdout, and the content is still
+    # captured for Claude to review) and is strictly simpler than recomputing effective
+    # concurrency after breaker filtering — it only ever errs toward a file, never toward a
+    # colliding stdout.
     parallel = config.max_parallel_agents > 1
     # Size the loop's DEFAULT executor once (never a dedicated per-batch one) so
     # `asyncio.to_thread` — used below by `_call_worker`, kept specifically because it
