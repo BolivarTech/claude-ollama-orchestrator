@@ -230,7 +230,7 @@ def _parse_lock(run_dir: str) -> tuple[int | None, float | None, int | None]:
 
 def _dir_is_fresh(run_dir: str) -> bool:
     try:
-        return (time.time() - os.path.getmtime(run_dir)) < LOCK_STALE_AFTER_SECONDS
+        return max(0.0, time.time() - os.path.getmtime(run_dir)) < LOCK_STALE_AFTER_SECONDS
     except OSError:
         return True
 
@@ -245,7 +245,7 @@ def _dir_is_within_setup_grace(run_dir: str) -> bool:
     total-exception guard still governs overall conservatism).
     """
     try:
-        return (time.time() - os.path.getmtime(run_dir)) < _LOCK_SETUP_GRACE_SECONDS
+        return max(0.0, time.time() - os.path.getmtime(run_dir)) < _LOCK_SETUP_GRACE_SECONDS
     except OSError:
         return False
 
@@ -491,7 +491,7 @@ def _lockfile_holder_is_live(path: str) -> bool:
             # created moments ago is presumed to be a concurrent winner's write still in
             # flight, not an abandoned corpse.
             try:
-                age_on_disk = time.time() - os.path.getmtime(path)
+                age_on_disk = max(0.0, time.time() - os.path.getmtime(path))
             except OSError:
                 return False  # vanished mid-check -> nothing left to hold, reclaimable
             return age_on_disk < _EPHEMERAL_TORN_WRITE_GRACE_SECONDS
@@ -509,7 +509,7 @@ def _lockfile_holder_is_live(path: str) -> bool:
         # in flight (held); older -> the writer died mid-write, reclaimable. This guarantees an
         # ephemeral lock ALWAYS self-heals rather than wedging a slot/token forever.
         try:
-            age_on_disk = time.time() - os.path.getmtime(path)
+            age_on_disk = max(0.0, time.time() - os.path.getmtime(path))
         except OSError:
             return False  # vanished mid-check -> reclaimable
         return age_on_disk < _EPHEMERAL_TORN_WRITE_GRACE_SECONDS
