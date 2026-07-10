@@ -42,12 +42,66 @@ from typing import Any
 # e.g. `@@ -1,3 +10,4 @@ def foo():`), so an optional ` <anything>` trailer is allowed via
 # `(?: .*)?$` rather than anchoring at the closing `@@`.
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$")
-# The new-file path line `+++ b/<path>` (the `b/` prefix is git's; `diff -u` omits it).
-_PLUSFILE = re.compile(r"^\+\+\+ (?:b/)?(.+?)\s*$")
-# `Binary files a/<x> and b/<y> differ` — capture the new-side (b/) path.
-_BINARY = re.compile(r"^Binary files .+? and (?:b/)?(.+?) differ\s*$")
+# The new-file path line `+++ b/<path>`. The whole token after `+++ ` is captured (quoted or
+# not); :func:`_normalize_diff_path` strips the git `a/`/`b/` prefix and un-quotes it -- the
+# `b/` is NOT stripped in the regex because git QUOTES a path with special bytes as
+# `"b/caf\303\251.py"`, putting the prefix INSIDE the quotes where a regex prefix can't reach.
+_PLUSFILE = re.compile(r"^\+\+\+ (.+?)\s*$")
+# `Binary files a/<x> and b/<y> differ` — capture the new-side path token (quoted or not).
+_BINARY = re.compile(r"^Binary files .+? and (.+?) differ\s*$")
 # `rename to <new path>` — the destination path of a rename (may carry no hunk body).
 _RENAME_TO = re.compile(r"^rename to (.+?)\s*$")
+
+# git c-style escapes emitted inside a quoted path (core.quotePath on, the default).
+_GIT_ESCAPE = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+
+
+def _git_unquote(path: str) -> str:
+    """Decode a git-quoted diff path to its real value; return *path* unchanged if not quoted.
+
+    When ``core.quotePath`` is on (the default), git wraps a path containing special/high bytes
+    in double quotes and c-escapes them: simple escapes (``\\t \\n \\" \\\\`` ...) and any other
+    byte as a 3-digit OCTAL escape (``\\303\\251`` for the UTF-8 bytes of ``é``). Without
+    un-quoting, ``parse_diff`` would register the escaped form and a model's finding on the real
+    path would be wrongly HARD-DROPPED as fabricated. Total: malformed escapes decode
+    best-effort (``errors="replace"``), never raising.
+    """
+    if len(path) < 2 or not (path.startswith('"') and path.endswith('"')):
+        return path
+    inner = path[1:-1]
+    out = bytearray()
+    i = 0
+    n = len(inner)
+    while i < n:
+        c = inner[i]
+        if c == "\\" and i + 1 < n:
+            nxt = inner[i + 1]
+            if nxt in _GIT_ESCAPE:
+                out.append(_GIT_ESCAPE[nxt])
+                i += 2
+                continue
+            if nxt in "01234567":  # octal escape: up to 3 octal digits
+                j = 0
+                while j < 3 and i + 1 + j < n and inner[i + 1 + j] in "01234567":
+                    j += 1
+                out.append(int(inner[i + 1 : i + 1 + j], 8) & 0xFF)
+                i += 1 + j
+                continue
+            out.append(ord(nxt) & 0xFF)  # unknown escape: take the char literally
+            i += 2
+            continue
+        out.extend(c.encode("utf-8"))
+        i += 1
+    return out.decode("utf-8", errors="replace")
+
+
+def _normalize_diff_path(raw: str) -> str:
+    """Un-quote a git diff path token and strip its leading ``a/``/``b/`` prefix (if any)."""
+    p = _git_unquote(raw)
+    for prefix in ("a/", "b/"):
+        if p.startswith(prefix):
+            return p[len(prefix) :]
+    return p
 
 
 def parse_diff(diff: str) -> tuple[set[str], dict[str, set[int]]]:
@@ -110,20 +164,20 @@ def parse_diff(diff: str) -> tuple[set[str], dict[str, set[int]]]:
                 continue
             m_bin = _BINARY.match(line)
             if m_bin:  # binary file: touched, no line info
-                path = m_bin.group(1)
+                path = _normalize_diff_path(m_bin.group(1))
                 files.add(path)
                 ranges.setdefault(path, set())
                 current = None  # no hunk body follows a binary line
                 continue
             m_rename = _RENAME_TO.match(line)
-            if m_rename:  # rename destination: touched
-                path = m_rename.group(1)
+            if m_rename:  # rename destination: touched (rename paths carry no a//b/ prefix)
+                path = _git_unquote(m_rename.group(1))
                 files.add(path)
                 ranges.setdefault(path, set())
                 continue
             m_file = _PLUSFILE.match(line)
             if m_file and line.startswith("+++"):
-                current = m_file.group(1)
+                current = _normalize_diff_path(m_file.group(1))
                 if current != "/dev/null":
                     files.add(current)
                     ranges.setdefault(current, set())

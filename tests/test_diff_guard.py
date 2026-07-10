@@ -44,6 +44,25 @@ def test_added_content_line_starting_with_plus_plus_is_not_misread_as_file_heade
     assert {11, 12} <= ranges["src/app.py"]  # 11='+++ ...' added, 12='+another' added
 
 
+def test_git_quoted_unicode_path_is_unquoted_so_real_findings_are_not_dropped():
+    """Git quotes a path with special/high bytes (core.quotePath on, the default):
+    '"b/caf\\303\\251.py"' for 'café.py'. parse_diff must UN-quote it so the files set holds
+    the REAL path -- otherwise a model's finding on 'café.py' would be wrongly HARD-DROPPED as
+    fabricated (a real finding lost), which is worse than a false negative."""
+    diff = (
+        'diff --git "a/caf\\303\\251.py" "b/caf\\303\\251.py"\n'
+        '--- "a/caf\\303\\251.py"\n'
+        '+++ "b/caf\\303\\251.py"\n'
+        "@@ -1,1 +1,2 @@\n"
+        " context\n"
+        "+added\n"
+    )
+    files, ranges = parse_diff(diff)
+    assert "café.py" in files  # unquoted to the real path, not the escaped/quoted form
+    kept, dropped = validate_findings([{"file": "café.py", "line": 2, "title": "real"}], diff)
+    assert dropped == []  # a real finding on the unicode path is KEPT, not hard-dropped
+
+
 def test_removed_content_line_starting_with_minus_minus_is_not_misread_as_file_header():
     """Symmetric to the '+++' case: a REMOVED line whose content starts with '-- ' (diff line
     '--- ...') inside a hunk body is a removed line, not a '--- a/<file>' header. It must not
