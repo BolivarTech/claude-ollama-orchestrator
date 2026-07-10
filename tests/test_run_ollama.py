@@ -1541,3 +1541,1150 @@ def test_make_file_sink_closes_handle_on_construction_failure(monkeypatch, tmp_p
 
     assert len(handles) == 1
     assert handles[0].closed is True  # no leaked handle
+
+
+# --- Task 5: run_batch — scheduler + breaker + per-delegation stderr + sink routing ---
+
+import asyncio  # noqa: E402 — appended section, mirrors the plan's own layout
+
+
+def test_run_batch_fanout_bounds_concurrency_and_files_per_delegation(tmp_path):
+    import run_ollama
+    from backend import DelegationResult
+
+    peak = {"active": 0, "max": 0}
+
+    async def _job(cap, model, sink):
+        peak["active"] += 1
+        peak["max"] = max(peak["max"], peak["active"])
+        await asyncio.sleep(0.01)
+        peak["active"] -= 1
+        sink("tok")  # each writes to its own file sink
+        return DelegationResult(f"{cap}-out", 1, 1, True, 0.1)
+
+    jobs = [
+        run_ollama._Job(cap=c, model="m", prompt="p")
+        for c in ("coder", "reviewer", "explainer", "thinking")
+    ]
+    results = run_ollama._run_batch_for_test(
+        jobs, _job=_job, max_parallel=2, max_queued=10, output_dir=str(tmp_path)
+    )
+    assert peak["max"] <= 2 and len(results) == 4
+    for i, c in enumerate(("coder", "reviewer", "explainer", "thinking")):
+        # WARNING fix #1: each delegation gets a UNIQUE, index-suffixed artifact
+        # filename (never the bare `{cap}.*`), so two same-capability jobs in one
+        # batch can never collide/overwrite each other's file.
+        assert os.path.exists(os.path.join(str(tmp_path), f"{c}_{i}.stream.log"))
+
+
+def test_run_batch_same_capability_fanout_gets_unique_artifact_files(tmp_path):
+    # WARNING fix #1: two delegations of the SAME capability in one batch must
+    # not collide on `{cap}.stream.log` / `{cap}.stderr.log` — each gets an
+    # index-suffixed, unique filename, and neither's content is overwritten by
+    # the other.
+    import run_ollama
+    from backend import DelegationResult
+
+    async def _job(cap, model, sink):
+        sink(f"tok-{model}")
+        return DelegationResult(f"{cap}-out", 1, 1, True, 0.1)
+
+    jobs = [
+        run_ollama._Job(cap="coder", model="m0", prompt="p0"),
+        run_ollama._Job(cap="coder", model="m1", prompt="p1"),
+    ]
+    run_ollama._run_batch_for_test(
+        jobs, _job=_job, max_parallel=2, max_queued=10, output_dir=str(tmp_path)
+    )
+
+    stream_0 = os.path.join(str(tmp_path), "coder_0.stream.log")
+    stream_1 = os.path.join(str(tmp_path), "coder_1.stream.log")
+    assert os.path.exists(stream_0) and os.path.exists(stream_1)
+    with open(stream_0, encoding="utf-8") as fh:
+        assert fh.read() == "tok-m0"  # job 0's own content, not overwritten by job 1
+    with open(stream_1, encoding="utf-8") as fh:
+        assert fh.read() == "tok-m1"  # job 1's own content
+
+    assert os.path.exists(os.path.join(str(tmp_path), "coder_0.stderr.log"))
+    assert os.path.exists(os.path.join(str(tmp_path), "coder_1.stderr.log"))
+
+
+def test_run_batch_serial_max_parallel_1_streams_stdout_no_files(tmp_path, capsys):
+    import run_ollama
+    from backend import DelegationResult
+
+    async def _job(cap, model, sink):
+        sink("tok")
+        return DelegationResult(f"{cap}-out", 1, 1, True, 0.1)
+
+    jobs = [run_ollama._Job(cap="coder", model="m", prompt="p")]
+    run_ollama._run_batch_for_test(
+        jobs, _job=_job, max_parallel=1, max_queued=0, output_dir=str(tmp_path)
+    )
+    assert "tok" in capsys.readouterr().out  # stdout sink
+    assert not os.path.exists(os.path.join(str(tmp_path), "coder_0.stream.log"))  # no file at all
+    assert not os.path.exists(os.path.join(str(tmp_path), "coder.stream.log"))
+
+
+def test_run_batch_breaker_failfasts_bad_model_others_proceed(tmp_path):
+    import run_ollama
+    from backend import DelegationResult
+    from circuit_breaker import CircuitBreaker
+    from errors import DelegationError
+
+    breaker = CircuitBreaker(threshold=1, cooldown=1e9)
+    breaker.record_failure("bad:cloud", now=0.0)  # already open
+
+    async def _job(cap, model, sink):
+        return DelegationResult("ok", 1, 1, True, 0.1)
+
+    jobs = [
+        run_ollama._Job(cap="coder", model="bad:cloud", prompt="p"),
+        run_ollama._Job(cap="reviewer", model="good:cloud", prompt="p"),
+    ]
+    results = run_ollama._run_batch_for_test(
+        jobs, _job=_job, max_parallel=2, max_queued=10, output_dir=str(tmp_path), breaker=breaker
+    )
+    assert isinstance(results[0], DelegationError)  # bad model fail-fast (open circuit)
+    assert getattr(results[1], "content", None) == "ok"  # good model proceeded
+
+
+def test_run_batch_open_circuit_never_touches_the_semaphore(tmp_path):
+    # INFO fix: an open-circuit job is rejected BEFORE it ever occupies a slot — it must
+    # not count against the ceiling, so N healthy jobs still all get to run even when the
+    # ceiling (max_parallel + max_queued) would otherwise have no room for them plus a
+    # rejected one.
+    import run_ollama
+    from backend import DelegationResult
+    from circuit_breaker import CircuitBreaker
+
+    breaker = CircuitBreaker(threshold=1, cooldown=1e9)
+    breaker.record_failure("bad:cloud", now=0.0)
+
+    async def _job(cap, model, sink):
+        return DelegationResult("ok", 1, 1, True, 0.1)
+
+    jobs = [run_ollama._Job(cap="coder", model="bad:cloud", prompt="p")] + [
+        run_ollama._Job(cap="reviewer", model="good:cloud", prompt="p") for _ in range(3)
+    ]
+    results = run_ollama._run_batch_for_test(  # ceiling 3 (2 parallel + 1 queued)
+        jobs, _job=_job, max_parallel=2, max_queued=1, output_dir=str(tmp_path), breaker=breaker
+    )
+    # All 3 "good" jobs ran (none overflow-rejected) — the open-circuit job never reserved
+    # a slot against the ceiling.
+    assert sum(getattr(r, "content", None) == "ok" for r in results) == 3
+
+
+def test_run_batch_rejects_overflow_per_delegation(tmp_path):
+    import run_ollama
+    from backend import DelegationResult
+    from errors import DelegationError
+
+    async def _job(cap, model, sink):
+        await asyncio.sleep(0.005)
+        return DelegationResult("ok", 1, 1, True, 0.1)
+
+    jobs = [run_ollama._Job(cap="coder", model="m", prompt="p") for _ in range(5)]
+    results = run_ollama._run_batch_for_test(
+        jobs, _job=_job, max_parallel=2, max_queued=1, output_dir=str(tmp_path)
+    )  # ceiling 3
+    assert sum(isinstance(r, DelegationError) for r in results) == 2  # 2 overflow rejected
+    assert sum(getattr(r, "content", None) == "ok" for r in results) == 3
+
+
+def test_run_batch_breaker_ignores_validation_and_delegation_errors(tmp_path):
+    # WARNING fix: a parse/schema failure or a scheduling rejection is NOT a backend/
+    # transport failure — the breaker must stay untouched.
+    import run_ollama
+    from circuit_breaker import CircuitBreaker
+    from errors import ValidationError
+
+    breaker = CircuitBreaker(threshold=1, cooldown=1e9)
+
+    async def _job(cap, model, sink):
+        raise ValidationError("bad schema")
+
+    jobs = [run_ollama._Job(cap="reviewer", model="m", prompt="p")]
+    results = run_ollama._run_batch_for_test(
+        jobs, _job=_job, max_parallel=2, max_queued=10, output_dir=str(tmp_path), breaker=breaker
+    )
+    assert isinstance(results[0], ValidationError)
+    assert breaker.is_open("m", now=0.0) is False  # never trips the breaker
+
+
+def test_run_batch_breaker_opens_after_k_real_backend_errors(tmp_path):
+    # WARNING fix: K real backend/transport failures (connection refused / 5xx / timeout)
+    # DO trip the breaker.
+    import run_ollama
+    from circuit_breaker import CircuitBreaker
+    from errors import OllamaBackendError
+
+    breaker = CircuitBreaker(threshold=2, cooldown=1e9)
+
+    async def _job(cap, model, sink):
+        raise OllamaBackendError("connection refused")
+
+    jobs = [run_ollama._Job(cap="coder", model="m", prompt="p") for _ in range(2)]
+    results = run_ollama._run_batch_for_test(
+        jobs, _job=_job, max_parallel=2, max_queued=10, output_dir=str(tmp_path), breaker=breaker
+    )
+    assert all(isinstance(r, OllamaBackendError) for r in results)
+    assert breaker.is_open("m", now=0.0) is True  # 2 real backend failures trip it
+
+
+def test_run_batch_breaker_ignores_rate_limit_errors(tmp_path):
+    # WARNING fix: a RateLimitError (429 exhausted) is throttling, not a dead model.
+    import run_ollama
+    from circuit_breaker import CircuitBreaker
+    from errors import RateLimitError
+
+    breaker = CircuitBreaker(threshold=1, cooldown=1e9)
+
+    async def _job(cap, model, sink):
+        raise RateLimitError("429 exhausted")
+
+    jobs = [run_ollama._Job(cap="coder", model="m", prompt="p")]
+    results = run_ollama._run_batch_for_test(
+        jobs, _job=_job, max_parallel=2, max_queued=10, output_dir=str(tmp_path), breaker=breaker
+    )
+    assert isinstance(results[0], RateLimitError)
+    assert breaker.is_open("m", now=0.0) is False  # never trips the breaker
+
+
+def test_run_batch_structured_plus_streaming_parses_and_validates(tmp_path):
+    """MS4/Caspar deferral: a structured capability with stream=true → stream → parse → validate.
+
+    This drives the REAL `dispatch()` (not a re-implementation) with only `stream_run`
+    monkeypatched, so it also proves `_run_once` (MS4) actually routes to the streaming
+    path — never the transactional `backend.run` — when `stream=true`.
+    """
+    import run_ollama
+
+    findings = '{"capability":"reviewer","findings":[{"severity":"low","title":"t","detail":"d"}]}'
+    result = run_ollama._dispatch_structured_streaming_for_test(
+        capability="reviewer", streamed_content=findings
+    )
+    assert result.parsed["capability"] == "reviewer"  # validated .parsed
+    assert result.parsed["findings"][0]["title"] == "t"
+
+
+def test_run_batch_rmtrees_managed_output_dir_on_interrupt(tmp_path, monkeypatch):
+    # INFO fix (R27): an interrupt mid-batch removes the managed run dir, mirroring
+    # managed_run_dir's own KeyboardInterrupt/SystemExit handler (MS3).
+    import run_ollama
+
+    async def _boom(cap, model, sink):
+        raise KeyboardInterrupt
+
+    jobs = [run_ollama._Job(cap="coder", model="m", prompt="p")]
+    with pytest.raises(KeyboardInterrupt):
+        run_ollama._run_batch_for_test(
+            jobs, _job=_boom, max_parallel=2, max_queued=10, output_dir=str(tmp_path)
+        )
+    assert not os.path.exists(str(tmp_path))  # torn down, not left as an orphan
+
+
+def test_run_batch_explicit_output_dir_survives_interrupt(tmp_path, monkeypatch):
+    # An explicit (unmanaged) --output-dir is NEVER removed, even on interrupt — same
+    # rule as managed_run_dir(output_dir=...) (MS3, R15/R28).
+    import run_ollama
+
+    async def _boom(cap, model, sink):
+        raise KeyboardInterrupt
+
+    jobs = [run_ollama._Job(cap="coder", model="m", prompt="p")]
+    config = run_ollama._cfg_for_batch(max_parallel_agents=2, max_queued_agents=10)
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(
+            run_ollama.run_batch(
+                jobs, config=config, output_dir=str(tmp_path), managed=False, _worker=_boom
+            )
+        )
+    assert os.path.exists(str(tmp_path))  # caller-supplied dir, never rmtree'd
+
+
+def test_run_batch_probe_cancellation_releases_slot_for_a_later_probe(tmp_path):
+    # WARNING fix #3: a probe delegation that is cancelled/interrupted (raises
+    # KeyboardInterrupt, never resolves via record_success/record_failure) must
+    # not leave the model's circuit permanently stuck in "probe in flight" — a
+    # SUBSEQUENT check against the same breaker must still see a probe admitted.
+    # cooldown=0.0 makes the OPEN->HALF-OPEN transition immediate and deterministic
+    # under the real event-loop clock (loop.time() only ever moves forward, so any
+    # positive value clears a cooldown of 0), so this proves the release, not a
+    # timing coincidence.
+    import run_ollama
+    from circuit_breaker import CircuitBreaker
+
+    breaker = CircuitBreaker(threshold=1, cooldown=0.0)
+    breaker.record_failure("flaky:cloud", now=0.0)
+
+    async def _cancelled_probe(cap, model, sink):
+        raise KeyboardInterrupt
+
+    jobs = [run_ollama._Job(cap="coder", model="flaky:cloud", prompt="p")]
+    with pytest.raises(KeyboardInterrupt):
+        run_ollama._run_batch_for_test(
+            jobs,
+            _job=_cancelled_probe,
+            max_parallel=1,
+            max_queued=0,
+            output_dir=str(tmp_path),
+            breaker=breaker,
+        )
+
+    # Without the fix, `flaky:cloud` would stay stuck in the probe-reservation set
+    # forever (is_open would keep returning True) — 1e15 is far beyond any real
+    # loop.time() value, so this proves the slot was released, not that the
+    # cooldown merely happened to elapse.
+    assert breaker.is_open("flaky:cloud", now=1e15) is False  # a LATER probe is admitted
+
+
+def test_run_one_delegation_uses_real_dispatch_path(monkeypatch):
+    # WARNING fix #4: `_run_one_delegation` (production code, not a test seam) is
+    # exercised DIRECTLY, with `dispatch`/`load_system_prompt`/`_make_backend`
+    # mocked — proving the real function body, not only `_run_batch_for_test`'s
+    # injected-fake-worker seam.
+    import run_ollama
+    from backend import DelegationResult
+
+    def _fake_dispatch(
+        capability, prompt, *, backend, model, timeout, system_prompt, config, sink=None, stats=None
+    ):
+        assert timeout == run_ollama.DEFAULT_BATCH_TIMEOUT_SECONDS
+        assert system_prompt == "sys"
+        if sink is not None:
+            sink("real-dispatch-output")
+        return DelegationResult("real-dispatch-output", 3, 5, True, 0.2)
+
+    monkeypatch.setattr(run_ollama, "dispatch", _fake_dispatch)
+    monkeypatch.setattr(run_ollama, "load_system_prompt", lambda cap: "sys")
+    monkeypatch.setattr(run_ollama, "_make_backend", lambda cfg: object())
+
+    config = run_ollama._cfg_for_batch(max_parallel_agents=2, max_queued_agents=10)
+    job = run_ollama._Job(cap="coder", model="m", prompt="p")
+    seen: list[str] = []
+    result = run_ollama._run_one_delegation(job, config, seen.append)
+
+    assert result.content == "real-dispatch-output"
+    assert seen == ["real-dispatch-output"]
+
+
+def test_run_batch_worker_none_drives_run_one_delegation(tmp_path, monkeypatch):
+    # WARNING fix #4: the default `_worker=None` path in `run_batch` itself must
+    # call `_run_one_delegation` via `asyncio.to_thread(...)` (kept, seventh
+    # round, specifically because it copies context — see the thread-pool
+    # sizing entry's CRITICAL fix — dispatched onto the loop's own DEFAULT
+    # executor, sized once by `_ensure_sized_default_executor`) — proven
+    # end-to-end (not via the `_worker` test seam) with `dispatch` mocked at
+    # module level.
+    import run_ollama
+    from backend import DelegationResult
+
+    def _fake_dispatch(
+        capability, prompt, *, backend, model, timeout, system_prompt, config, sink=None, stats=None
+    ):
+        if sink is not None:
+            sink("batch-output")
+        return DelegationResult("batch-output", 1, 1, True, 0.1)
+
+    monkeypatch.setattr(run_ollama, "dispatch", _fake_dispatch)
+    monkeypatch.setattr(run_ollama, "load_system_prompt", lambda cap: "sys")
+    monkeypatch.setattr(run_ollama, "_make_backend", lambda cfg: object())
+
+    config = run_ollama._cfg_for_batch(max_parallel_agents=1, max_queued_agents=0)
+    job = run_ollama._Job(cap="coder", model="m", prompt="p")
+    results = asyncio.run(run_ollama.run_batch([job], config=config, output_dir=str(tmp_path)))
+    assert results[0].content == "batch-output"
+
+
+def test_process_wide_breaker_singleton_persists_failure_count_across_batches(
+    tmp_path, monkeypatch
+):
+    # WARNING fix #1: R14b's "K consecutive failures" is a PER-PROCESS property
+    # spanning separate batches -- the `CircuitBreaker` `run_batch` falls back
+    # to when the caller omits `breaker=` must be the SAME shared instance
+    # across two SEPARATE `run_batch`/`_run_batch_for_test` calls, never a
+    # fresh one constructed inside `run_batch` (which would silently reset the
+    # failure count to 0 every batch and the circuit could never open).
+    #
+    # INFO fix (test isolation): swap the module-level singleton for a fresh,
+    # isolated `CircuitBreaker()` via `monkeypatch.setattr` (auto-restored at
+    # teardown) instead of `importlib.reload(run_ollama)`. Reloading the module
+    # rebinds EVERY name defined in it -- classes, functions, the module object
+    # itself -- which can silently break `isinstance` checks and any other
+    # test's already-held reference to the pre-reload module; `monkeypatch`
+    # touches exactly the one attribute under test and undoes it automatically,
+    # with no risk of corrupting global test-run state.
+    import run_ollama
+    from circuit_breaker import CircuitBreaker
+    from errors import OllamaBackendError
+
+    monkeypatch.setattr(run_ollama, "_PROCESS_CIRCUIT_BREAKER", CircuitBreaker())
+    model = "flaky-singleton:cloud"  # default threshold=3
+
+    async def _job(cap, model_, sink):
+        raise OllamaBackendError("connection refused")
+
+    # Batch 1 (no `breaker=` passed -- falls back to the process singleton):
+    # 2 consecutive failures, still below the default threshold of 3.
+    jobs_batch_1 = [run_ollama._Job(cap="coder", model=model, prompt="p") for _ in range(2)]
+    r1 = run_ollama._run_batch_for_test(
+        jobs_batch_1, _job=_job, max_parallel=2, max_queued=10, output_dir=str(tmp_path)
+    )
+    assert all(isinstance(r, OllamaBackendError) for r in r1)
+    assert run_ollama._PROCESS_CIRCUIT_BREAKER.is_open(model, now=0.0) is False
+
+    # Batch 2 -- a SEPARATE call, still no `breaker=` passed. Only ONE more
+    # failure is needed to reach threshold=3; this is only possible if the
+    # breaker's count survived from batch 1 (a fresh `CircuitBreaker()` per
+    # call would restart counting from 0 here and never open).
+    jobs_batch_2 = [run_ollama._Job(cap="coder", model=model, prompt="p")]
+    r2 = run_ollama._run_batch_for_test(
+        jobs_batch_2, _job=_job, max_parallel=1, max_queued=0, output_dir=str(tmp_path)
+    )
+    assert isinstance(r2[0], OllamaBackendError)
+    assert run_ollama._PROCESS_CIRCUIT_BREAKER.is_open(model, now=0.0) is True
+
+
+def test_run_batch_restores_sys_stderr_to_the_original_after_returning(tmp_path):
+    # WARNING fix #2: `run_batch` installs `install_dispatching_stderr()` around
+    # its ENTIRE fan-out -- after a normal return, `sys.stderr` must be the
+    # exact original object again, not left as (or wrapping) the proxy. A
+    # leaked process-global proxy would silently affect every later
+    # test/run/plugin sharing this process.
+    #
+    # Two jobs (post-approval fix #2): this must exercise the GENERAL fan-out
+    # path (`install_dispatching_stderr`'s guaranteed restore), not the serial
+    # single-delegation fast path -- the fast path deliberately mirrors MS3's
+    # `run_delegation` (via `buffered_stderr_while` -> the lazy,
+    # never-restoring `_ensure_dispatching_stderr_installed`) and so does NOT
+    # restore `sys.stderr`, same accepted long-lived-CLI-process rationale as
+    # MS3's own single-delegation path. A 1-job/max_parallel=1 shape now hits
+    # that fast path instead, so this test needs 2 jobs to still land here.
+    import sys
+
+    import run_ollama
+    from backend import DelegationResult
+
+    async def _job(cap, model, sink):
+        return DelegationResult("ok", 1, 1, True, 0.1)
+
+    original = sys.stderr
+    jobs = [
+        run_ollama._Job(cap="coder", model="m", prompt="p"),
+        run_ollama._Job(cap="reviewer", model="m2", prompt="p"),
+    ]
+    run_ollama._run_batch_for_test(
+        jobs, _job=_job, max_parallel=2, max_queued=0, output_dir=str(tmp_path)
+    )
+    assert sys.stderr is original
+
+
+def test_run_batch_restores_sys_stderr_to_the_original_after_raising(tmp_path):
+    # WARNING fix #2: the SAME restoration guarantee must hold on the exception
+    # path -- an interrupt propagating out of `run_batch` must not leave the
+    # dispatching proxy installed.
+    #
+    # Two jobs (post-approval fix #2), same reason as the normal-exit test above:
+    # this must land on the general fan-out path, not the serial fast path.
+    import sys
+
+    import run_ollama
+
+    async def _boom(cap, model, sink):
+        raise KeyboardInterrupt
+
+    original = sys.stderr
+    jobs = [
+        run_ollama._Job(cap="coder", model="m", prompt="p"),
+        run_ollama._Job(cap="reviewer", model="m2", prompt="p"),
+    ]
+    with pytest.raises(KeyboardInterrupt):
+        run_ollama._run_batch_for_test(
+            jobs, _job=_boom, max_parallel=2, max_queued=0, output_dir=str(tmp_path)
+        )
+    assert sys.stderr is original
+
+
+def test_run_batch_outer_interrupt_releases_probe_for_a_job_never_reached_by_one(
+    tmp_path, monkeypatch
+):
+    # WARNING fix (belt-and-suspenders): an event-loop-level interrupt that escapes
+    # `Scheduler.run_all` itself -- BEFORE the mid-probe job's own `_one()` body ever
+    # started (so `_one()`'s own per-delegation `except BaseException` never had a
+    # chance to call `release_probe`) -- must still not leave that model's circuit
+    # stuck in a permanent half-open reservation. `run_batch`'s OUTER `except
+    # BaseException` releases the probe slot for every job in `eligible`
+    # unconditionally (a documented no-op for non-probe models), independent of
+    # whether that job's own `_one()` ever ran.
+    import run_ollama
+    from circuit_breaker import CircuitBreaker
+    from scheduler import Scheduler
+
+    breaker = CircuitBreaker(threshold=1, cooldown=0.0)
+    breaker.record_failure("flaky:cloud", now=0.0)  # -> is_open(now>0) reserves the probe
+
+    async def _boom_run_all(self, thunks):
+        # Simulates an interrupt at the Scheduler level -- BEFORE any thunk (and
+        # therefore before any `_one()` body / its own per-delegation release) ever
+        # runs. Proves the OUTER cleanup, not the per-delegation one (already
+        # covered by test_run_batch_probe_cancellation_releases_slot_for_a_later_probe).
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(Scheduler, "run_all", _boom_run_all)
+
+    # max_parallel=2 (post-approval fix #2): this test's whole point is the
+    # GENERAL path's `Scheduler.run_all` monkeypatch and its outer belt-and-
+    # suspenders `except BaseException` handler -- neither exists in the serial
+    # single-delegation fast path (which has no Scheduler/eligible-list layer to
+    # wrap in the first place). A 1-job/max_parallel=1 shape would now bypass
+    # `Scheduler` entirely and never exercise the patched `run_all` at all.
+    jobs = [run_ollama._Job(cap="coder", model="flaky:cloud", prompt="p")]
+    with pytest.raises(KeyboardInterrupt):
+        run_ollama._run_batch_for_test(
+            jobs,
+            _job=lambda *a: None,
+            max_parallel=2,
+            max_queued=0,
+            output_dir=str(tmp_path),
+            breaker=breaker,
+        )
+
+    # Without the outer-level fix, `flaky:cloud`'s probe slot (reserved by the
+    # fail-fast `breaker.is_open` check in `run_batch`, before `Scheduler.run_all`
+    # ever got a chance to run -- let alone `_one()`'s own except clause) would stay
+    # reserved forever.
+    assert breaker.is_open("flaky:cloud", now=1e15) is False
+
+
+def test_run_batch_cancelled_error_is_captured_per_delegation_not_fatal_to_siblings(tmp_path):
+    # Post-approval fix #1 (Caspar spec gap, R27): asyncio.CancelledError is a
+    # BaseException (Python 3.8+), so Scheduler.run_all's
+    # gather(..., return_exceptions=True) does NOT capture it the way it captures
+    # an ordinary Exception -- left unhandled inside `_one()`, it would propagate
+    # out of `gather` and cancel the WHOLE batch, killing sibling delegations that
+    # have nothing to do with this one's cancellation. `_one()` catches it
+    # explicitly (before the generic `except BaseException`, reserved for a
+    # genuine whole-batch KeyboardInterrupt/SystemExit) and returns it as THIS
+    # delegation's own result, so the siblings run to completion undisturbed.
+    import asyncio as _asyncio
+
+    import run_ollama
+    from backend import DelegationResult
+
+    async def _job(cap, model, sink):
+        if cap == "coder":
+            raise _asyncio.CancelledError()
+        return DelegationResult(f"{cap}-ok", 1, 1, True, 0.1)
+
+    jobs = [
+        run_ollama._Job(cap="coder", model="m", prompt="p"),
+        run_ollama._Job(cap="reviewer", model="m2", prompt="p"),
+    ]
+    results = run_ollama._run_batch_for_test(
+        jobs, _job=_job, max_parallel=2, max_queued=10, output_dir=str(tmp_path)
+    )
+    assert isinstance(results[0], _asyncio.CancelledError)  # captured, not raised
+    assert getattr(results[1], "content", None) == "reviewer-ok"  # sibling completed normally
+
+
+def test_run_batch_serial_single_job_uses_fast_path_bypassing_scheduler_and_proxy(
+    tmp_path, monkeypatch
+):
+    # Post-approval fix #2 (Balthasar maintainability finding): max_parallel_agents
+    # == 1 AND a single-job batch must bypass the Scheduler and the fan-out
+    # indexed-file-sink routing entirely, AND must bypass the guaranteed-restore
+    # `install_dispatching_stderr()` wrapper specifically (asserted below by
+    # monkeypatching THAT function, not the `_DispatchingStderr` proxy class --
+    # the proxy itself is still lazily installed via `buffered_stderr_while` ->
+    # `capture_stderr_for_delegation` -> `_ensure_dispatching_stderr_installed`,
+    # [doc, corrected] same as MS3) -- delegating straight to the same shape as
+    # MS3's simple `run_delegation` path (stdout sink, plain `{cap}.*` artifact
+    # names, `buffered_stderr_while`).
+    import run_ollama
+    from backend import DelegationResult
+    from scheduler import Scheduler
+
+    def _boom_run_all(self, thunks):
+        raise AssertionError("fast path must not touch Scheduler.run_all")
+
+    def _boom_install_proxy():
+        raise AssertionError(
+            "fast path must not use the guaranteed-restore install_dispatching_stderr() "
+            "wrapper (the proxy itself may still be lazily installed elsewhere)"
+        )
+
+    monkeypatch.setattr(Scheduler, "run_all", _boom_run_all)
+    monkeypatch.setattr(run_ollama, "install_dispatching_stderr", _boom_install_proxy)
+
+    async def _job(cap, model, sink):
+        sink("tok")
+        return DelegationResult(f"{cap}-out", 1, 1, True, 0.1)
+
+    jobs = [run_ollama._Job(cap="coder", model="m", prompt="p")]
+    results = run_ollama._run_batch_for_test(
+        jobs, _job=_job, max_parallel=1, max_queued=0, output_dir=str(tmp_path)
+    )
+    assert results[0].content == "coder-out"
+    # Plain, unindexed artifact name -- there is exactly one delegation, nothing to
+    # disambiguate against (contrast with the fan-out naming, `{cap}_{index}.*`).
+    assert os.path.exists(os.path.join(str(tmp_path), "coder.stderr.log"))
+    assert not os.path.exists(os.path.join(str(tmp_path), "coder_0.stderr.log"))
+
+
+def test_run_batch_aggregates_token_stats_across_fanout_delegations(tmp_path, monkeypatch):
+    # INFO fix (R12): fan-out delegations must thread a SHARED, thread-safe
+    # TokenStats (MS2's, guarded by its own lock) into dispatch(..., stats=...) so
+    # token accounting is not inert for batches -- each delegation's tokens
+    # accumulate into ONE aggregate, written to token_stats.json at batch end.
+    import json
+
+    import run_ollama
+    from backend import DelegationResult
+
+    def _fake_dispatch(
+        capability, prompt, *, backend, model, timeout, system_prompt, config, sink=None, stats=None
+    ):
+        result = DelegationResult(f"{capability}-out", 10, 20, True, 1.0)
+        if stats is not None:
+            stats.record(capability, model, result)
+        return result
+
+    monkeypatch.setattr(run_ollama, "dispatch", _fake_dispatch)
+    monkeypatch.setattr(run_ollama, "load_system_prompt", lambda cap: "sys")
+    monkeypatch.setattr(run_ollama, "_make_backend", lambda cfg: object())
+
+    config = run_ollama._cfg_for_batch(max_parallel_agents=2, max_queued_agents=10)
+    jobs = [
+        run_ollama._Job(cap="coder", model="m1", prompt="p1"),
+        run_ollama._Job(cap="reviewer", model="m2", prompt="p2"),
+    ]
+    results = asyncio.run(run_ollama.run_batch(jobs, config=config, output_dir=str(tmp_path)))
+    assert all(r.content.endswith("-out") for r in results)
+
+    stats_path = os.path.join(str(tmp_path), "token_stats.json")
+    assert os.path.exists(stats_path)
+    with open(stats_path, encoding="utf-8") as fh:
+        saved = json.load(fh)
+    assert saved["coder"]["m1"]["prompt_tokens"] == 10
+    assert saved["coder"]["m1"]["completion_tokens"] == 20
+    assert saved["reviewer"]["m2"]["prompt_tokens"] == 10
+    assert saved["reviewer"]["m2"]["completion_tokens"] == 20
+
+
+def test_general_and_serial_paths_both_route_through_execute_delegation_for_rate_limit(
+    tmp_path, monkeypatch
+):
+    # DRY fix (gate-closing round): `_one()` (parallel) and
+    # `_run_batch_serial_fast_path` (serial) must both classify outcomes via the
+    # SAME shared `_execute_delegation` core, not duplicated inline logic. Spy on
+    # `_execute_delegation` itself and drive BOTH a 2-job parallel batch and a
+    # 1-job/max_parallel=1 serial batch through a RateLimitError: both must (a)
+    # actually call the shared function for every job's model and (b) classify
+    # the outcome identically -- neither trips its breaker.
+    import run_ollama
+    from circuit_breaker import CircuitBreaker
+    from errors import RateLimitError
+
+    calls: list[str] = []
+    orig = run_ollama._execute_delegation
+
+    async def _spy(model, **kwargs):
+        calls.append(model)
+        return await orig(model, **kwargs)
+
+    monkeypatch.setattr(run_ollama, "_execute_delegation", _spy)
+
+    async def _job(cap, model, sink):
+        raise RateLimitError("429 exhausted")
+
+    breaker_parallel = CircuitBreaker(threshold=1, cooldown=1e9)
+    jobs_parallel = [
+        run_ollama._Job(cap="coder", model="m1", prompt="p"),
+        run_ollama._Job(cap="reviewer", model="m2", prompt="p"),
+    ]
+    results_parallel = run_ollama._run_batch_for_test(
+        jobs_parallel,
+        _job=_job,
+        max_parallel=2,
+        max_queued=10,
+        output_dir=str(tmp_path),
+        breaker=breaker_parallel,
+    )
+    assert all(isinstance(r, RateLimitError) for r in results_parallel)
+    assert breaker_parallel.is_open("m1", now=0.0) is False
+    assert breaker_parallel.is_open("m2", now=0.0) is False
+
+    breaker_serial = CircuitBreaker(threshold=1, cooldown=1e9)
+    jobs_serial = [run_ollama._Job(cap="coder", model="m3", prompt="p")]
+    results_serial = run_ollama._run_batch_for_test(
+        jobs_serial,
+        _job=_job,
+        max_parallel=1,
+        max_queued=0,
+        output_dir=str(tmp_path),
+        breaker=breaker_serial,
+    )
+    assert isinstance(results_serial[0], RateLimitError)
+    assert breaker_serial.is_open("m3", now=0.0) is False
+
+    # Both concurrency shapes actually routed through the shared core.
+    assert "m1" in calls and "m2" in calls and "m3" in calls
+
+
+def test_run_batch_stats_write_oserror_does_not_crash_the_batch(tmp_path, monkeypatch, caplog):
+    # [WARNING] stats.write raising OSError (disk-full/permission) must not crash
+    # an otherwise-successful batch -- best-effort, like `_persist_stderr`.
+    # [WARNING, seventh round -- closed] the failure must also no longer be
+    # SILENT: `_write_stats_best_effort` now logs an actionable warning
+    # (observability fix) before swallowing the OSError.
+    import logging
+
+    import run_ollama
+    from backend import DelegationResult
+    from token_stats import TokenStats
+
+    def _boom_write(self, output_dir):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(TokenStats, "write", _boom_write)
+
+    async def _job(cap, model, sink):
+        return DelegationResult(f"{cap}-ok", 1, 1, True, 0.1)
+
+    jobs = [
+        run_ollama._Job(cap="coder", model="m1", prompt="p"),
+        run_ollama._Job(cap="reviewer", model="m2", prompt="p"),
+    ]
+    with caplog.at_level(logging.WARNING):
+        results = run_ollama._run_batch_for_test(
+            jobs, _job=_job, max_parallel=2, max_queued=10, output_dir=str(tmp_path)
+        )
+    assert all(getattr(r, "content", "").endswith("-ok") for r in results)
+    # The loss is now observable, not silent (never raised to the caller either way).
+    assert "token_stats.json" in caplog.text and "disk full" in caplog.text
+
+
+def test_run_batch_serial_fast_path_stats_write_oserror_does_not_crash(
+    tmp_path, monkeypatch, caplog
+):
+    # [WARNING] Same best-effort guarantee on the serial single-delegation fast path.
+    # [WARNING, seventh round -- closed] same observability requirement as the
+    # general-path test above: the warning must fire here too.
+    import logging
+
+    import run_ollama
+    from backend import DelegationResult
+    from token_stats import TokenStats
+
+    def _boom_write(self, output_dir):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(TokenStats, "write", _boom_write)
+
+    async def _job(cap, model, sink):
+        return DelegationResult(f"{cap}-ok", 1, 1, True, 0.1)
+
+    jobs = [run_ollama._Job(cap="coder", model="m", prompt="p")]
+    with caplog.at_level(logging.WARNING):
+        results = run_ollama._run_batch_for_test(
+            jobs, _job=_job, max_parallel=1, max_queued=0, output_dir=str(tmp_path)
+        )
+    assert results[0].content == "coder-ok"
+    assert "token_stats.json" in caplog.text and "disk full" in caplog.text
+
+
+def test_run_batch_empty_job_list_returns_empty_list_cleanly(tmp_path, monkeypatch):
+    # [INFO] run_batch([]) must short-circuit before touching the Scheduler, the
+    # stderr-dispatching proxy, or TokenStats -- no scheduler run, no proxy
+    # install, no crash.
+    import run_ollama
+    from scheduler import Scheduler
+
+    def _boom_run_all(self, thunks):
+        raise AssertionError("empty batch must never reach Scheduler.run_all")
+
+    def _boom_install_proxy():
+        raise AssertionError("empty batch must never install the stderr proxy")
+
+    monkeypatch.setattr(Scheduler, "run_all", _boom_run_all)
+    monkeypatch.setattr(run_ollama, "install_dispatching_stderr", _boom_install_proxy)
+
+    config = run_ollama._cfg_for_batch(max_parallel_agents=3, max_queued_agents=10)
+    results = asyncio.run(run_ollama.run_batch([], config=config, output_dir=str(tmp_path)))
+    assert results == []
+
+
+def test_run_batch_overflow_rejected_half_open_job_does_not_leak_the_probe(tmp_path):
+    # CRITICAL fix (gate-closing round, probe-slot leak): a job whose model is
+    # HALF-OPEN-eligible passes the READ-ONLY pre-scheduling filter
+    # (`is_definitively_open`) without reserving anything -- but if the
+    # Scheduler then overflow-REJECTS it (R21b) before it ever reaches
+    # `_execute_delegation`, the OLD behavior (the pre-scan calling the
+    # reserving `is_open`) would have permanently stranded the model with a
+    # probe reservation nobody ever releases. Prove the fix: a LATER
+    # delegation to the same model must still be admitted as the probe.
+    import run_ollama
+    from backend import DelegationResult
+    from circuit_breaker import CircuitBreaker
+
+    breaker = CircuitBreaker(threshold=1, cooldown=0.0)
+    breaker.record_failure("flaky:cloud", now=0.0)  # cooldown=0.0 -> half-open-eligible immediately
+
+    async def _job(cap, model, sink):
+        await asyncio.sleep(0.02)  # keep the ceiling's first 2 slots occupied
+        return DelegationResult("ok", 1, 1, True, 0.1)
+
+    # ceiling = max_parallel(1) + max_queued(1) = 2. Three jobs targeting the
+    # SAME half-open model: the pre-scheduling filter (read-only) lets all
+    # three through (none of them is "definitively open" -- the model is only
+    # half-open-eligible); the Scheduler admits the first 2 against the
+    # ceiling and overflow-rejects the 3rd, which therefore NEVER reaches
+    # `_execute_delegation` and never touches the probe.
+    jobs = [run_ollama._Job(cap="coder", model="flaky:cloud", prompt="p") for _ in range(3)]
+    results = run_ollama._run_batch_for_test(
+        jobs, _job=_job, max_parallel=1, max_queued=1, output_dir=str(tmp_path), breaker=breaker
+    )
+    assert (
+        sum(getattr(r, "content", None) == "ok" for r in results) >= 1
+    )  # the probe ran and succeeded
+
+    # A brand-new batch, later, to the SAME model must still be able to probe
+    # (threshold=1, so a fresh failure would immediately reopen -- but here we
+    # just confirm the circuit is CLOSED, proving the earlier probe resolved
+    # cleanly and nothing was left stuck from the overflow-rejected job).
+    assert breaker.is_open("flaky:cloud", now=1.0) is False
+
+
+def test_run_batch_two_concurrent_half_open_candidates_exactly_one_becomes_probe(tmp_path):
+    # Two delegations targeting the SAME half-open-eligible model, admitted
+    # CONCURRENTLY by the Scheduler (max_parallel=2): both pass the read-only
+    # pre-scheduling filter (neither is "definitively open"); when they
+    # actually run, `_execute_delegation`'s `breaker.try_enter(...)` admits
+    # exactly ONE as the probe -- the other fails fast with a DelegationError
+    # -- and the probe's reservation is released afterward (whether it
+    # succeeds or fails), never leaving the model stuck.
+    import run_ollama
+    from backend import DelegationResult
+    from circuit_breaker import CircuitBreaker
+    from errors import DelegationError
+
+    breaker = CircuitBreaker(threshold=1, cooldown=0.0)
+    breaker.record_failure("flaky:cloud", now=0.0)
+
+    barrier = asyncio.Event()
+    entered = {"count": 0}
+
+    async def _job(cap, model, sink):
+        entered["count"] += 1
+        if entered["count"] == 2:
+            barrier.set()  # release both once both have entered try_enter's caller
+        await barrier.wait()  # maximize the chance both are "in flight" at once
+        return DelegationResult("ok", 1, 1, True, 0.1)
+
+    jobs = [run_ollama._Job(cap="coder", model="flaky:cloud", prompt="p") for _ in range(2)]
+    results = run_ollama._run_batch_for_test(
+        jobs, _job=_job, max_parallel=2, max_queued=0, output_dir=str(tmp_path), breaker=breaker
+    )
+
+    successes = [r for r in results if getattr(r, "content", None) == "ok"]
+    rejections = [r for r in results if isinstance(r, DelegationError)]
+    # Exactly one of the two concurrent half-open candidates became the probe
+    # and ran; the other fails fast -- never both, never neither.
+    assert len(successes) + len(rejections) == 2
+    assert len(successes) >= 1
+    # The probe resolved (record_success) -- the model is healthy again, and
+    # nothing was left permanently reserved for the one that fast-failed.
+    assert breaker.is_open("flaky:cloud", now=1.0) is False
+
+
+def test_run_batch_serial_fast_path_releases_probe_on_success(tmp_path):
+    # The serial fast path's probe (if it holds one) is released via
+    # `record_success` inside the shared `_execute_delegation` core when the
+    # delegation succeeds -- proving the fast path's probe-holding delegation
+    # resolves cleanly, not just on cancellation (already covered by
+    # `test_run_batch_probe_cancellation_releases_slot_for_a_later_probe`).
+    import run_ollama
+    from backend import DelegationResult
+    from circuit_breaker import CircuitBreaker
+
+    breaker = CircuitBreaker(threshold=1, cooldown=0.0)
+    breaker.record_failure("flaky:cloud", now=0.0)
+
+    async def _job(cap, model, sink):
+        return DelegationResult("ok", 1, 1, True, 0.1)
+
+    jobs = [run_ollama._Job(cap="coder", model="flaky:cloud", prompt="p")]
+    results = run_ollama._run_batch_for_test(
+        jobs, _job=_job, max_parallel=1, max_queued=0, output_dir=str(tmp_path), breaker=breaker
+    )
+    assert getattr(results[0], "content", None) == "ok"
+    assert breaker.is_open("flaky:cloud", now=1.0) is False  # closed by record_success
+
+
+def test_run_batch_serial_fast_path_releases_probe_on_failure(tmp_path):
+    # Same, but the probe delegation FAILS (a real backend error) -- resolved
+    # via `record_failure` (reopens for a fresh cooldown), not left stuck in
+    # "probe in flight" forever.
+    import run_ollama
+    from circuit_breaker import CircuitBreaker
+    from errors import OllamaBackendError
+
+    breaker = CircuitBreaker(threshold=1, cooldown=5.0)
+    breaker.record_failure("flaky:cloud", now=0.0)
+
+    async def _job(cap, model, sink):
+        raise OllamaBackendError("connection refused")
+
+    jobs = [run_ollama._Job(cap="coder", model="flaky:cloud", prompt="p")]
+    results = run_ollama._run_batch_for_test(
+        jobs, _job=_job, max_parallel=1, max_queued=0, output_dir=str(tmp_path), breaker=breaker
+    )
+    assert isinstance(results[0], OllamaBackendError)
+    assert breaker.is_open("flaky:cloud", now=1.0) is True  # reopened for a FRESH cooldown
+    assert (
+        breaker.is_open("flaky:cloud", now=6.0) is False
+    )  # fresh cooldown (1+5) elapsed -> a later probe admitted
+
+
+def test_run_batch_thread_pool_sized_to_max_parallel_not_capped_by_default_executor(tmp_path):
+    # Thread-pool sizing fix, re-verified under the seventh-round design:
+    # `max_parallel_agents` set to 40 -- above the DEFAULT executor's
+    # `min(32, os.cpu_count() + 4)` ceiling on any real/CI machine -- with 40
+    # concurrent BLOCKING jobs (a real `threading.Event`, so each genuinely
+    # occupies a worker thread; an `asyncio.sleep` would NOT prove this, since
+    # it never blocks a thread) must all run concurrently -- proving
+    # `run_batch`'s `_ensure_sized_default_executor(loop, max_parallel_agents)`
+    # (which sizes the loop's own DEFAULT executor -- the one `asyncio.to_thread`
+    # implicitly dispatches onto) is the true limit, not the event loop's
+    # smaller, un-sized default pool. `asyncio.to_thread` is deliberately still
+    # the dispatch mechanism (not a separately-passed dedicated executor) --
+    # see the thread-pool-sizing entry's CRITICAL fix for why.
+    import threading
+
+    import run_ollama
+    from backend import DelegationResult
+
+    N = 40
+    release = threading.Event()
+    entered = {"count": 0}
+    lock = threading.Lock()
+
+    def _blocking_job(cap, model, sink):
+        with lock:
+            entered["count"] += 1
+        release.wait(timeout=5.0)  # blocks a REAL OS thread until every job has entered
+        return DelegationResult("ok", 1, 1, True, 0.1)
+
+    # Drive the REAL `run_batch` (not the `_job=` test seam) with `dispatch`
+    # monkeypatched to the blocking body, so `run_batch`'s actual sized DEFAULT
+    # executor (`_ensure_sized_default_executor`) is exercised end-to-end via
+    # `_run_one_delegation` -> `dispatch` -> `asyncio.to_thread(...)`, not
+    # bypassed by the `_job=` seam's own direct-call shortcut.
+    def _fake_dispatch(
+        capability, prompt, *, backend, model, timeout, system_prompt, config, sink=None, stats=None
+    ):
+        return _blocking_job(capability, model, sink)
+
+    import unittest.mock
+
+    with (
+        unittest.mock.patch.object(run_ollama, "dispatch", _fake_dispatch),
+        unittest.mock.patch.object(run_ollama, "load_system_prompt", lambda cap: "sys"),
+        unittest.mock.patch.object(run_ollama, "_make_backend", lambda cfg: object()),
+    ):
+        config = run_ollama._cfg_for_batch(max_parallel_agents=N, max_queued_agents=0)
+        jobs = [run_ollama._Job(cap="coder", model="m", prompt="p") for _ in range(N)]
+
+        async def _drive():
+            task = asyncio.create_task(
+                run_ollama.run_batch(jobs, config=config, output_dir=str(tmp_path))
+            )
+            # Poll until every job has entered its blocking body, or time out --
+            # if the pool were capped below N, `entered["count"]` would plateau
+            # below N forever (every job past the cap starves for a free thread).
+            for _ in range(100):
+                with lock:
+                    if entered["count"] >= N:
+                        break
+                await asyncio.sleep(0.05)
+            with lock:
+                reached_all = entered["count"] >= N
+            release.set()
+            return await task, reached_all
+
+        results, reached_all = asyncio.run(_drive())
+        assert reached_all, f"only {entered['count']}/{N} jobs ever entered — pool-capped"
+        assert all(getattr(r, "content", None) == "ok" for r in results)
+
+
+def test_run_batch_stderr_contextvar_propagates_to_worker_thread(tmp_path, capsys):
+    # [CRITICAL, seventh round -- the actual regression test for this round's
+    # fix] `_run_one_delegation` runs on a REAL OS worker thread (dispatched
+    # via `asyncio.to_thread`, onto the loop's own sized DEFAULT executor --
+    # see `_ensure_sized_default_executor`). `asyncio.to_thread` copies the
+    # calling CONTEXT (`contextvars.copy_context().run(...)`) into that
+    # thread, so the per-delegation `capture_stderr_for_delegation()`
+    # ContextVar set on the EVENT-LOOP TASK immediately before dispatch (Task
+    # 4) is still visible from INSIDE the worker thread -- which is what makes
+    # `_DispatchingStderr` route THIS thread's `sys.stderr` writes to THIS
+    # delegation's own buffer.
+    #
+    # A bare `loop.run_in_executor(executor, func)` call (the sixth round's
+    # design, reverted this round) does NOT copy context: the worker thread
+    # would see `_current_capture.get()`'s default (None) and fall straight
+    # through to the REAL stderr instead of either delegation's buffer -- both
+    # delegations' writes would show up on the real stderr (via `capsys`)
+    # and NEITHER `.stderr.log` would contain them. This test drives the REAL
+    # `run_batch` (not the `_worker=` seam, which calls its fake directly on
+    # the event loop and would never touch a worker thread at all) with two
+    # concurrent fan-out jobs, so `dispatch` genuinely executes inside
+    # `asyncio.to_thread`.
+    import sys
+    import unittest.mock
+
+    import run_ollama
+    from backend import DelegationResult
+
+    def _fake_dispatch(
+        capability, prompt, *, backend, model, timeout, system_prompt, config, sink=None, stats=None
+    ):
+        # Runs on the worker thread. Writes through `sys.stderr` -- the
+        # per-delegation `_DispatchingStderr` proxy IF (and only if) the
+        # ContextVar propagated into THIS thread.
+        print(f"worker-stderr-{capability}", file=sys.stderr)
+        return DelegationResult(f"{capability}-out", 1, 1, True, 0.1)
+
+    with (
+        unittest.mock.patch.object(run_ollama, "dispatch", _fake_dispatch),
+        unittest.mock.patch.object(run_ollama, "load_system_prompt", lambda cap: "sys"),
+        unittest.mock.patch.object(run_ollama, "_make_backend", lambda cfg: object()),
+    ):
+        config = run_ollama._cfg_for_batch(max_parallel_agents=2, max_queued_agents=10)
+        jobs = [
+            run_ollama._Job(cap="coder", model="m1", prompt="p"),
+            run_ollama._Job(cap="reviewer", model="m2", prompt="p"),
+        ]
+        results = asyncio.run(run_ollama.run_batch(jobs, config=config, output_dir=str(tmp_path)))
+
+    assert all(r.content.endswith("-out") for r in results)
+
+    # Each delegation's OWN worker-thread write landed in ITS OWN indexed
+    # stderr artifact -- not the sibling's, and not the real stderr.
+    with open(os.path.join(str(tmp_path), "coder_0.stderr.log"), encoding="utf-8") as fh:
+        coder_log = fh.read()
+    with open(os.path.join(str(tmp_path), "reviewer_1.stderr.log"), encoding="utf-8") as fh:
+        reviewer_log = fh.read()
+    assert "worker-stderr-coder" in coder_log
+    assert "worker-stderr-reviewer" not in coder_log
+    assert "worker-stderr-reviewer" in reviewer_log
+    assert "worker-stderr-coder" not in reviewer_log
+    # If the ContextVar had NOT propagated into the worker thread (the
+    # sixth-round bug), both writes would have fallen through to the REAL
+    # stderr instead of either delegation's buffer.
+    assert "worker-stderr" not in capsys.readouterr().err
+
+
+def test_run_batch_reuses_the_same_sized_default_executor_across_calls_on_one_loop(tmp_path):
+    # [WARNING, seventh round -- closed] Per-batch executor churn eliminated:
+    # confirm `_ensure_sized_default_executor` constructs the ThreadPoolExecutor
+    # only the FIRST time it sees a given loop -- a second `run_batch` call
+    # made from WITHIN THE SAME `asyncio.run()` block must reuse the IDENTICAL
+    # executor instance, never construct/tear down a fresh one per batch.
+    # [WARNING, eighth round -- closed] Updated for the WeakKeyDictionary cache
+    # (`_SIZED_DEFAULT_EXECUTORS`), which replaced a private
+    # `loop._ollama_worker_executor` attribute -- also now asserts that a
+    # SECOND, independent loop gets its OWN, distinct executor (the cache is
+    # keyed per-loop, never a single global instance).
+    import run_ollama
+    from backend import DelegationResult
+
+    async def _job(cap, model, sink):
+        return DelegationResult(f"{cap}-ok", 1, 1, True, 0.1)
+
+    async def _drive():
+        config = run_ollama._cfg_for_batch(max_parallel_agents=2, max_queued_agents=10)
+        jobs_1 = [
+            run_ollama._Job(cap="coder", model="m1", prompt="p"),
+            run_ollama._Job(cap="reviewer", model="m2", prompt="p"),
+        ]
+        await run_ollama.run_batch(jobs_1, config=config, output_dir=str(tmp_path), _worker=_job)
+        loop = asyncio.get_running_loop()
+        executor_after_first = run_ollama._SIZED_DEFAULT_EXECUTORS.get(loop)
+        assert executor_after_first is not None
+
+        jobs_2 = [
+            run_ollama._Job(cap="coder", model="m1", prompt="p"),
+            run_ollama._Job(cap="reviewer", model="m2", prompt="p"),
+        ]
+        await run_ollama.run_batch(jobs_2, config=config, output_dir=str(tmp_path), _worker=_job)
+        executor_after_second = run_ollama._SIZED_DEFAULT_EXECUTORS.get(loop)
+
+        # Same object -- no reconstruction between the two run_batch calls.
+        assert executor_after_second is executor_after_first
+        return executor_after_first
+
+    executor_on_loop_a = asyncio.run(_drive())
+
+    # A SECOND, independent `asyncio.run()` call gets a brand-new loop -- the
+    # WeakKeyDictionary cache must size and store a DISTINCT executor for it,
+    # never reuse loop A's (proving the cache is keyed per-loop).
+    executor_on_loop_b = asyncio.run(_drive())
+    assert executor_on_loop_b is not executor_on_loop_a
+
+
+def test_run_batch_token_stats_thread_safe_under_real_fanout_concurrency(tmp_path):
+    # [WARNING] MS2's `TokenStats.record`/`.to_dict` are lock-guarded, but this
+    # is the first test to verify that lock actually holds under MS5's REAL
+    # fan-out (many genuinely concurrent delegations, not just two) -- proving
+    # the aggregate is the exact sum with no torn/lost update, not merely that
+    # two calls happen not to collide.
+    import json
+
+    import run_ollama
+    from backend import DelegationResult
+
+    N = 25
+    PROMPT_TOKENS_EACH = 7
+    COMPLETION_TOKENS_EACH = 13
+
+    async def _job(cap, model, sink):
+        await asyncio.sleep(0.001)  # encourage interleaving across the real fan-out
+        return DelegationResult(
+            f"{cap}-out", PROMPT_TOKENS_EACH, COMPLETION_TOKENS_EACH, True, 0.05
+        )
+
+    def _fake_dispatch(
+        capability, prompt, *, backend, model, timeout, system_prompt, config, sink=None, stats=None
+    ):
+        result = DelegationResult(
+            f"{capability}-out", PROMPT_TOKENS_EACH, COMPLETION_TOKENS_EACH, True, 0.05
+        )
+        if stats is not None:
+            stats.record(capability, model, result)
+        return result
+
+    import unittest.mock
+
+    with (
+        unittest.mock.patch.object(run_ollama, "dispatch", _fake_dispatch),
+        unittest.mock.patch.object(run_ollama, "load_system_prompt", lambda cap: "sys"),
+        unittest.mock.patch.object(run_ollama, "_make_backend", lambda cfg: object()),
+    ):
+        # All N delegations target the SAME model bucket, so a torn/lost update
+        # would show up directly as a wrong aggregate count for that one bucket
+        # -- N distinct buckets could hide a lost update behind N-1 correct ones.
+        config = run_ollama._cfg_for_batch(max_parallel_agents=8, max_queued_agents=N)
+        jobs = [
+            run_ollama._Job(cap="coder", model="shared:cloud", prompt=f"p{i}") for i in range(N)
+        ]
+        results = asyncio.run(run_ollama.run_batch(jobs, config=config, output_dir=str(tmp_path)))
+
+    assert all(r.content == "coder-out" for r in results)
+    with open(os.path.join(str(tmp_path), "token_stats.json"), encoding="utf-8") as fh:
+        saved = json.load(fh)
+    bucket = saved["coder"]["shared:cloud"]
+    # The aggregate must equal the EXACT sum across all N concurrent
+    # delegations -- no torn state, no lost increments under real concurrency.
+    assert bucket["prompt_tokens"] == N * PROMPT_TOKENS_EACH
+    assert bucket["completion_tokens"] == N * COMPLETION_TOKENS_EACH
