@@ -1344,6 +1344,96 @@ def test_dispatch_stream_false_uses_transactional_unchanged(monkeypatch):
     assert out.content == "core" and (out.prompt_tokens, out.completion_tokens) == (7, 3)
 
 
+def test_schema_capability_never_streams_even_when_stream_true(monkeypatch):
+    # Important (R25/R29): a schema-mode capability (reviewer/tester) ALWAYS uses the
+    # transactional path — even if [stream]=true is (mis)configured — so its parse/validate
+    # retry shares ONE deadline (streaming derives its own → up to 2×timeout) and the
+    # invalid first attempt's tokens are never concatenated with the retry's on one sink.
+    import run_ollama
+
+    calls = {"stream": 0, "transactional": 0}
+
+    def _fake_stream(
+        config, system_prompt, prompt, model, timeout, *, sink, response_format=None, **kw
+    ):
+        calls["stream"] += 1
+        return DelegationResult(_GOOD_REVIEW, 1, 1, True, 0.1)
+
+    class _FakeBackend:
+        def run(
+            self,
+            capability,
+            system_prompt,
+            prompt,
+            model,
+            timeout,
+            *,
+            response_format=None,
+            deadline=None,
+        ):
+            calls["transactional"] += 1
+            return DelegationResult(_GOOD_REVIEW, 5, 2, False, 0.1)
+
+    monkeypatch.setattr(run_ollama, "stream_run", _fake_stream)
+    out = run_ollama.dispatch(
+        "reviewer",
+        "review",
+        backend=_FakeBackend(),
+        model="m",
+        timeout=10,
+        system_prompt="sys",
+        config=_stream_cfg(reviewer=True),
+        stats=TokenStats(),
+        sink=lambda _s: None,
+    )
+    assert calls["transactional"] == 1 and calls["stream"] == 0  # schema → transactional
+    assert out.parsed is not None and out.parsed["capability"] == "reviewer"
+
+
+def test_stream_true_but_no_sink_falls_back_to_transactional(monkeypatch):
+    # R7c: [stream]=true but sink=None means there is nothing to stream to, so the
+    # transactional path applies (the streaming path is never entered without a sink).
+    import run_ollama
+
+    calls = {"stream": 0, "transactional": 0}
+
+    def _fake_stream(
+        config, system_prompt, prompt, model, timeout, *, sink, response_format=None, **kw
+    ):
+        calls["stream"] += 1
+        return DelegationResult("streamed", 1, 1, True, 0.1)
+
+    class _FakeBackend:
+        def run(
+            self,
+            capability,
+            system_prompt,
+            prompt,
+            model,
+            timeout,
+            *,
+            response_format=None,
+            deadline=None,
+        ):
+            calls["transactional"] += 1
+            return DelegationResult("transacted", 1, 1, True, 0.1)
+
+    monkeypatch.setattr(run_ollama, "stream_run", _fake_stream)
+    out = run_ollama.dispatch(
+        "coder",
+        "write",
+        backend=_FakeBackend(),
+        model="m",
+        timeout=10,
+        system_prompt="sys",
+        config=_stream_cfg(coder=True),
+        stats=TokenStats(),
+        sink=None,
+    )
+    assert calls["transactional"] == 1 and calls["stream"] == 0  # no sink → transactional
+    assert out.content == "transacted"
+
+
 def test_stdout_sink_writes_and_flushes(monkeypatch):
     import run_ollama
 

@@ -381,10 +381,11 @@ def _run_once(
     """Pick the streaming or transactional path for one delegation attempt (R7b/R7c).
 
     Streams via ``ollama_stream.stream_run`` (or ``ollama_vision.stream_vision`` for
-    ``vision``) when BOTH the capability's ``[stream]`` config is true AND a *sink* is
-    given — no sink means nothing to stream to, so the transactional path always
-    applies regardless of the ``[stream]`` setting. Otherwise runs the MS1
-    transactional core (``backend.run``) unchanged.
+    ``vision``) when ALL of: the capability's ``[stream]`` config is true, a *sink* is
+    given, AND the capability is NOT schema-mode (``[structured]`` != ``"schema"``). No
+    sink means nothing to stream to; a schema-mode capability ALWAYS runs transactionally
+    so its R25 parse/validate retry shares one deadline and never double-streams (see the
+    inline note). Otherwise runs the MS1 transactional core (``backend.run``) unchanged.
 
     *deadline* is threaded into ``backend.run`` only: the streaming path
     (``stream_run``/``stream_vision``) derives its OWN deadline internally from
@@ -409,7 +410,15 @@ def _run_once(
     Returns:
         The ``DelegationResult`` for this one attempt.
     """
-    if bool(config.stream.get(capability)) and sink is not None:
+    # A schema-mode (structured) capability ALWAYS uses the transactional path, never
+    # streaming — even if [stream]=true is (mis)configured for it. Streaming a schema
+    # capability would break the shared R25 deadline on a parse/validate retry (stream_run
+    # derives its OWN fresh deadline → up to 2×timeout) and concatenate the invalid first
+    # attempt's raw tokens with the retry's on the same sink. The spec's config rationale
+    # is "structured/corto → transactional"; making it a code invariant (not just the
+    # reviewer/tester [stream]=false default a user could override) closes that gap.
+    is_schema = config.structured.get(capability) == "schema"
+    if bool(config.stream.get(capability)) and sink is not None and not is_schema:
         fn = stream_vision if capability == "vision" else stream_run
         return fn(
             config,
