@@ -211,8 +211,8 @@ def _escape_multipart_filename(filename: str) -> str:
     # CR/LF are the ONLY exploitable characters here (MIME headers split solely on them, and
     # the multipart boundary is an unguessable uuid4), but stripping EVERY C0 control char,
     # DEL, and the Unicode line/paragraph separators (NEL/LS/PS) as well is cheap
-    # defense-in-depth: no control character rides into the header value at all. The escape
-    # of `\`/`"` above produces `\\`/`\"` (both printable), so it survives this pass.
+    # defense-in-depth: no line-terminating or C0 control character reaches the header value.
+    # The escape of `\`/`"` above produces `\\`/`\"` (both printable), so it survives this pass.
     return "".join(c for c in escaped if ord(c) >= 0x20 and c != "\x7f" and c not in "  ")
 
 

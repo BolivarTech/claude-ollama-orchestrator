@@ -438,7 +438,13 @@ def _lockfile_holder_is_live(path: str) -> bool:
       3. PID parses and the process is alive, but ``age``/``bound`` both parse and
          ``age >= bound`` -> reclaimable (PID-recycling-safe: the bound overrides a live
          PID that cannot possibly still be the original legitimate holder).
-      4. PID parses and is alive, and (``age < bound``, or either is unparseable) -> held.
+      4. PID parses and is alive and ``age < bound`` -> held.
+      5. PID parses and is alive but ``age``/``bound`` is unparseable (torn write that
+         landed only the PID line, or later corruption) -> the persisted bound cannot be
+         applied, so freshness falls back to the file's own mtime vs.
+         :data:`_EPHEMERAL_TORN_WRITE_GRACE_SECONDS` (as in rule 0): younger -> held;
+         older -> reclaimable. Without this, a recycled-PID live process would keep such a
+         lock IMMORTAL, wedging a slot/token forever.
 
     Args:
         path: The ephemeral lockfile to inspect.
