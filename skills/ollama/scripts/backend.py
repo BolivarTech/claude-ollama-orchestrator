@@ -17,7 +17,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 
 from errors import OllamaBackendError
 from ollama_config import OllamaAgentsConfig
@@ -57,17 +57,30 @@ def _safe_close(closable: Any) -> None:
         return
     try:
         close()
-    except OSError:
+    except Exception:  # noqa: BLE001
+        # Resource cleanup must NEVER mask the real result/exception in flight. `close()`
+        # most commonly raises `OSError`, but a stream can also raise a non-OSError (e.g.
+        # a `ValueError` "I/O operation on closed file", or a driver-specific error), which
+        # a narrow `except OSError` would let escape from a `finally` and REPLACE the real
+        # exception. Swallow ANY close failure — this is best-effort teardown, not a
+        # correctness path.
         pass
 
 
-def _estimate_tokens(text: str) -> int:
-    """Estimate token count as ``len(text) // 4`` (stdlib heuristic; never raises)."""
+def estimate_tokens(text: str) -> int:
+    """Estimate token count as ``len(text) // 4`` (stdlib heuristic; never raises).
+
+    Public (MS4 Task 1): shared with ``ollama_stream.py`` so the transactional core
+    and the streaming reader use the SAME estimator (DRY) — the local fail-soft
+    fallback used whenever the server omits ``usage`` (R7a).
+    """
     return len(text) // 4
 
 
-def _estimate_tokens_from_len(n: int) -> int:
+def estimate_tokens_from_len(n: int) -> int:
     """Estimate tokens from a character count as ``n // 4`` — no string allocation.
+
+    Public (MS4 Task 1): shared with ``ollama_stream.py`` (see ``estimate_tokens``).
 
     Args:
         n: A non-negative character length.
@@ -130,7 +143,7 @@ def _resolve_usage(
         completion_tokens = _coerce_token_count(usage.get("completion_tokens"))
         if prompt_tokens is not None and completion_tokens is not None:
             return prompt_tokens, completion_tokens, False
-    return _estimate_tokens_from_len(prompt_len), _estimate_tokens(content), True
+    return estimate_tokens_from_len(prompt_len), estimate_tokens(content), True
 
 
 @dataclass(frozen=True)
@@ -152,6 +165,12 @@ class DelegationResult:
         parsed: For a structured capability, the validated output dict; ``None`` for
             free-text. Lets ``dispatch`` return a single type carrying both the
             content and the parsed object.
+        truncated: True when the output was cut short by an anti-runaway output-size
+            cap. FIRST INTRODUCED in MS4 (Task 1): the streaming reader (Task 2) sets
+            this when it hits its bounded-buffer/output cap; the transactional core
+            never sets it here (MS6's R24c wires the transactional output cap onto
+            this SAME field rather than introducing a new one). Defaults to ``False``
+            so every MS1/MS2 construction site is unaffected.
     """
 
     content: str
@@ -160,6 +179,7 @@ class DelegationResult:
     estimated: bool
     elapsed_s: float
     parsed: dict[str, Any] | None = None
+    truncated: bool = False
 
     @property
     def tok_per_s(self) -> float:
@@ -177,16 +197,202 @@ class DelegationResult:
         return round(self.completion_tokens / self.elapsed_s, 4)
 
 
-class _ResponseFormatRejected(Exception):
-    """Internal signal: the server rejected ``response_format`` (400) → downgrade."""
+class ResponseFormatRejected(Exception):
+    """Signal: HTTP 400 rejected ``response_format`` → retry once without it (R11).
+
+    An internal HTTP-flow control signal — deliberately NOT part of the domain
+    exception hierarchy in ``errors.py`` (see MS4's import-consistency note): it
+    never surfaces past ``OllamaBackend.run`` / the streaming reader's downgrade
+    retry. Public (MS4 Task 1) so ``ollama_stream.py`` shares this ONE signal with
+    the transactional core instead of duplicating it.
+    """
 
 
 class _RateLimited(Exception):
-    """Internal signal: HTTP 429. Carries the parsed ``Retry-After`` (or None)."""
+    """Internal signal: HTTP 429. Carries the raw ``HTTPError`` so the caller can
+    compute the backoff delay via the shared ``retry_after_delay`` (DRY)."""
 
-    def __init__(self, retry_after: float | None) -> None:
+    def __init__(self, exc: urllib.error.HTTPError) -> None:
         super().__init__("rate limited")
-        self.retry_after = retry_after
+        self.exc = exc
+
+
+def build_chat_request(
+    config: OllamaAgentsConfig,
+    system_prompt: str,
+    prompt: str,
+    model: str,
+    response_format: dict[str, Any] | None,
+    *,
+    stream: bool,
+    content_parts: list[dict[str, Any]] | None = None,
+) -> urllib.request.Request:
+    """Build the shared ``/chat/completions`` request (transactional or streaming).
+
+    Public (MS4 Task 1): both ``OllamaBackend`` (transactional, ``stream=False``)
+    and ``ollama_stream.py`` (streaming, ``stream=True``) build their request
+    through this ONE function, so auth/shape/response_format handling can never
+    drift between the two paths (DRY).
+
+    Args:
+        config: Resolved config (``base_url``/``api_key``).
+        system_prompt: Capability system prompt.
+        prompt: Sanitized user prompt (used as the plain-string user content UNLESS
+            *content_parts* is given).
+        model: Resolved model tag.
+        response_format: Structured-output shape, or ``None`` for free text
+            (omitted from the body entirely when ``None``, never sent as JSON
+            ``null``).
+        stream: ``True`` adds ``"stream": true`` plus
+            ``stream_options: {"include_usage": true}`` so the final SSE chunk
+            still carries ``usage`` (R7a); ``False`` (MS1-MS6 default) is the
+            transactional shape, byte-identical to before this helper existed.
+        content_parts: Optional OpenAI-compatible multimodal content-parts array
+            for the user message (e.g. ``[{"type": "text", "text": ...},
+            {"type": "image_url", "image_url": {...}}]``). When provided, the user
+            message's ``content`` is this list INSTEAD OF the plain *prompt*
+            string. When ``None`` (the MS1-MS6 default), behavior is
+            byte-identical to before this parameter existed. This is the
+            **forward-compatible seam for MS7**: MS7's vision image transport
+            fills ``content_parts`` for the ``image_url`` data-URI part WITHOUT
+            any refactor of this shared helper.
+
+    Returns:
+        The prepared POST request (``Authorization`` header only if an api_key
+        exists — R9).
+    """
+    user_content: str | list[dict[str, Any]] = (
+        content_parts if content_parts is not None else prompt
+    )
+    body: dict[str, Any] = {
+        "model": model,
+        "stream": stream,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+    }
+    if stream:
+        body["stream_options"] = {"include_usage": True}
+    if response_format is not None:
+        body["response_format"] = response_format
+    req = urllib.request.Request(
+        f"{config.base_url}/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    if config.api_key:
+        req.add_header("Authorization", f"Bearer {config.api_key}")
+    return req
+
+
+def map_http_error(exc: BaseException, *, redact: Callable[[str], str]) -> NoReturn:
+    """Map a transport error to a domain exception. Always raises (``NoReturn``) —
+    callers never need a fall-through/re-raise after calling this.
+
+    Public (MS4 Task 1), shared by ``OllamaBackend`` and ``ollama_stream.py``.
+
+    HTTP 429 is deliberately NOT handled here: the caller must check
+    ``exc.code == 429`` and branch to its own backoff loop (via
+    ``retry_after_delay``) BEFORE calling this function — a 429 is not a terminal
+    failure, so it must never reach this always-raises mapper.
+
+    Args:
+        exc: The transport exception to map (``HTTPError``, ``URLError``,
+            ``socket.timeout``/``TimeoutError``, or any other transport failure).
+        redact: A ``str -> str`` redactor (see ``make_redactor``) applied to every
+            message so a configured ``api_key`` can never leak (NR3).
+
+    Raises:
+        ResponseFormatRejected: HTTP 400 rejecting ``response_format``/
+            ``json_schema`` (→ downgrade retry).
+        TimeoutError: socket timeout.
+        OllamaBackendError: any other 4xx/5xx, unreachable host, or unexpected
+            transport error (message redacted).
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        detail = ""
+        if exc.fp is not None:
+            try:
+                # Bounded read (MAX_ERROR_BODY_BYTES, MS1's DoS backstop, preserved
+                # verbatim here): a malicious/broken endpoint must not be able to
+                # force an unbounded in-memory read via its *error* body. Best-effort:
+                # a read failure (e.g. the peer resets the socket mid-read of the
+                # error page) degrades to an empty/unavailable detail rather than
+                # letting this SECONDARY, non-domain failure mask the error already
+                # being mapped below.
+                raw_detail = exc.read(MAX_ERROR_BODY_BYTES + 1)
+            except OSError:
+                raw_detail = b""
+            detail = raw_detail.decode("utf-8", errors="replace").lower()
+        if exc.code == 400 and ("response_format" in detail or "json_schema" in detail):
+            raise ResponseFormatRejected() from None
+        raise OllamaBackendError(
+            redact(f"Ollama HTTP {exc.code}: {exc.reason} {detail}".strip())
+        ) from None
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        raise TimeoutError(redact(f"Delegation timed out: {exc}")) from None
+    if isinstance(exc, urllib.error.URLError):
+        raise OllamaBackendError(redact(f"Cannot reach Ollama: {exc.reason}")) from None
+    raise OllamaBackendError(redact(f"Unexpected transport error: {exc}")) from None
+
+
+def make_redactor(api_key: str | None) -> Callable[[str], str]:
+    """Return a redactor that removes *api_key* from any message (NR3).
+
+    Public (MS4 Task 1): both the transactional core (``OllamaBackend``) and the
+    streaming reader build their redactor from this ONE source, so the api_key can
+    never leak through an error message via either path. An empty/``None`` key
+    yields an identity redactor (nothing secret to hide); a present key is always
+    replaced with ``***``.
+
+    Args:
+        api_key: The resolved api_key, or ``None``.
+
+    Returns:
+        A ``str -> str`` redactor.
+    """
+    if not api_key:
+        return lambda msg: msg
+    secret = api_key
+    return lambda msg: msg.replace(secret, _REDACTED)
+
+
+def retry_after_delay(exc: urllib.error.HTTPError, attempt: int, rng: Callable[[], float]) -> float:
+    """Backoff delay for a 429: honor ``Retry-After`` (numeric seconds or an
+    RFC-7231 HTTP-date), else a bounded exponential backoff with jitter (R8).
+
+    Public (MS4 Task 1), shared by ``OllamaBackend`` and ``ollama_stream.py`` so
+    the two paths compute IDENTICAL 429 backoff delays.
+
+    Args:
+        exc: The 429 ``HTTPError`` (its ``Retry-After`` header, if present, wins).
+        attempt: The zero-based backoff attempt number (used for the exponential
+            fallback only).
+        rng: Injectable random source in ``[0, 1)`` for deterministic jitter tests.
+
+    Returns:
+        The delay in seconds to sleep before the next attempt.
+    """
+    header = exc.headers.get("Retry-After") if exc.headers else None
+    if header:
+        header = header.strip()
+        if header.isdigit():
+            return float(header)
+        try:  # best-effort HTTP-date (RFC 7231); else fall back to jitter below.
+            when = parsedate_to_datetime(header)
+            if when is not None:
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+                return max((when - datetime.now(timezone.utc)).total_seconds(), 0.0)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    # `2**attempt` alone is typed `Any` by mypy (int.__pow__'s overload can't decide
+    # int-vs-float for a non-literal exponent) — pin it to `int` explicitly so the
+    # `Any` never silently leaks into this function's declared `-> float` return.
+    capped_backoff: int = min(2**attempt, _BACKOFF_CAP_SECONDS)
+    return capped_backoff * (0.5 + rng())
 
 
 class AgentBackend(ABC):
@@ -253,16 +459,17 @@ class OllamaBackend(AgentBackend):
         self._sleep = sleep or time.sleep
         self._rng = rng or random.random
         self._max_backoffs = max_backoffs
-
-    def _redact(self, message: str) -> str:
-        """Redact the configured ``api_key`` (if any) from an error message (NR3)."""
-        key = self._config.api_key
-        return message.replace(key, _REDACTED) if key else message
+        # DRY (MS4 Task 1): built from the SAME `make_redactor` the streaming reader
+        # uses, so the api_key can never leak through either path's error messages.
+        self._redact: Callable[[str], str] = make_redactor(config.api_key)
 
     def _build_request(
         self, system_prompt: str, prompt: str, model: str, response_format: dict[str, Any] | None
     ) -> urllib.request.Request:
-        """Build the OpenAI-compatible ``/chat/completions`` request.
+        """Build the OpenAI-compatible ``/chat/completions`` request (transactional).
+
+        Thin wrapper over the shared ``build_chat_request`` (``stream=False``),
+        kept as a method so the rest of this class's call sites are unchanged.
 
         Args:
             system_prompt: The capability's system prompt.
@@ -275,25 +482,9 @@ class OllamaBackend(AgentBackend):
             A prepared, not-yet-sent :class:`urllib.request.Request`. The
             ``Authorization`` header is added only when ``api_key`` is present (R9).
         """
-        body: dict[str, Any] = {
-            "model": model,
-            "stream": False,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-        }
-        if response_format is not None:
-            body["response_format"] = response_format
-        req = urllib.request.Request(
-            f"{self._config.base_url}/chat/completions",
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        return build_chat_request(
+            self._config, system_prompt, prompt, model, response_format, stream=False
         )
-        if self._config.api_key:
-            req.add_header("Authorization", f"Bearer {self._config.api_key}")
-        return req
 
     def _call(
         self, req: urllib.request.Request, deadline: float
@@ -345,11 +536,11 @@ class OllamaBackend(AgentBackend):
                             "or lower max_parallel_agents."
                         )
                     ) from None
-                delay = (
-                    rl.retry_after
-                    if rl.retry_after is not None
-                    else min(2**attempt, _BACKOFF_CAP_SECONDS) * (0.5 + self._rng())
-                )
+                # DRY (MS4 Task 1): the SAME `retry_after_delay` helper the streaming
+                # reader uses computes this delay (Retry-After header, numeric or
+                # HTTP-date, else bounded exponential + jitter) — identical to the
+                # inline logic this replaces.
+                delay = retry_after_delay(rl.exc, attempt, self._rng)
                 if time.monotonic() + delay > deadline:
                     raise OllamaBackendError(
                         self._redact(
@@ -375,7 +566,7 @@ class OllamaBackend(AgentBackend):
             (``None`` if the server omitted it) — no additional I/O or decoding.
 
         Raises:
-            _ResponseFormatRejected: on a 400 that mentions ``response_format``/
+            ResponseFormatRejected: on a 400 that mentions ``response_format``/
                 ``json_schema`` (caller downgrades and retries once).
             _RateLimited: on a 429 (caller backs off).
             OllamaBackendError: on any other HTTP error, connection failure, oversized
@@ -407,50 +598,23 @@ class OllamaBackend(AgentBackend):
             payload = json.loads(raw.decode("utf-8", errors="replace"))
         except urllib.error.HTTPError as exc:
             try:
-                detail = ""
-                if exc.fp is not None:
-                    # Bounded read, mirroring the success-path backstop above: a
-                    # malicious/broken endpoint must not be able to force an unbounded
-                    # in-memory read via its *error* body either. Best-effort: a read
-                    # failure degrades to an empty detail rather than masking exc.
-                    try:
-                        raw_detail = exc.read(MAX_ERROR_BODY_BYTES + 1)
-                    except OSError:
-                        raw_detail = b""
-                    detail = raw_detail.decode("utf-8", errors="replace").lower()
-                if exc.code == 400 and ("response_format" in detail or "json_schema" in detail):
-                    raise _ResponseFormatRejected() from None
+                # 429 is handled HERE, BEFORE the shared `map_http_error` (DRY, MS4
+                # Task 1): it is not a terminal failure — the caller (`_call`) backs
+                # off and retries, computing the delay via the shared
+                # `retry_after_delay` (identical logic to the streaming reader's).
                 if exc.code == 429:
-                    header = exc.headers.get("Retry-After") if exc.headers else None
-                    retry_after: float | None = None
-                    if header:
-                        header = header.strip()
-                        if header.isdigit():
-                            retry_after = float(header)
-                        else:  # best-effort HTTP-date (RFC 7231); else fall back to jitter.
-                            try:
-                                when = parsedate_to_datetime(header)
-                                if when is not None:
-                                    if when.tzinfo is None:
-                                        when = when.replace(tzinfo=timezone.utc)
-                                    retry_after = max(
-                                        (when - datetime.now(timezone.utc)).total_seconds(),
-                                        0.0,
-                                    )
-                            except (TypeError, ValueError, OverflowError):
-                                retry_after = None
-                    raise _RateLimited(retry_after) from None
-                raise OllamaBackendError(
-                    self._redact(f"Ollama HTTP {exc.code}: {exc.reason} {detail}".strip())
-                ) from None
+                    raise _RateLimited(exc) from None
+                # Every other HTTPError (400 downgrade-signal or any other 4xx/5xx)
+                # goes through the ONE shared mapper both the transactional core and
+                # the streaming reader use — same bounded error-body read
+                # (MAX_ERROR_BODY_BYTES), same redaction, same downgrade detection.
+                map_http_error(exc, redact=self._redact)
             finally:
                 _safe_close(exc)
         except (socket.timeout, TimeoutError) as exc:
-            raise TimeoutError(self._redact(f"Delegation timed out: {exc}")) from None
+            map_http_error(exc, redact=self._redact)
         except urllib.error.URLError as exc:
-            raise OllamaBackendError(
-                self._redact(f"Cannot reach Ollama at {self._config.base_url}: {exc.reason}")
-            ) from None
+            map_http_error(exc, redact=self._redact)
         except (OSError, http.client.IncompleteRead) as exc:
             # Any other connect/read failure not already covered above (e.g. a
             # ConnectionResetError or a truncated read on a mid-response connection
@@ -537,11 +701,11 @@ class OllamaBackend(AgentBackend):
         start = time.monotonic()
         try:
             content, usage = self._call(req, deadline)
-        except _ResponseFormatRejected:
+        except ResponseFormatRejected:
             downgraded = self._build_request(system_prompt, prompt, model, None)
             try:
                 content, usage = self._call(downgraded, deadline)
-            except _ResponseFormatRejected:
+            except ResponseFormatRejected:
                 # The DOWNGRADED (no response_format) request was STILL rejected as a
                 # response_format/json_schema 400 — e.g. a proxy whose error body
                 # generically mentions those terms regardless of what was actually sent.

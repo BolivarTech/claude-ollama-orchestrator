@@ -3,20 +3,39 @@
 # Date: 2026-07-05
 """Transactional OllamaBackend: extraction, auth, error mapping, downgrade-on-400."""
 
+import email.utils
 import io
 import json
 import urllib.error
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from backend import DelegationResult, MAX_ERROR_BODY_BYTES, MAX_RESPONSE_BYTES, OllamaBackend
-from errors import OllamaBackendError
+from backend import (
+    DelegationResult,
+    MAX_ERROR_BODY_BYTES,
+    MAX_RESPONSE_BYTES,
+    OllamaBackend,
+    ResponseFormatRejected,
+    build_chat_request,
+    estimate_tokens,
+    estimate_tokens_from_len,
+    make_redactor,
+    map_http_error,
+    retry_after_delay,
+)
+from errors import OllamaBackendError  # domain exceptions come from errors, never backend
 from ollama_config import resolve_config
 
 
 def _cfg(api_key=None):
     return replace(resolve_config(global_path=None, repo_path=None, env={}), api_key=api_key)
+
+
+def _cfg_with_key(api_key):
+    """Convenience alias for the shared-helper tests below (mirrors ``_cfg(api_key=...)``)."""
+    return _cfg(api_key=api_key)
 
 
 class _Recorder:
@@ -485,3 +504,128 @@ def test_safe_close_ignores_non_callable_close_attribute():
 
     _safe_close(_Weird())  # must not raise TypeError
     _safe_close(object())  # no close attribute at all → also a no-op
+
+
+def test_safe_close_swallows_a_non_oserror_close_failure():
+    # _safe_close's contract is that cleanup NEVER masks the real exception in flight.
+    # close() can raise a NON-OSError (e.g. ValueError "I/O operation on closed file", or a
+    # driver-specific error); a narrow `except OSError` would let it escape from a
+    # `finally` and replace the real exception. _safe_close must swallow ANY close failure.
+    from backend import _safe_close
+
+    class _RaisesValueError:
+        def close(self):
+            raise ValueError("I/O operation on closed file")
+
+    _safe_close(_RaisesValueError())  # must not raise
+
+
+# --- Task 1 (MS4): shared HTTP-plumbing helpers extracted for reuse by ollama_stream.py ---
+
+
+def test_build_chat_request_sets_stream_and_auth():
+    cfg = _cfg_with_key("sk-123")
+    req = build_chat_request(cfg, "sys", "hi", "m", None, stream=True)
+    body = json.loads(req.data)
+    assert body["stream"] is True and body["stream_options"] == {"include_usage": True}
+    assert req.get_header("Authorization") == "Bearer sk-123"
+    req2 = build_chat_request(_cfg(), "s", "p", "m", {"type": "json_object"}, stream=False)
+    b2 = json.loads(req2.data)
+    assert b2["stream"] is False and "stream_options" not in b2
+    assert b2["response_format"] == {"type": "json_object"}
+
+
+def test_build_chat_request_content_parts_is_forward_compatible_with_ms7():
+    """MS7 forward-compat seam: when `content_parts` is given, the user message's
+    `content` is the multimodal parts array (text + image_url) INSTEAD OF the plain
+    prompt string; when omitted (the MS1-MS6 default), the message shape is
+    BYTE-IDENTICAL to before this parameter existed — MS7 fills `content_parts` for
+    vision without any refactor of this shared helper."""
+    cfg = _cfg()
+    parts = [
+        {"type": "text", "text": "describe this UI"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    ]
+    req = build_chat_request(
+        cfg, "sys", "describe this UI", "m", None, stream=False, content_parts=parts
+    )
+    body = json.loads(req.data)
+    assert body["messages"][1]["content"] == parts
+
+    req_default = build_chat_request(cfg, "sys", "hi", "m", None, stream=False)
+    assert json.loads(req_default.data)["messages"][1]["content"] == "hi"
+
+
+def test_map_http_error_400_response_format_raises_downgrade_signal():
+    exc = urllib.error.HTTPError("u", 400, "Bad", {}, io.BytesIO(b"invalid response_format"))
+    with pytest.raises(ResponseFormatRejected):
+        map_http_error(exc, redact=lambda s: s)
+
+
+def test_map_http_error_5xx_raises_backend_error_redacted():
+    exc = urllib.error.HTTPError("u", 503, "Down", {}, io.BytesIO(b"boom sk-secret"))
+    with pytest.raises(OllamaBackendError):
+        map_http_error(exc, redact=lambda s: s.replace("sk-secret", "***"))
+
+
+def test_map_http_error_body_read_failure_falls_back_to_empty_detail():
+    """`exc.read()` can itself raise on a broken connection while fetching the error
+    body (inherited concern from MS1) — `map_http_error` must not let that SECONDARY,
+    non-domain exception replace the one it's already handling; it degrades to an
+    empty/unavailable body and still raises the domain `OllamaBackendError`.
+
+    NOTE (adaptation from the plan's literal snippet): the real, hardened
+    `map_http_error` calls `exc.read(MAX_ERROR_BODY_BYTES + 1)` — a BOUNDED read
+    (see MS1's `MAX_ERROR_BODY_BYTES` DoS backstop, preserved verbatim by this
+    refactor) — never a bare `exc.read()`. So the fake body's `read` must accept
+    the size argument (as any real file-like object's `read(size)` would) for this
+    test double to exercise the SAME call shape production code actually uses.
+    """
+
+    class _BrokenBody:
+        def read(self, size=-1):
+            raise ConnectionResetError("connection reset while reading error body")
+
+        def close(self):
+            pass
+
+    exc = urllib.error.HTTPError("u", 503, "Down", {}, _BrokenBody())
+    with pytest.raises(OllamaBackendError):
+        map_http_error(exc, redact=lambda s: s)
+
+
+def test_retry_after_delay_honors_header_then_jitter():
+    exc = urllib.error.HTTPError("u", 429, "Too Many", {"Retry-After": "0"}, io.BytesIO(b""))
+    assert retry_after_delay(exc, attempt=0, rng=lambda: 0.5) == 0.0
+    exc2 = urllib.error.HTTPError("u", 429, "Too Many", {}, io.BytesIO(b""))
+    d = retry_after_delay(exc2, attempt=1, rng=lambda: 0.0)  # min(2**1,30)*(0.5+0)=1.0
+    assert d == 1.0
+
+
+def test_retry_after_delay_honors_http_date_header():
+    """The `Retry-After` header MAY be an RFC-7231 HTTP-date (e.g. from a proxy)
+    instead of a numeric seconds count — the extracted `retry_after_delay` must
+    still parse it via `email.utils.parsedate_to_datetime`. This is the HTTP-date
+    branch of the DRY-owned helper, covered here in MS4 (not only via MS1)."""
+    future = datetime.now(timezone.utc) + timedelta(seconds=5)
+    http_date = email.utils.format_datetime(future, usegmt=True)
+    exc = urllib.error.HTTPError("u", 429, "Too Many", {"Retry-After": http_date}, io.BytesIO(b""))
+    delay = retry_after_delay(exc, attempt=0, rng=lambda: 0.0)
+    # allow a small tolerance for the time elapsed between building `future` and
+    # the assertion below (no sleeping happens in between, so this is generous)
+    assert 4.0 <= delay <= 5.5
+
+
+def test_public_token_estimators():
+    assert estimate_tokens("abcdefgh") == 2 and estimate_tokens_from_len(12) == 3
+
+
+def test_make_redactor_masks_key_and_is_identity_when_absent():
+    redact = make_redactor("sk-secret")
+    assert redact("prefix sk-secret suffix") == "prefix *** suffix"
+    identity = make_redactor(None)
+    assert identity("unchanged sk-secret") == "unchanged sk-secret"
+
+
+def test_delegation_result_truncated_defaults_false():
+    assert DelegationResult("x", 1, 1, False, 0.1).truncated is False

@@ -1,6 +1,6 @@
 [project]
 name = "claude-ollama-orchestrator"
-version = "0.0.3"
+version = "0.0.4"
 requires-python = ">= 3.12"
 description = "Delegate coding, review, testing, explanation, vision, and transcription to Ollama models from Claude Code"
 license = "MIT OR Apache-2.0"
@@ -12,6 +12,9 @@ dev = ["pytest", "pytest-asyncio", "ruff", "mypy", "hypothesis"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["skills/ollama/scripts"]
+markers = [
+    "integration: slower integration tests exercising real byte-boundary behavior (run by make verify)",
+]
 asyncio_mode = "auto"
 
 [tool.ruff]

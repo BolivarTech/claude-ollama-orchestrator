@@ -29,6 +29,17 @@ class OllamaBackendError(Exception):
     """Raised on transport/backend failures (HTTP, timeout, bad response)."""
 
 
+class SinkError(OllamaBackendError):
+    """A failure WRITING a delta to a streaming output sink (stdout/file), raised by
+    `ollama_stream._consume` (MS4). A `BrokenPipeError`/`OSError` from the sink is
+    wrapped as this distinct type so it is never misreported as a transport/HTTP
+    fault; it is still an `OllamaBackendError`, so callers that only catch that
+    base type (e.g. `run_ollama.main`) still report it actionably, while callers
+    that need to distinguish "the model/transport failed" from "writing the output
+    failed" (e.g. `run_ollama.dispatch`) can catch `SinkError` specifically.
+    """
+
+
 class DelegationError(Exception):
     """Raised on orchestration failures (queue full, deadline exceeded)."""
 

@@ -14,9 +14,9 @@ import shutil
 import sys
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import replace
-from typing import Any
+from typing import Any, TextIO
 
 from agent_schema import DISCRIMINATOR_KEYS, SCHEMAS
 from backend import AgentBackend, DelegationResult, OllamaBackend
@@ -26,6 +26,7 @@ from errors import (
     OllamaBackendError,
     OllamaConfigError,
     OllamaPreflightError,
+    SinkError,
     ValidationError,
 )
 from ollama_config import CAPABILITIES, OllamaAgentsConfig
@@ -34,6 +35,8 @@ from ollama_config import CAPABILITIES, OllamaAgentsConfig
 # run_ollama.resolve_config directly as a monkeypatch/config seam.
 from ollama_config import resolve_config as resolve_config
 from ollama_preflight import preflight
+from ollama_stream import stream_run
+from ollama_vision import stream_vision
 from parse_output import parse_agent_output
 from run_lock import remove_lock, staleness_bound_for_timeout, write_lock
 from status_display import StatusDisplay
@@ -248,9 +251,193 @@ def _response_format_for(capability: str, mode: str) -> dict[str, Any] | None:
     return None
 
 
+def stdout_sink(text: str) -> None:
+    """R7c stdout sink: write a streamed delta to stdout and flush (single delegation only).
+
+    The live, single-in-flight-delegation streaming sink (R7c): every MS4 delegation
+    passes this to ``dispatch`` as ``sink`` — MS4 has no fan-out (MS5), so the R7c
+    invariant "stdout streams only when exactly one delegation is in flight" trivially
+    holds and this is always the active sink for a streaming capability.
+
+    Args:
+        text: One delta of streamed content.
+    """
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+class _FileSink:
+    """A per-delegation streaming sink that owns ONE open file handle: opened once,
+    written per delta, closed once at stream end. Never reopens the file per token
+    (the old design opened+closed on every delta). Callable as a ``Callable[[str], None]``,
+    and also supports the context-manager protocol (``with make_file_sink(path) as sink:``)
+    so ``close()`` is guaranteed on exit — including when the ``with`` block raises.
+
+    Reserved for the MS5 fan-out (each parallel delegation streams to its OWN file,
+    never a shared stdout, R7c); MS4 always streams the single in-flight delegation to
+    :func:`stdout_sink` instead.
+    """
+
+    def __init__(self, fh: TextIO) -> None:
+        """Wrap an ALREADY-OPEN file handle.
+
+        The file is opened by `make_file_sink` — never inside this constructor —
+        specifically so a failure anywhere in construction can never produce a
+        half-built sink holding an orphan, unreachable handle: `make_file_sink` owns
+        the open/close-on-failure pairing (see its docstring), while `_FileSink`
+        itself only ever takes ownership of a handle that is guaranteed either fully
+        adopted (this constructor returns) or already closed by the caller.
+
+        Args:
+            fh: An already-open, writable text file handle.
+        """
+        self._fh = fh
+        self._closed = False
+
+    def __call__(self, text: str) -> None:
+        """Write *text* to the open file handle.
+
+        Raises:
+            SinkError: called after ``close()`` — use-after-close is a caller bug,
+                surfaced as a clear, actionable domain error instead of letting the
+                raw ``ValueError: I/O operation on closed file`` from the underlying
+                handle leak through unclassified.
+        """
+        if self._closed:
+            raise SinkError("write to a closed _FileSink")
+        self._fh.write(text)
+
+    def __enter__(self) -> "_FileSink":
+        """Return self — the file is already open from ``__init__``/``make_file_sink``."""
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        """Guarantee ``close()`` on ``with`` exit, whether or not the block raised."""
+        self.close()
+
+    def close(self) -> None:
+        """Close the handle (best-effort; **idempotent**).
+
+        A double-close (e.g. ``close()`` called again in a ``finally`` block after
+        the stream already closed it, or after ``__exit__`` already closed it) must
+        NOT raise ``ValueError: I/O operation on closed file`` — this guard makes the
+        second call a no-op.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._fh.close()
+        except OSError:
+            pass
+
+
+def make_file_sink(path: str) -> "_FileSink":
+    """Open *path* (``{cap}.stream.log``) ONCE and return a `_FileSink` wrapping it.
+
+    The file is opened HERE, not inside `_FileSink.__init__`, and this function owns
+    the open/adopt-or-close pairing: if constructing the `_FileSink` around the
+    freshly-opened handle fails for ANY reason, the handle is closed before the
+    exception propagates — a failed construction can never leak an orphan open file
+    handle. On success, ownership of the handle transfers entirely to the returned
+    `_FileSink` (its `.close()`/context-manager protocol is thereafter the only way
+    to close it).
+
+    The caller MUST ``.close()`` the returned sink in a ``finally`` at stream end —
+    OR use it as a context manager (``with make_file_sink(path) as sink:``), whose
+    ``__enter__``/``__exit__`` guarantee the close. Used by the MS5 fan-out so each
+    parallel delegation streams to its OWN file (never a shared stdout, R7c).
+
+    Raises:
+        OSError: the file could not be opened (propagates unchanged; nothing was
+            opened, so there is nothing to clean up).
+    """
+    fh = open(path, "a", encoding="utf-8")  # noqa: SIM115 — ownership transfers to _FileSink
+    try:
+        return _FileSink(fh)
+    except Exception:
+        fh.close()  # construction failed after a successful open — never leak the handle
+        raise
+
+
 # Capabilities whose transport is not in MS1 (multimodal/audio → M7). Guarded in
 # ``dispatch`` so a binary input is never sent as garbled chat text. Removed in M7.
 _MS1_UNSUPPORTED_CAPS = frozenset({"vision", "transcribe"})
+
+
+def _run_once(
+    capability: str,
+    system_prompt: str,
+    prompt: str,
+    model: str,
+    timeout: int,
+    *,
+    backend: AgentBackend,
+    config: OllamaAgentsConfig,
+    sink: Callable[[str], None] | None,
+    response_format: dict[str, Any] | None,
+    deadline: float | None = None,
+) -> DelegationResult:
+    """Pick the streaming or transactional path for one delegation attempt (R7b/R7c).
+
+    Streams via ``ollama_stream.stream_run`` (or ``ollama_vision.stream_vision`` for
+    ``vision``) when ALL of: the capability's ``[stream]`` config is true, a *sink* is
+    given, AND the capability is NOT schema-mode (``[structured]`` != ``"schema"``). No
+    sink means nothing to stream to; a schema-mode capability ALWAYS runs transactionally
+    so its R25 parse/validate retry shares one deadline and never double-streams (see the
+    inline note). Otherwise runs the MS1 transactional core (``backend.run``) unchanged.
+
+    *deadline* is threaded into ``backend.run`` only: the streaming path
+    (``stream_run``/``stream_vision``) derives its OWN deadline internally from
+    *timeout* and has no deadline parameter to accept, so passing the caller's shared
+    R25 deadline to it would be meaningless. For the transactional path, forwarding it
+    preserves MS1's existing guarantee that the parse-retry loop (``dispatch``) and the
+    429-backoff loop (``backend.run``) share the SAME time budget.
+
+    Args:
+        capability: The capability name.
+        system_prompt: The capability's system prompt.
+        prompt: The (possibly retry-feedback-augmented) prompt for this attempt.
+        model: Resolved model tag.
+        timeout: Per-delegation timeout.
+        backend: The transactional ``AgentBackend``.
+        config: The resolved config (``config.stream`` drives the path choice).
+        sink: The delta sink for the streaming path, or ``None`` (never streams).
+        response_format: The structured-output shape for this attempt, or ``None``.
+        deadline: The shared monotonic deadline (R25), forwarded to ``backend.run``
+            only.
+
+    Returns:
+        The ``DelegationResult`` for this one attempt.
+    """
+    # A schema-mode (structured) capability ALWAYS uses the transactional path, never
+    # streaming — even if [stream]=true is (mis)configured for it. Streaming a schema
+    # capability would break the shared R25 deadline on a parse/validate retry (stream_run
+    # derives its OWN fresh deadline → up to 2×timeout) and concatenate the invalid first
+    # attempt's raw tokens with the retry's on the same sink. The spec's config rationale
+    # is "structured/corto → transactional"; making it a code invariant (not just the
+    # reviewer/tester [stream]=false default a user could override) closes that gap.
+    is_schema = config.structured.get(capability) == "schema"
+    if bool(config.stream.get(capability)) and sink is not None and not is_schema:
+        fn = stream_vision if capability == "vision" else stream_run
+        return fn(
+            config,
+            system_prompt,
+            prompt,
+            model,
+            timeout,
+            sink=sink,
+            response_format=response_format,
+        )
+    return backend.run(
+        capability,
+        system_prompt,
+        prompt,
+        model,
+        timeout,
+        response_format=response_format,
+        deadline=deadline,
+    )
 
 
 def dispatch(
@@ -263,6 +450,7 @@ def dispatch(
     system_prompt: str,
     config: OllamaAgentsConfig,
     stats: TokenStats | None = None,
+    sink: Callable[[str], None] | None = None,
 ) -> DelegationResult:
     """Run one delegation; for the ``schema`` mode parse+validate with one retry.
 
@@ -281,6 +469,12 @@ def dispatch(
     never recorded — ``http_calls`` reflects completed attempts, not raw connection
     attempts (see ``token_stats.TokenStats``).
 
+    Each attempt is routed through :func:`_run_once` (R7b/R7c), which picks the
+    streaming path (``ollama_stream.stream_run``/``ollama_vision.stream_vision``) when
+    BOTH *config*'s per-capability ``[stream]`` setting is true AND *sink* is given,
+    else the MS1 transactional core (``backend.run``) — unchanged either way from the
+    caller's perspective, since both paths return the same ``DelegationResult`` shape.
+
     Args:
         capability: The capability name.
         prompt: The user prompt, passed as-is in MS1 (anti-injection sanitization is
@@ -289,9 +483,14 @@ def dispatch(
         model: Resolved model tag.
         timeout: Per-delegation timeout.
         system_prompt: The capability's system prompt.
-        config: The resolved config (its ``structured`` mapping drives the mode).
+        config: The resolved config (its ``structured`` mapping drives the mode; its
+            ``stream`` mapping drives the streaming-vs-transactional choice, R7b/R7c).
         stats: Optional local token accumulator (R12); every completed backend call is
             recorded into it.
+        sink: Optional delta receiver for the streaming path (R7c); ``None`` (the
+            default) never streams regardless of *config*'s ``[stream]`` setting —
+            callers that want streaming must supply one (e.g. ``stdout_sink`` for the
+            single in-flight delegation).
 
     Returns:
         The ``DelegationResult`` — with the validated dict in ``.parsed`` for schema mode,
@@ -326,12 +525,15 @@ def dispatch(
     if mode != "schema" or keys is None:
         # Free-text/object (and schema-without-keys) return the DelegationResult verbatim:
         # `.content` is what Claude reviews, `.parsed` stays None. Record the completed call.
-        result = backend.run(
+        result = _run_once(
             capability,
             system_prompt,
             prompt,
             model,
             timeout,
+            backend=backend,
+            config=config,
+            sink=sink,
             response_format=response_format,
             deadline=deadline,
         )
@@ -346,12 +548,15 @@ def dispatch(
             raise OllamaBackendError(
                 f"{capability} delegation exceeded its retry deadline ({last_error})"
             )
-        result = backend.run(
+        result = _run_once(
             capability,
             system_prompt,
             attempt_prompt,
             model,
             timeout,
+            backend=backend,
+            config=config,
+            sink=sink,
             response_format=response_format,
             deadline=deadline,
         )
@@ -733,6 +938,12 @@ def run_delegation(ns: argparse.Namespace) -> int:
 
     The reviewable output (`.parsed` when present, else `.content`) is untrusted data
     for Claude to review; it is printed, never auto-applied (R8/R14).
+
+    `dispatch` is given `sink=stdout_sink` (R7c): for a capability whose per-capability
+    `[stream]` config is true, tokens stream live to stdout as they arrive; this CLI
+    always drives exactly one delegation at a time (fan-out is MS5), so the R7c
+    invariant -- stdout streams only when a single delegation is in flight -- always
+    holds here.
     """
     cfg = resolve_config(global_path=_global_toml(), repo_path=_repo_toml(), env=os.environ)
 
@@ -767,6 +978,9 @@ def run_delegation(ns: argparse.Namespace) -> int:
                     system_prompt=system_prompt,
                     config=cfg,
                     stats=stats,
+                    # R7c: this CLI drives exactly ONE delegation at a time (concurrency
+                    # is MS5) -- the single-in-flight case always gets the stdout sink.
+                    sink=stdout_sink,
                 )
                 _write_artifacts(output_dir, ns.capability, prompt, result, stats, errbuf)
                 if display is not None:
