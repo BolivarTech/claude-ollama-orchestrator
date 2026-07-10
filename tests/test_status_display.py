@@ -84,3 +84,32 @@ def test_empty_agents_list_is_safe_to_construct_and_stop():
     disp = StatusDisplay([], stream=out)
     disp.stop()  # no-op teardown, never raises
     assert out.getvalue() == ""  # nothing drawn without a single update()
+
+
+def test_status_display_unwraps_dispatching_stderr_proxy_to_the_real_stream():
+    # INFO fix (#7): constructing StatusDisplay AFTER the per-delegation dispatching
+    # proxy is installed must resolve `self._stream` to the REAL stream, not the
+    # proxy object itself.
+    import sys
+
+    from stderr_shim import _DispatchingStderr
+    from status_display import StatusDisplay
+
+    class _FakeReal:
+        def isatty(self) -> bool:
+            return False
+
+        def write(self, s: str) -> int:
+            return len(s)
+
+        def flush(self) -> None:
+            pass
+
+    real = _FakeReal()
+    old_stderr = sys.stderr
+    sys.stderr = _DispatchingStderr(real)
+    try:
+        display = StatusDisplay(["coder"])
+        assert display._stream is real  # unwrapped to the REAL stream, not the proxy
+    finally:
+        sys.stderr = old_stderr
