@@ -28,7 +28,8 @@ class CircuitBreaker:
     "fix" this into a bug):** `run_batch`'s per-delegation worker body
     (`_run_one_delegation`) runs on a REAL OS worker thread via
     `asyncio.to_thread` — dispatched onto the event loop's own DEFAULT
-    executor, sized once per loop by `_ensure_sized_default_executor`
+    executor, sized per loop by `_ensure_sized_default_executor` (and grown
+    when a larger later batch needs more workers)
     (seventh round: a dedicated per-batch `ThreadPoolExecutor` dispatched via
     a bare `loop.run_in_executor(executor, ...)` was tried in an intervening
     round specifically to fix that sizing, but was reverted because it broke
