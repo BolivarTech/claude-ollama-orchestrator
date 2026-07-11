@@ -212,13 +212,22 @@ def preflight(
     check_models = dict(config.models)
     if capability is not None and effective_model is not None:
         check_models[capability] = effective_model
-    missing = sorted(set(check_models.values()) - available)
+    distinct_models = set(check_models.values())
+    missing = sorted(distinct_models - available)
     if missing:
+        # The plugin validates EVERY configured capability model up front (fail-fast), not
+        # just the one being delegated, so a missing model never surprises the user
+        # mid-task. Make that explicit — otherwise a `coder` run failing on a vision/tester
+        # model the user never invoked reads as a spurious error (R10/R14).
         raise OllamaPreflightError(
             _redact(
-                f"Missing models: {', '.join(missing)}. "
-                "Run `ollama pull <model>` / `ollama signin` (cloud) / edit the TOML / "
-                "`--ollama-init`.",
+                "Not all configured models are available. The plugin verifies that "
+                "every configured capability model exists before delegating (fail-fast), "
+                "so a missing model never surfaces in the middle of a task. Missing "
+                f"{len(missing)} of {len(distinct_models)}: {', '.join(missing)}. Enable "
+                "them for the plugin to work — `ollama signin` for `:cloud` tags or "
+                "`ollama pull <model>` for local — or repoint/remove them in "
+                "./.claude/ollama-agents.toml (see `--ollama-init`), then retry.",
                 config.api_key,
             )
         )
