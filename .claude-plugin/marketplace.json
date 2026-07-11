@@ -2,7 +2,7 @@
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "bolivartech-ollama-orchestrator",
   "description": "Claude-Ollama-Orchestrator plugin by BolivarTech",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "owner": {
     "name": "BolivarTech",
     "url": "https://github.com/BolivarTech"
@@ -11,7 +11,7 @@
     {
       "name": "claude-ollama-orchestrator",
       "description": "Delegate coding, review, testing, explanation, vision, and transcription to Ollama models via streaming subagents",
-      "version": "0.0.7",
+      "version": "0.0.8",
       "author": {
         "name": "Julian Bolivar",
         "url": "https://github.com/BolivarTech"

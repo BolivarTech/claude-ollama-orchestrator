@@ -1,6 +1,6 @@
 {
   "name": "claude-ollama-orchestrator",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "description": "Orchestration plugin that lets Claude Code delegate coding, review, testing, explanation, vision, and transcription tasks to local/LAN/cloud Ollama models via streaming subagents — cutting token cost while keeping generation on-device.",
   "author": {
     "name": "Julian Bolivar",
