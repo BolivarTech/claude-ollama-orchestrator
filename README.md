@@ -5,7 +5,7 @@
 [![Ruff](https://img.shields.io/badge/linter-ruff-orange.svg)](https://docs.astral.sh/ruff/)
 [![Typecheck](https://img.shields.io/badge/mypy-strict-blue.svg)](https://mypy-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Status](https://img.shields.io/badge/status-v0.0.7%20%E2%80%94%20all%207%20milestones-brightgreen.svg)](#project-status)
+[![Release](https://img.shields.io/badge/release-v0.0.7-brightgreen.svg)](https://github.com/BolivarTech/claude-ollama-orchestrator/releases)
 
 A Claude Code plugin that lets Claude **orchestrate a set of Ollama subagents** and
 **delegate** concrete generation tasks to them — code, review, tests, explanation,
@@ -16,48 +16,6 @@ on **local / LAN / cloud open-weight models** served by an OpenAI-compatible Oll
 endpoint. Claude **reviews** the delegated output before applying it with its own
 Edit/Write tools. The goal: **cut Anthropic token cost** and keep bulk generation
 **on-device**, without ceding Claude's judgment.
-
-> [!IMPORTANT]
-> ### Project Status
-> **v0.0.7 — feature-complete (all 7 milestones shipped).** Built under the SBTDD workflow
-> (Spec + Behavior + Test-Driven Development), milestone-by-milestone, test-first, each
-> milestone passing a 3-perspective MAGI review gate to `STRONG GO`. The full plugin —
-> transactional core, token accounting, temp/lock/status, visible streaming, bounded
-> concurrency, untrusted-I/O hardening, and the vision / transcribe / thinking capabilities
-> plus cross-process arbitration — is implemented with 573 passing tests, `mypy --strict`
-> clean, and a stdlib-only runtime.
->
-> **Implemented so far:** the **transactional delegation core** — layered config, fail-fast
-> preflight, an OpenAI-compatible backend with structured output + downgrade-on-400, a
-> tolerant JSON parser, and the `/ollama` orchestrator (+ `--ollama-init`); **local token
-> accounting** (per-delegation tok/s + token counts, `token_stats.json` kept **separate**
-> from Claude usage); **output management** — a per-project temp namespace, a cross-platform
-> process-liveness lock, LRU cleanup that never prunes a live run, per-run artifacts, a live
-> per-agent status display, and interrupt-safe cleanup; **visible streaming** — a
-> hardened SSE reader (idle timeout, bounded reassembly buffer, UTF-8-boundary output cap,
-> transport-error-safe) wired per-capability as a **decoupled layer** over the transactional
-> core (toggle `[stream]`), streaming tokens to stdout when a single delegation is in flight
-> while structured capabilities stay transactional; and **bounded concurrency** — a fan-out
-> `run_batch` bounded by a `max_parallel_agents` semaphore plus a hard-capped
-> `max_queued_agents` queue (overflow rejected fail-closed, per-delegation, as a DoS
-> backstop), a **per-model circuit breaker** (K consecutive backend failures open a model's
-> circuit without blocking others; a 429 is throttling, excluded, with `Retry-After` +
-> jittered backoff), per-delegation stderr capture via `contextvars`, and R7c sink routing
-> (stdout only at effective concurrency 1, else per-delegation files); and **untrusted-I/O
-> hardening** — 4-layer anti-prompt-injection with a fresh 128-bit nonce, fail-closed, on
-> both the user input (R22) and the model output shown to Claude (R22b, including the live
-> stream), an oversize-input token estimate (CJK-conservative), a transactional + streaming
-> **output cap** that can only tighten the absolute DoS floor, a bounded magic-byte-checked
-> **binary input guard** (vision/transcribe), Windows console UTF-8 hardening, config
-> world-readable + plaintext-key warnings, and a layered/bool-rejecting `max_output_bytes`.
-> The final milestone (MS7) completes the plugin: **`vision`** (image sent as an `image_url`
-> data-URI content-part, multimodal-gated, MIME from magic bytes), **`transcribe`**
-> (experimental, endpoint- or audio-chat-gated, RFC 5987 multipart filenames, header-injection
-> safe), and **`thinking`** (`<think>` recovery); **cross-process arbitration** — a project-level
-> stdout token and a `.ollama-slots/` counter over a shared, TOCTOU-safe ephemeral-lock
-> primitive (atomic `O_EXCL` steal/reclaim, live-holder-safe restore, self-healing, with a
-> `disable_fs_locks` kill-switch); and the optional **diff-grounded hallucination guard** (R30)
-> that grounds a model's `file:line` claims against a Claude-provided unified diff.
 
 ---
 
@@ -86,8 +44,8 @@ Claude reviews the result before it touches your files.
 Seven delegable capabilities, each with its own system prompt and its own default
 model, resolved from layered config:
 
-| Subagent | Task | Model grade (tags fixed in the spec) |
-|----------|------|--------------------------------------|
+| Capability | Task | Default model |
+|------------|------|---------------|
 | **`ollama-coder`** | Write / fix / refactor code | `kimi-k2.7-code:cloud` |
 | **`ollama-reviewer`** | Security & code review | `glm-5.2:cloud` |
 | **`ollama-tester`** | Unit / integration test generation | `deepseek-v4-flash:cloud` |
@@ -103,54 +61,65 @@ model, resolved from layered config:
 
 ## Usage
 
-The plugin is invoked with **`/ollama`** — the slash command is the skill name
-(`name: ollama`), the same way `/magi` works (no `commands/` directory).
+### Getting started
+
+1. **Install the plugin** — see [Installation](#installation).
+
+2. **Sign in for cloud models** (the defaults are `:cloud`). Run this **once** on your local
+   Ollama daemon — it does **not** download any weights:
+
+   ```bash
+   ollama signin
+   ```
+
+3. **Create the config file** from the built-in defaults (it refuses to overwrite an existing
+   one):
+
+   ```bash
+   python skills/ollama/scripts/run_ollama.py --ollama-init
+   ```
+
+   This writes `./.claude/ollama-agents.toml`. Edit it to change the models, the endpoint, or
+   the concurrency limits (see [Configuration](#configuration)) — or leave it as-is to use the
+   defaults.
+
+4. **Delegate** — call `/ollama` in Claude Code (next section).
+
+### Delegating with `/ollama`
+
+The first token picks one of the seven capabilities; omit it and Claude auto-classifies the
+request and picks the fitting one. An invalid capability errors with the list of valid ones.
 
 ```
-/ollama <capability> [context]     # explicit capability (positional)
-/ollama [context]                  # capability omitted → the skill auto-classifies
+/ollama <capability> <request>     # explicit capability
+/ollama <request>                  # capability omitted → auto-classified
 ```
 
-The first token after `/ollama` selects one of the seven capabilities — analogous to
-`/magi <mode>`. Omit it and the orchestrator classifies the task and picks the fitting
-capability; an invalid capability errors with the valid list.
-
-**Text capabilities** (`coder`, `reviewer`, `tester`, `explainer`, `thinking`) take your
-request as free text:
+**Text capabilities** (`coder`, `reviewer`, `tester`, `explainer`, `thinking`) take a free-text
+request:
 
 ```
 /ollama coder      write a retry decorator with exponential backoff
 /ollama reviewer   review the auth changes in this diff for security issues
 /ollama thinking   should we shard by tenant or by region? weigh the trade-offs
-/ollama            <request>            # no capability → auto-routed by Claude's judgment
+/ollama            add unit tests for the parser        # no capability → auto-routed
 ```
 
-**Media capabilities** take a **file path** as the input (validated by magic bytes, not
-the extension):
+**Media capabilities** (`vision`, `transcribe`) take a **file path** (checked by the file's
+magic bytes, not its extension):
 
 ```
-/ollama vision      path/to/screenshot.png      # analyzes the image (v0.0.7 uses a built-in
-                                                 # analysis prompt; a custom prompt lands in v0.2)
-/ollama transcribe  path/to/recording.mp3       # experimental; requires the endpoint to expose
-                                                 # /audio/transcriptions OR an audio-multimodal model
+/ollama vision      path/to/screenshot.png      # analyze an image / UI
+/ollama transcribe  path/to/recording.mp3       # transcribe audio (experimental)
 ```
 
-- `vision` needs a **multimodal** model (default `minimax-m3:cloud`); a text-only model is
-  detected and rejected with an actionable error.
-- `transcribe` is **experimental and gated**: if the endpoint supports neither audio path, it
-  fails with a clear message (never a crash) — it does not block the other six capabilities.
+- `vision` needs a multimodal model (default `minimax-m3:cloud`); a text-only model is
+  rejected with a clear error.
+- `transcribe` is **experimental**: if the endpoint can't handle audio it fails with an
+  actionable message (never a crash), and the other six capabilities keep working.
 
-### First-time setup
-
-```bash
-# 1. (cloud models) sign the local daemon in to Ollama Cloud — no weight download
-ollama signin
-
-# 2. Scaffold ./.claude/ollama-agents.toml from defaults (refuses to overwrite an existing one)
-python skills/ollama/scripts/run_ollama.py --ollama-init
-
-# 3. Edit the TOML if you want different models / a LAN or direct-cloud base_url, then delegate.
-```
+In every case, Ollama generates the output and **Claude reviews it before writing anything to
+your files** — delegation never bypasses Claude's judgment.
 
 ---
 
@@ -165,7 +134,7 @@ python skills/ollama/scripts/run_ollama.py --ollama-init
 # 2. Install the plugin
 /plugin install claude-ollama-orchestrator@bolivartech-ollama-orchestrator
 
-# 3. Scaffold the config, then delegate
+# 3. For :cloud models, run `ollama signin` once on your daemon — then just use /ollama
 ```
 
 Update after new versions are published:
@@ -196,9 +165,9 @@ Verify it is a real junction (`LinkType: Junction`) and byte-identical (`fc` / `
 
 ## Configuration
 
-The runtime is stdlib-only; config lives in `./.claude/ollama-agents.toml` (gitignored —
-the file and any API key are never tracked). Scaffold it from defaults with the plugin's
-init (does **not** overwrite an existing file).
+Configuration is **optional** — the built-in defaults work out of the box. To customize
+models, the endpoint, or concurrency, create `./.claude/ollama-agents.toml` (gitignored, so
+the file and any API key are never tracked). Only the keys you set override the defaults:
 
 ```toml
 base_url = "http://localhost:11434/v1"   # OpenAI base (path verbatim; bare host:port → /v1)
@@ -227,7 +196,7 @@ vision     = "off"       # free text
 transcribe = "off"       # free text
 thinking   = "off"       # free text (extended reasoning)
 
-# Visible streaming PER CAPABILITY (R7b): true → live SSE + tok/s, false → transactional
+# Visible streaming PER CAPABILITY: true → live SSE + tok/s, false → transactional
 # (same content + metrics). Long generation → true; structured/short → false.
 [stream]
 coder      = true
@@ -277,150 +246,26 @@ written to artifacts, and are **redacted** in error messages.
 
 ## How It Works
 
-```
-Claude (orchestrator)
-  |  classifies task -> picks capability
-  v
-SKILL.md (gate: delegate? which capability?)
-  |
-  v
-resolve config (ollama_config)  ->  preflight (ollama_preflight, fail-fast)
-  |
-  v
-backend.run(capability, system_prompt, prompt, model)   # OpenAI-compatible /v1, streaming
-  |         \__ stream tokens -> stdout (tok/s + count) __\
-  v                                                        v
-choices[0].message.content                     token_stats (local accounting)
-  |
-  v
-Claude reviews the output  ->  applies with Edit/Write
-```
-
-### Step by Step
-
-1. **Classify & gate** — the orchestrator skill decides whether to delegate and which of
-   the seven capabilities fits (explicit via `/ollama <capability>`, or auto-classified).
+1. **Classify & gate** — Claude decides whether to delegate and which of the seven
+   capabilities fits (explicit via `/ollama <capability>`, or auto-classified).
 2. **Resolve config** — layered, per-key merge (`env > repo TOML > global TOML > default`).
-3. **Preflight (fail-fast)** — `GET {base_url}/models` with a short timeout. Host
-   unreachable or a configured model missing → **abort** with an actionable message
-   (`ollama pull` / `ollama signin` / edit the TOML). `401/403` → abort (auth). `404/501` on
-   `/models` → warn-and-proceed. **No auto-pull.**
-4. **Delegate & stream** — an OpenAI-compatible `POST {base_url}/chat/completions` streams
-   tokens to stdout with live speed and count. HTTP calls do not block the event loop
-   (`asyncio.to_thread`).
-5. **Structured output + backstop** — request JSON structured output where supported; an
-   HTTP 400 rejecting `response_format` triggers **one** retry without it (downgrade),
-   backed by a tolerant parser that recovers prose / `<think>` leaks.
-6. **Account locally** — token usage is recorded per capability/model in a local artifact,
-   **separate** from Claude/Anthropic usage.
-7. **Review & apply** — Claude reviews the delegated output and applies changes with its own
-   Edit/Write tools. If Ollama is unavailable, the plugin **reports** and does **not**
-   silently fall back to generating with Claude without explicit authorization.
+3. **Preflight (fail-fast)** — a quick check that the host is reachable and the configured
+   model is available; otherwise it aborts with an actionable message (`ollama pull` /
+   `ollama signin` / edit the config). Models are never auto-downloaded.
+4. **Delegate & stream** — an OpenAI-compatible chat request streams tokens to your terminal
+   with live speed and count; structured capabilities (reviewer/tester) request strict JSON.
+5. **Account locally** — token usage is recorded per capability/model in a local file,
+   separate from your Claude/Anthropic usage.
+6. **Review & apply** — **Claude reviews the delegated output before applying any change**
+   with its own Edit/Write tools. If Ollama is unavailable, the plugin reports it and does
+   **not** silently fall back to Claude without your authorization.
 
-### Run isolation, output & concurrency (MAGI-level)
-
-Each run writes its artifacts into a unique directory under a **per-project temp
-namespace** — `<tempdir>/ollama-runs/<sha256(project_root)[:16]>/ollama-run-*` created
-with `mkdtemp` (atomic, collision-free). A `.ollama-lock` (PID + ISO start time +
-staleness bound, written atomically) marks a run **live**, so a concurrent session's LRU
-cleanup never prunes an in-progress run; the liveness probe is cross-platform and
-conservative. `cleanup_old_runs` keeps the most recent `--keep-runs` non-live dirs,
-excludes live ones, and refuses to delete anything outside the temp root.
-
-Output is split across **three sinks**:
-
-| Sink | Content |
-|------|---------|
-| **stdout** | The live token stream (tok/s + count) — **only when a single delegation is in flight** (stdout is serial; streaming N parallel agents there would interleave) |
-| **stderr** | Live status tree — the fan-out view: per-agent state + tok/s (ANSI redraw on a TTY, one plain line per update on a pipe, ASCII on cp1252), preflight, warnings |
-| **file** | Per-agent `{cap}.stream.log` / `.raw.json` + JSON accounting (`ollama-report.json` / `token_stats.json`) — never dumped to stdout |
-
-Multiple delegations may run in parallel, bounded by a semaphore of size
-`max_parallel_agents` (**default 3**) so the plugin never exceeds the concurrency your
-Ollama subscription/load allows. Work beyond the running set **queues**, itself hard-capped
-by `max_queued_agents` (**default 32**); overflow is rejected fail-closed as a **DoS
-backstop** against a runaway fan-out (total ceiling = 3 running + 32 queued = 35).
-
-**When more than one runs at once, streaming to stdout is suppressed** — each delegation
-streams to its own file in the run dir and the live view is the status display on stderr;
-stdout carries a single delegation's stream only. That "one streamer" invariant holds even
-across **independent processes** (e.g. a background delegation + a new request) via a
-project-level **`.ollama-stdout.lock`** — the holder streams to the terminal, any concurrent
-delegation is file-only until the token frees (self-healing if the holder dies). If a new
-request interrupts the turn instead, the running delegation is cleaned up (SIGINT) and the
-token is released.
-
----
-
-## Project Structure
-
-```
-.claude-plugin/
-  plugin.json                 -- Plugin manifest (name, version, author, repository)
-  marketplace.json            -- Local marketplace config (bolivartech-ollama-orchestrator)
-skills/ollama/                -- dir == skill name == command (MAGI standard)
-  SKILL.md                    -- Orchestrator (name: ollama → /ollama): classification, delegation, fallback
-  agents/
-    ollama-coder.md           -- write / fix / refactor code
-    ollama-reviewer.md        -- security & code review
-    ollama-tester.md          -- unit / integration test generation
-    ollama-explainer.md       -- code explanation
-    ollama-vision.md          -- image / UI analysis
-    ollama-transcribe.md      -- audio transcription
-    ollama-thinking.md        -- deep analysis / extended reasoning
-  scripts/
-    __init__.py               -- Python package marker
-    run_ollama.py             -- CLI orchestrator (capability positional arg; --ollama-init)
-    ollama_init.py            -- renders ollama-agents.toml from defaults (refuse-if-exists)
-    ollama_stream.py          -- streaming text delegation (token/speed metrics)
-    ollama_vision.py          -- vision delegation: image_url data-URI, magic-byte MIME
-    transcribe.py             -- experimental audio transcription (endpoint/audio-chat, gated)
-    ollama_config.py          -- layered config resolver (env > repo > global > default)
-    ollama_preflight.py       -- fail-fast host + model-availability check
-    backend.py                -- OpenAI-compatible /v1 transport (chat/completions)
-    errors.py                 -- domain exceptions (Ollama*/Delegation/Validation/InvalidInput)
-    scheduler.py              -- bounded concurrency: max_parallel semaphore + max_queued queue
-    circuit_breaker.py        -- per-model circuit breaker (K failures open; 429 excluded)
-    token_stats.py            -- local token accounting (independent of Claude usage)
-    temp_dirs.py              -- per-project temp namespace, unique run dirs, LRU cleanup
-    run_lock.py               -- .ollama-lock + cross-process stdout token / .ollama-slots (R7d/R21c)
-    status_display.py         -- live status tree (ANSI/TTY, plain on pipe, ASCII fallback)
-    stderr_shim.py            -- buffers real stderr while the status display renders
-    sanitize.py               -- 4-layer anti-prompt-injection + nonce delimiters (input & output)
-    startup_hardening.py      -- Windows console UTF-8 + world-readable/plaintext-key warnings
-    parse_output.py           -- tolerant JSON extractor (<think> recovery, fail-closed, DoS bounds)
-    binary_input.py           -- bounded magic-byte-checked binary loader (vision/transcribe)
-    validate.py               -- domain guards + clean_title + output-size cap
-    agent_schema.py           -- per-capability JSON-Schema (lockstep with validate.py)
-    input_size.py             -- token estimate (chars/4) + oversize warning
-    diff_guard.py             -- (optional) unified-diff parser + hallucination guard (R30)
-tests/                        -- pytest suite (BDD-named, HTTP mocked at the urllib edge)
-pyproject.toml                -- Python >= 3.12, dual license, dev deps, tool config
-conftest.py                   -- tdd-guard pytest plugin + sys.path setup
-Makefile                      -- verify, test, lint, format, typecheck targets
-```
-
-> This is the shipped structure as of v0.0.7: the 20 script modules above, one dedicated
-> pytest suite per module, the `SKILL.md` orchestrator, and the seven `agents/` system
-> prompts — all implemented, `mypy --strict` clean, stdlib-only runtime.
-
----
-
-## Testing
-
-Test-first (SBTDD): a pytest suite with BDD-style names, **all HTTP mocked at the `urllib`
-edge** (zero network). Property-based checks (`hypothesis`) cover the config resolver,
-`base_url` normalization, and `api_key` redaction; fuzzing (`atheris`) hardens the tolerant
-parser against untrusted model output.
-
-```bash
-python -m pytest tests/ -v    # unit + BDD suite
-
-make verify                   # lockcheck + test + lint + format + typecheck
-make test | lint | format | typecheck
-```
-
-`make verify` must be clean before every release.
+**Output & concurrency.** A single delegation streams live to your terminal (tok/s + count);
+status and warnings go to stderr; the raw output and token accounting are written to per-run
+files. Multiple delegations can run in parallel, capped by `max_parallel_agents` (default 3)
+with extra work queued up to `max_queued_agents` (default 32); when more than one runs at once
+each streams to its own file (never interleaved on the terminal). Runs are isolated per project,
+so a concurrent session never interferes.
 
 ---
 
@@ -431,12 +276,6 @@ make test | lint | format | typecheck
 | Ollama | Yes | Local daemon, LAN endpoint, or `ollama signin` for `:cloud` models |
 | Python 3.12+ | Yes | Uses `tomllib`, `asyncio`, `dict[str, Any]` syntax |
 | Runtime dependencies | **None** | stdlib-only: `urllib`, `json`, `tomllib` |
-
-### Dev Dependencies
-
-```bash
-pip install pytest pytest-asyncio ruff mypy hypothesis
-```
 
 ---
 
