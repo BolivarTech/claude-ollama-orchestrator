@@ -72,18 +72,22 @@ model, resolved from layered config:
    ollama signin
    ```
 
-3. **Create the config file** from the built-in defaults (it refuses to overwrite an existing
-   one):
+3. **Scaffold the config** (optional — the built-in defaults work out of the box). In Claude
+   Code, run:
 
-   ```bash
-   python skills/ollama/scripts/run_ollama.py --ollama-init
+   ```
+   /ollama --ollama-init
    ```
 
-   This writes `./.claude/ollama-agents.toml`. Edit it to change the models, the endpoint, or
-   the concurrency limits (see [Configuration](#configuration)) — or leave it as-is to use the
-   defaults.
+   This writes `./.claude/ollama-agents.toml` from the defaults and exits without delegating
+   (it refuses to overwrite an existing file). Edit the TOML to change models, the endpoint, or
+   the concurrency limits (see [Configuration](#configuration)) — or skip this step entirely to
+   use the defaults.
 
-4. **Delegate** — call `/ollama` in Claude Code (next section).
+   > Running from a local checkout instead of an installed plugin? The underlying CLI is
+   > `python skills/ollama/scripts/run_ollama.py --ollama-init`.
+
+4. **Delegate** — call `/ollama <capability> <request>` in Claude Code (next section).
 
 ### Delegating with `/ollama`
 
