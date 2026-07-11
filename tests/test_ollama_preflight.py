@@ -41,8 +41,19 @@ def test_preflight_passes_when_all_models_present():
 def test_preflight_aborts_on_missing_model_with_actionable_message():
     with pytest.raises(OllamaPreflightError) as exc:
         preflight(_cfg(), urlopen=_fake_urlopen({"data": [{"id": "m-a"}]}))
-    assert "m-b" in str(exc.value)
-    assert "ollama pull" in str(exc.value) or "signin" in str(exc.value)
+    msg = str(exc.value)
+    # Names the specific missing model...
+    assert "m-b" in msg
+    # ...states the count (missing / total configured) so the user sees the whole config
+    # is validated, not just one capability...
+    assert "1 of 2" in msg
+    # ...explains that EVERY configured model must be available (this is why a `coder`
+    # run can fail on a vision/tester model the user never invoked)...
+    assert "every configured" in msg.lower() or "not all configured" in msg.lower()
+    # ...tells the user to enable them for the plugin to work...
+    assert "enable" in msg.lower()
+    # ...and stays actionable.
+    assert "ollama pull" in msg or "signin" in msg
 
 
 def test_preflight_aborts_on_unreachable_host():
