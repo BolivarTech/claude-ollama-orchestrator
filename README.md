@@ -212,6 +212,13 @@ transcribe = true
 thinking   = true
 ```
 
+> **All seven models must be available.** Preflight validates the model of **every**
+> capability before any delegation runs (fail-fast), so each entry under `[models]` must
+> resolve to a model your endpoint can serve — even capabilities you don't currently use.
+> If you only have some models enabled, repoint the others to models you do have (or ensure
+> they're reachable via `ollama signin` / `ollama pull`); otherwise every `/ollama` call
+> aborts at preflight naming the missing ones.
+
 ### Layered precedence (per key)
 
 Config is merged **per key**, so a repo file can override just `base_url` while inheriting
@@ -253,9 +260,14 @@ written to artifacts, and are **redacted** in error messages.
 1. **Classify & gate** — Claude decides whether to delegate and which of the seven
    capabilities fits (explicit via `/ollama <capability>`, or auto-classified).
 2. **Resolve config** — layered, per-key merge (`env > repo TOML > global TOML > default`).
-3. **Preflight (fail-fast)** — a quick check that the host is reachable and the configured
-   model is available; otherwise it aborts with an actionable message (`ollama pull` /
-   `ollama signin` / edit the config). Models are never auto-downloaded.
+3. **Preflight (fail-fast)** — a quick check that the host is reachable and that **every
+   model configured for the seven capabilities is available**, not only the one you
+   invoked. The whole config is validated up front on purpose, so a missing model surfaces
+   immediately instead of interrupting you mid-task. If any is absent it aborts with an
+   actionable message naming the missing models and their count (`ollama signin` for
+   `:cloud` tags / `ollama pull <model>` for local / repoint them in the config). Models
+   are never auto-downloaded — you must have all configured models enabled for the plugin
+   to run.
 4. **Delegate & stream** — an OpenAI-compatible chat request streams tokens to your terminal
    with live speed and count; structured capabilities (reviewer/tester) request strict JSON.
 5. **Account locally** — token usage is recorded per capability/model in a local file,
