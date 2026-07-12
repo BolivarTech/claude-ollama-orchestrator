@@ -1,5 +1,10 @@
 # Delegating code generation to a local/Ollama model — condensed rules
 
+> **Human documentation only.** The skill does not read this file. `/ollama` carries its
+> own copy of these rules (`skills/ollama/SKILL.md` + `skills/ollama/references/
+> delegation-prompting.md`), so editing this document changes nothing about how the plugin
+> behaves. To change the plugin's behavior, edit the skill.
+
 Generic, evidence-based rules for any agent that delegates code generation to a local
 model (Ollama `/ollama`, or any "orchestrator generates a prompt → model returns text →
 orchestrator reviews and applies" setup). Goal: **maximize the share of generated code you
