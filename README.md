@@ -5,7 +5,7 @@
 [![Ruff](https://img.shields.io/badge/linter-ruff-orange.svg)](https://docs.astral.sh/ruff/)
 [![Typecheck](https://img.shields.io/badge/mypy-strict-blue.svg)](https://mypy-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Release](https://img.shields.io/badge/release-v0.0.7-brightgreen.svg)](https://github.com/BolivarTech/claude-ollama-orchestrator/releases)
+[![Release](https://img.shields.io/badge/release-v0.2.1-brightgreen.svg)](https://github.com/BolivarTech/claude-ollama-orchestrator/releases)
 
 A Claude Code plugin that lets Claude **orchestrate a set of Ollama subagents** and
 **delegate** concrete generation tasks to them — code, review, tests, explanation,
@@ -122,8 +122,19 @@ magic bytes, not its extension):
 - `transcribe` is **experimental**: if the endpoint can't handle audio it fails with an
   actionable message (never a crash), and the other six capabilities keep working.
 
+**The request can also be a file.** For the text capabilities, the request argument is
+*path-or-text*: if it names an existing file, the plugin reads that file's contents as the
+prompt (up to 10 MB); otherwise it is used as literal text. This is the way to send a long,
+detailed brief — a full spec with the tests pasted in — without fighting the shell's argument
+length limit (~32 KB on Windows). If the argument *looks* like a path but does not exist, the
+plugin warns on stderr and proceeds with it as literal text, so watch for that warning when a
+delegation returns something unexpected.
+
 In every case, Ollama generates the output and **Claude reviews it before writing anything to
 your files** — delegation never bypasses Claude's judgment.
+
+For how to write a delegation brief that comes back correct, and the full CLI surface, see the
+[User Guide](docs/user-guide.md).
 
 ---
 
@@ -234,11 +245,27 @@ built-in defaults  <  ~/.claude/ollama-agents.toml  <  ./.claude/ollama-agents.t
 | `api_key` | `OLLAMA_AGENTS_API_KEY` → repo → global → `OLLAMA_API_KEY` → `None` |
 | `models.<cap>` | `OLLAMA_AGENTS_MODEL_<CAP>` → repo `[models]` → global `[models]` → default |
 | `max_parallel_agents` | `OLLAMA_AGENTS_MAX_PARALLEL` → repo → global → `3` (Ollama Pro default) |
+| `max_queued_agents` | `OLLAMA_AGENTS_MAX_QUEUED` → repo → global → `32` |
+| `structured.<cap>` | `OLLAMA_AGENTS_STRUCTURED_<CAP>` → repo `[structured]` → global → `off` |
+| `stream.<cap>` | `OLLAMA_AGENTS_STREAM_<CAP>` → repo `[stream]` → global → default |
 
 **Bounded concurrency.** `max_parallel_agents` caps how many delegations run at once —
 a semaphore ensures no more than N Ollama agents are in flight, matching the maximum
 your subscription or load allows. Must be an integer ≥ 1 (invalid → actionable
-`ValidationError`).
+`ValidationError`). Work beyond that queues, itself capped by `max_queued_agents`
+(integer ≥ 0); overflow is rejected fail-closed rather than growing without bound.
+
+### When Ollama retires a model tag
+
+All seven defaults are `:cloud` tags, and Ollama retires tags on short notice. Because
+preflight validates **every** configured model, a retired tag on a capability you never use
+(say `transcribe`) will still abort a `coder` run. The failure is loud and immediate, not
+silent — and the fix is one line:
+
+1. Read the preflight error; it names the missing models and their count.
+2. Edit that capability's entry under `[models]` in `./.claude/ollama-agents.toml` to point at
+   a model your endpoint serves.
+3. Re-run. No code change, no reinstall.
 
 > Do **not** conflate this config (`ollama-agents.toml`) with MAGI's (`magi-ollama.toml`).
 > This plugin is the **delegation runtime**; MAGI is the **review gate**.
@@ -292,6 +319,16 @@ so a concurrent session never interferes.
 | Ollama | Yes | Local daemon, LAN endpoint, or `ollama signin` for `:cloud` models |
 | Python 3.12+ | Yes | Uses `tomllib`, `asyncio`, `dict[str, Any]` syntax |
 | Runtime dependencies | **None** | stdlib-only: `urllib`, `json`, `tomllib` |
+
+---
+
+## Documentation
+
+| Document | What it covers |
+|----------|----------------|
+| [User Guide](docs/user-guide.md) | Setup, the seven capabilities, the full CLI surface, where run artifacts land, and what each common error means |
+| [Architecture](docs/architecture.md) | How the runtime is built: the module map, the three output sinks, bounded concurrency, the temp/lock lifecycle, and the untrusted-content hardening |
+| [Delegation best practices](docs/ollama-delegation-best-practices.md) | How to write a delegation brief that comes back correct, and how to review the output |
 
 ---
 
