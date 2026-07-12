@@ -1,6 +1,6 @@
 [project]
 name = "claude-ollama-orchestrator"
-version = "0.2.0"
+version = "0.2.1"
 requires-python = ">= 3.12"
 description = "Delegate coding, review, testing, explanation, vision, and transcription to Ollama models from Claude Code"
 license = "MIT OR Apache-2.0"

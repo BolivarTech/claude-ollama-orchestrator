@@ -99,40 +99,48 @@ def build_parser() -> argparse.ArgumentParser:
         The configured parser (positional capability with the 7 choices, input,
         and the R28 flags).
     """
-    parser = argparse.ArgumentParser(description="Claude-Ollama-Orchestrator delegation")
+    parser = argparse.ArgumentParser(
+        description="Claude-Ollama-Orchestrator delegation",
+        epilog=(
+            "run_ollama.py --ollama-init scaffolds ./.claude/ollama-agents.toml from the "
+            "built-in defaults and exits without delegating (it refuses to overwrite an "
+            "existing file). It must be the first argument."
+        ),
+    )
     parser.add_argument("capability", choices=CAPABILITIES, help="Delegation capability")
-    parser.add_argument("input", help="Path to file or inline text to delegate")
+    parser.add_argument(
+        "input",
+        help="The prompt: a path to a file whose contents are delegated, or inline text. "
+        "For vision/transcribe this is the path to the image/audio file.",
+    )
     parser.add_argument("--model", default=None, help="Override the resolved model")
     parser.add_argument("--timeout", type=int, default=900, help="Per-delegation timeout (s)")
     parser.add_argument(
         "--output-dir",
         default=None,
-        help="Caller-owned dir for the raw output artifact (else stdout only)",
+        help="Write run artifacts to this caller-owned dir instead of a managed temp run "
+        "dir (disables the run lock and LRU cleanup; do not share it between concurrent "
+        "delegations)",
     )
-    # --keep-runs is validated here (0 rejected, -1 disables); the run-dir cleanup it
-    # controls is implemented in MS3 (temp namespace + LRU prune) — a forward reference,
-    # not a dead flag. Kept in MS1's surface because R28 specifies the full CLI here.
     parser.add_argument(
         "--keep-runs",
         type=int,
         default=MAX_HISTORY_RUNS,
-        help="Max non-live temp run dirs to retain (-1 disables; cleanup in MS3)",
+        help="Max non-live temp run dirs to retain before pruning the oldest "
+        "(-1 disables cleanup; 0 is rejected as ambiguous)",
     )
-    # --no-status (status display) and --max-parallel (concurrency) are part of R28's CLI
-    # surface in MS1, but their behavior is wired in MS3 and MS5 respectively — documented
-    # forward references, not silent no-ops.
     parser.add_argument(
         "--no-status",
         dest="show_status",
         action="store_false",
         default=True,
-        help="Disable the live status display (wired in MS3)",
+        help="Disable the live status display on stderr",
     )
     parser.add_argument(
         "--max-parallel",
         type=int,
         default=None,
-        help="Override max_parallel_agents (concurrency wired in MS5)",
+        help="Override max_parallel_agents (how many delegations run at once)",
     )
     parser.add_argument(
         "--warn-input-tokens", type=int, default=150_000, help="Oversize warning threshold (tokens)"
@@ -140,8 +148,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--diff",
         default=None,
-        help="Path to a unified diff (or inline diff text) grounding reviewer findings "
-        "against it (R30); omit for no grounding",
+        help="Path to a unified diff (or inline diff text); reviewer findings are grounded "
+        "against it, dropping ones that cite files it does not contain. Omit for no grounding.",
     )
     # --ollama-init is intentionally NOT an argparse flag: it is handled solely by the
     # pre-parse first-token short-circuit in `main` (before argparse ever runs), so there
